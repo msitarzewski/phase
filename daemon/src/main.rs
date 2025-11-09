@@ -12,6 +12,7 @@ use plasm::{
 #[derive(Parser)]
 #[command(name = "plasmd")]
 #[command(about = "Phase local WASM execution daemon", long_about = None)]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
