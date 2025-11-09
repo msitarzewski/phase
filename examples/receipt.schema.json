@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://phasebased.com/schemas/receipt.v0.1.json",
+  "title": "Phase Execution Receipt",
+  "description": "Cryptographically signed proof of WASM execution",
+  "type": "object",
+  "required": [
+    "version",
+    "module_hash",
+    "exit_code",
+    "wall_time_ms",
+    "timestamp",
+    "node_pubkey",
+    "signature"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Receipt schema version",
+      "pattern": "^\\d+\\.\\d+$",
+      "examples": ["0.1"]
+    },
+    "module_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the executed WASM module",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "examples": ["sha256:d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"]
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Exit code (0 = success)",
+      "minimum": 0,
+      "maximum": 255,
+      "examples": [0, 1, 127]
+    },
+    "wall_time_ms": {
+      "type": "integer",
+      "description": "Wall clock execution time in milliseconds",
+      "minimum": 0,
+      "examples": [123, 1500, 30000]
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch timestamp (seconds) when execution completed",
+      "minimum": 0,
+      "examples": [1699564800, 1730991600]
+    },
+    "node_pubkey": {
+      "type": "string",
+      "description": "Ed25519 public key of executing node (hex-encoded, 64 chars)",
+      "pattern": "^[a-f0-9]{64}$",
+      "examples": ["a1b2c3d4e5f6..."]
+    },
+    "signature": {
+      "type": "string",
+      "description": "Ed25519 signature over receipt fields (hex-encoded, 128 chars)",
+      "pattern": "^[a-f0-9]{128}$",
+      "examples": ["9876543210abcdef..."]
+    }
+  },
+  "additionalProperties": false
+}

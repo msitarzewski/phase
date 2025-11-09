@@ -1,0 +1,23 @@
+# Rust
+/daemon/target/
+/daemon/Cargo.lock
+/wasm-examples/*/target/
+/wasm-examples/*/Cargo.lock
+
+# PHP
+/php-sdk/vendor/
+composer.lock
+
+# Binaries
+*.wasm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

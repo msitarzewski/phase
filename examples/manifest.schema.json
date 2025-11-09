@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://phasebased.com/schemas/manifest.v0.1.json",
+  "title": "Phase Job Manifest",
+  "description": "Describes resource requirements and execution constraints for a WASM job",
+  "type": "object",
+  "required": ["version", "module_hash", "cpu_cores", "memory_mb", "timeout_seconds"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Manifest schema version",
+      "pattern": "^\\d+\\.\\d+$",
+      "examples": ["0.1"]
+    },
+    "module_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the WASM module (format: sha256:HEX)",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "examples": ["sha256:d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"]
+    },
+    "cpu_cores": {
+      "type": "integer",
+      "description": "Number of CPU cores required",
+      "minimum": 1,
+      "maximum": 64,
+      "examples": [1, 2, 4]
+    },
+    "memory_mb": {
+      "type": "integer",
+      "description": "Maximum memory in megabytes",
+      "minimum": 1,
+      "maximum": 32768,
+      "examples": [128, 256, 512]
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "description": "Maximum execution time in seconds",
+      "minimum": 1,
+      "maximum": 3600,
+      "examples": [30, 60, 300]
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,9 @@
+{
+  "version": "0.1",
+  "module_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "exit_code": 0,
+  "wall_time_ms": 1234,
+  "timestamp": 1730991600,
+  "node_pubkey": "8f14e45fceea167a5a36dedd4bea2543fa8451ca77f6a4cc8c8b84b4f6881f7d",
+  "signature": "304502210086c0aeffd12a66f76c5d7f58f5c0f2c7e6f8d3a3b9c2d1e0f6a7b8c9d0e1f2a3022033f0a7d8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6"
+}
