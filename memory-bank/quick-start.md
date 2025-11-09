@@ -1,6 +1,6 @@
 # Quick Start: Phase Development Guide
 
-**Last Updated**: 2025-11-08
+**Last Updated**: 2025-11-09
 **Version**: 0.1
 **Audience**: Developers working on Phase Open MVP
 
@@ -8,12 +8,171 @@
 
 ## Table of Contents
 
-1. [Session Startup](#session-startup)
-2. [Common Patterns](#common-patterns)
-3. [File Locations](#file-locations)
-4. [Code Snippets](#code-snippets)
-5. [Troubleshooting](#troubleshooting)
-6. [Quick Commands](#quick-commands)
+1. [Architecture: Library + Binary Pattern](#architecture-library--binary-pattern)
+2. [Session Startup](#session-startup)
+3. [Common Patterns](#common-patterns)
+4. [File Locations](#file-locations)
+5. [Code Snippets](#code-snippets)
+6. [Troubleshooting](#troubleshooting)
+7. [Quick Commands](#quick-commands)
+
+---
+
+## Architecture: Library + Binary Pattern
+
+**IMPORTANT**: Phase uses the standard Rust pattern of **library + binary crate** instead of a standalone binary.
+
+### Why This Matters
+
+✅ **Do this from the start**, not as a refactor:
+- Zero `#[allow(dead_code)]` suppressions needed
+- All "unused" code is actually public library API
+- Clean compiler warnings
+- Reusable for other Rust projects
+- Standard pattern (ripgrep, tokio, clap all use this)
+
+❌ **Don't do this**:
+- Build everything as binary modules (`mod config; mod wasm;`)
+- Add `#[allow(dead_code)]` to silence warnings
+- Refactor to library later
+
+### Structure
+
+```
+daemon/
+├── Cargo.toml          # Defines both [lib] and [[bin]]
+└── src/
+    ├── lib.rs          # Library public API (re-exports everything)
+    ├── main.rs         # Binary (uses `plasm::` library)
+    ├── config.rs       # Internal module
+    ├── wasm/           # Internal modules
+    └── network/        # Internal modules
+```
+
+### Cargo.toml Configuration
+
+```toml
+[package]
+name = "plasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "plasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plasmd"
+path = "src/main.rs"
+```
+
+### lib.rs Pattern
+
+**Purpose**: Expose clean public API
+
+```rust
+//! # Plasm - Phase Local WASM Execution Library
+//!
+//! Core functionality for the Phase distributed compute network.
+
+pub mod config;
+pub mod wasm;
+pub mod network;
+
+// Re-export commonly used types for convenience
+pub use config::{Config, ExecutionLimits};
+pub use wasm::{
+    runtime::{WasmRuntime, Wasm3Runtime, ExecutionResult},
+    manifest::JobManifest,
+    receipt::Receipt,
+};
+pub use network::{
+    Discovery,
+    DiscoveryConfig,
+    ExecutionHandler,
+    // ... protocol types
+};
+```
+
+### main.rs Pattern
+
+**Purpose**: Thin CLI wrapper using library
+
+```rust
+// Use the library crate, not internal modules
+use plasm::{
+    network::{Discovery, DiscoveryConfig, ExecutionHandler},
+    wasm::runtime::{WasmRuntime, Wasm3Runtime},
+};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // CLI implementation uses library API
+    let discovery = Discovery::new(DiscoveryConfig::default())?;
+    // ...
+}
+```
+
+### Benefits
+
+| Aspect | Library + Binary | Binary Only |
+|--------|-----------------|-------------|
+| **Warnings** | Zero (all code is pub API) | Many (need `#[allow(dead_code)]`) |
+| **Reusability** | Other Rust projects can depend on it | Not reusable |
+| **Testing** | Integration tests use public API | Internal access only |
+| **Standard** | How all major Rust projects work | Non-standard |
+| **Maintenance** | Clear API boundary | Everything exposed to binary |
+
+### When to Use Library Pattern
+
+✅ **Always for projects with**:
+- Public API that others might use
+- Multiple binaries sharing code
+- Complex functionality (not just a script)
+- Long-term maintenance
+
+❌ **Skip for**:
+- One-off scripts
+- Throwaway prototypes
+- Truly private/internal-only tools
+
+### Lesson Learned (Milestone 4)
+
+**Problem**: After implementing Milestones 1-3, had 27 compiler warnings about unused code. All the code was tested and working, just not used by the `plasmd` binary.
+
+**Wrong approach**: Add `#[allow(dead_code)]` everywhere (suppresses warnings, doesn't fix root cause)
+
+**Right approach**: Refactor to library + binary pattern:
+- Created `lib.rs` with public API exports
+- Updated `main.rs` to use `plasm::` instead of `mod`
+- Removed ALL `#[allow(dead_code)]` attributes
+- Result: 0 warnings, clean public API, standard Rust pattern
+
+**Time cost**: ~30 minutes to refactor
+
+**Value**: Permanent clean architecture, no technical debt
+
+### Quick Reference
+
+```bash
+# Build library + binary
+cargo build
+
+# Test library (unit tests)
+cargo test --lib
+
+# Test binary
+cargo test --bin plasmd
+
+# Build just the library
+cargo build --lib
+
+# Build just the binary
+cargo build --bin plasmd
+
+# Check library API docs
+cargo doc --lib --open
+```
 
 ---
 

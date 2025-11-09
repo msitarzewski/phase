@@ -3,7 +3,6 @@ use std::path::Path;
 use anyhow::Result;
 
 /// Daemon configuration
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Listen address for P2P networking
@@ -19,7 +18,6 @@ pub struct Config {
     pub limits: ExecutionLimits,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionLimits {
     /// Maximum memory per job (bytes)
@@ -49,7 +47,6 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from JSON file
-    #[allow(dead_code)]
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = serde_json::from_str(&content)?;
@@ -57,7 +54,6 @@ impl Config {
     }
 
     /// Save configuration to JSON file
-    #[allow(dead_code)]
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 /// Job offer from client to node
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobOffer {
     /// Unique job ID
@@ -37,7 +36,6 @@ pub struct JobRequirements {
 }
 
 /// Response to job offer
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobResponse {
     /// Job accepted - node will execute it
@@ -63,7 +61,6 @@ pub enum JobResponse {
 }
 
 /// Reasons for rejecting a job
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RejectionReason {
     /// Resource requirements exceed node capacity

@@ -11,7 +11,6 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::peer::PeerCapabilities;
-#[allow(unused_imports)]
 use super::protocol::{JobOffer, JobResponse, RejectionReason, JobRequest, JobResult};
 use super::execution::ExecutionHandler;
 
@@ -19,7 +18,6 @@ use super::execution::ExecutionHandler;
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     /// Listen address (e.g., "/ip4/0.0.0.0/tcp/0")
-    #[allow(dead_code)]
     pub listen_addr: String,
 
     /// Bootstrap peers to connect to
@@ -44,10 +42,7 @@ pub struct Discovery {
     swarm: Swarm<KademliaBehaviour<MemoryStore>>,
     local_peer_id: PeerId,
     capabilities: PeerCapabilities,
-    #[allow(dead_code)]
     execution_handler: ExecutionHandler,
-    #[allow(dead_code)]
-    signing_key: SigningKey,
 }
 
 impl Discovery {
@@ -102,7 +97,6 @@ impl Discovery {
             local_peer_id,
             capabilities: config.capabilities,
             execution_handler,
-            signing_key,
         })
     }
 
@@ -135,13 +129,11 @@ impl Discovery {
     }
 
     /// Get node's public key (hex-encoded)
-    #[allow(dead_code)]
     pub fn public_key_hex(&self) -> String {
         self.execution_handler.public_key_hex()
     }
 
     /// Execute a job request (for testing/local execution)
-    #[allow(dead_code)]
     pub async fn execute_job(&self, request: JobRequest) -> Result<JobResult> {
         self.execution_handler.execute_job(request).await
     }
@@ -168,7 +160,6 @@ impl Discovery {
     }
 
     /// Discover peers with specific capability
-    #[allow(dead_code)]
     pub fn discover_peers(&mut self, arch: &str, runtime: &str) -> Result<()> {
         use libp2p::kad::RecordKey;
 
@@ -182,7 +173,6 @@ impl Discovery {
     }
 
     /// Handle incoming job offer
-    #[allow(dead_code)]
     pub fn handle_job_offer(&self, offer: JobOffer) -> JobResponse {
         use std::time::{SystemTime, UNIX_EPOCH};
 

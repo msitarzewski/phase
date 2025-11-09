@@ -4,7 +4,6 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum WasmError {
     #[error("Failed to create WASM runtime: {0}")]
     RuntimeCreationError(String),
@@ -78,7 +77,6 @@ impl Wasm3Runtime {
     }
 
     /// Set stack size
-    #[allow(dead_code)]
     pub fn with_stack_size(mut self, bytes: u64) -> Self {
         self._stack_size_bytes = bytes;
         self

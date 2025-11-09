@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 /// Job manifest describing resource requirements and execution constraints
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobManifest {
     /// Manifest version
@@ -22,7 +21,6 @@ pub struct JobManifest {
 
 impl JobManifest {
     /// Create a new manifest with default values
-    #[allow(dead_code)]
     pub fn new(module_hash: String) -> Self {
         Self {
             version: "0.1".to_string(),
@@ -34,7 +32,6 @@ impl JobManifest {
     }
 
     /// Validate manifest constraints
-    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.cpu_cores < 1 {
             return Err("cpu_cores must be at least 1".to_string());
@@ -49,21 +46,18 @@ impl JobManifest {
     }
 
     /// Serialize to JSON
-    #[allow(dead_code)]
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize manifest: {}", e))
     }
 
     /// Deserialize from JSON
-    #[allow(dead_code)]
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json)
             .map_err(|e| format!("Failed to deserialize manifest: {}", e))
     }
 
     /// Load from JSON file
-    #[allow(dead_code)]
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read file: {}", e))?;
@@ -71,7 +65,6 @@ impl JobManifest {
     }
 
     /// Save to JSON file
-    #[allow(dead_code)]
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), String> {
         let json = self.to_json()?;
         std::fs::write(path, json)
