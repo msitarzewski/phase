@@ -13,15 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 # WASM Runtime (using wasmtime for better compatibility)
-wasmtime = "15.0"
-wasmtime-wasi = "15.0"
+wasmtime = "27"
+wasmtime-wasi = "27"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 
 # Logging
@@ -29,7 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Cryptography (Ed25519 signatures)
-ed25519-dalek = "2.0"
+ed25519-dalek = "2.1"
 sha2 = "0.10"
 hex = "0.4"
 
@@ -39,9 +39,8 @@ tokio = { version = "1.0", features = ["full"] }
 # CLI
 clap = { version = "4.0", features = ["derive"] }
 
-# Networking (libp2p)
-libp2p = { version = "0.53", features = ["kad", "noise", "tcp", "quic", "yamux", "macros"] }
-libp2p-identity = "0.2"
+# Networking (libp2p) - Updated to latest
+libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify"] }
 futures = "0.3"
 num_cpus = "1.0"
 
