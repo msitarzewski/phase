@@ -3,14 +3,14 @@ use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use libp2p::{
     identity::Keypair,
-    kad::{store::MemoryStore, Behaviour as KademliaBehaviour, Config as KademliaConfig, Event as KademliaEvent},
+    kad::{store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent},
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::peer::{PeerCapabilities, PeerInfo};
+use super::peer::PeerCapabilities;
 use super::protocol::{JobOffer, JobResponse, RejectionReason, JobRequest, JobResult};
 use super::execution::ExecutionHandler;
 
@@ -43,7 +43,6 @@ pub struct Discovery {
     local_peer_id: PeerId,
     capabilities: PeerCapabilities,
     execution_handler: ExecutionHandler,
-    signing_key: SigningKey,
 }
 
 impl Discovery {
@@ -98,7 +97,6 @@ impl Discovery {
             local_peer_id,
             capabilities: config.capabilities,
             execution_handler,
-            signing_key,
         })
     }
 

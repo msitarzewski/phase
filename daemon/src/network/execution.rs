@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::wasm::receipt::Receipt;
 use crate::wasm::runtime::{WasmRuntime, Wasm3Runtime};

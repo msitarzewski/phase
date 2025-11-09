@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Stop the service if it's running
+if [ -d /run/systemd/system ]; then
+    if systemctl is-active --quiet plasmd; then
+        systemctl stop plasmd >/dev/null || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

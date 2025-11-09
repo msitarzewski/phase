@@ -3,11 +3,11 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber;
 
-mod config;
-mod wasm;
-mod network;
-
-use wasm::runtime::WasmRuntime;
+// Use the plasm library crate
+use plasm::{
+    network::{Discovery, DiscoveryConfig, ExecutionHandler, JobRequest, JobRequirements},
+    wasm::runtime::{WasmRuntime, Wasm3Runtime},
+};
 
 #[derive(Parser)]
 #[command(name = "plasmd")]
@@ -68,10 +68,10 @@ async fn main() -> Result<()> {
             info!("Starting plasmd with config: {}", config);
 
             // Create discovery configuration
-            let disc_config = network::DiscoveryConfig::default();
+            let disc_config = DiscoveryConfig::default();
 
             // Create discovery service
-            let mut discovery = network::Discovery::new(disc_config)?;
+            let mut discovery = Discovery::new(disc_config)?;
 
             // Start listening
             discovery.listen("/ip4/0.0.0.0/tcp/0")?;
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
             let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
             // Create runtime and execute
-            let runtime = wasm::runtime::Wasm3Runtime::new();
+            let runtime = Wasm3Runtime::new();
             let result = runtime.execute(&wasm_bytes, &args_refs).await?;
 
             // In quiet mode, suppress logs - WASM stdout is already inherited
@@ -114,7 +114,6 @@ async fn main() -> Result<()> {
             std::process::exit(result.exit_code as i32);
         }
         Commands::ExecuteJob { wasm_file, args } => {
-            use network::{JobRequest, JobRequirements};
             use sha2::{Digest, Sha256};
 
             info!("Executing job from: {}", wasm_file);
@@ -148,7 +147,7 @@ async fn main() -> Result<()> {
             let mut secret_bytes = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut secret_bytes);
             let signing_key = SigningKey::from_bytes(&secret_bytes);
-            let handler = network::ExecutionHandler::new(signing_key);
+            let handler = ExecutionHandler::new(signing_key);
 
             // Execute job
             let result = handler.execute_job(request).await?;

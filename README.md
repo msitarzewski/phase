@@ -78,24 +78,150 @@ Demonstrate end‑to‑end remote execution using anonymous discovery:
 
 ---
 
-## Getting Started (after build)
+## Installation
+
+### Prerequisites
+
+**Ubuntu/Debian Server (x86_64):**
+- Ubuntu 22.04 LTS or newer
+- systemd (for service management)
+- 1GB+ RAM, 1GB+ disk space
+
+**macOS/Linux Client (any architecture):**
+- PHP 8.1 or newer
+- Composer (PHP package manager)
+- `php-sodium` extension (for Ed25519 signature verification)
+
+### Building from Source
 
 ```bash
-# 1) Install plasm daemon on remote Ubuntu host
-sudo dpkg -i plasm_<version>_amd64.deb
+# Clone the repository
+git clone https://github.com/phasebased/phase.git
+cd phase
+
+# Install Rust toolchain (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install cargo-deb for packaging
+cargo install cargo-deb
+
+# Build the Debian package
+cd daemon
+cargo deb
+
+# Package will be created at: target/debian/plasm_0.1.0_amd64.deb
+```
+
+### Installing on Ubuntu/Debian
+
+```bash
+# Install the package
+sudo dpkg -i target/debian/plasm_0.1.0_amd64.deb
+
+# Start the service
 sudo systemctl start plasmd
 
-# 2) On your Mac (PHP client)
-composer require phasebased/plasm-php
-php examples/remote_test.php
+# Enable to start on boot (optional)
+sudo systemctl enable plasmd
+
+# Check service status
+sudo systemctl status plasmd
+
+# View logs
+sudo journalctl -u plasmd -f
+```
+
+### Installing PHP Client SDK
+
+```bash
+# Navigate to php-sdk directory
+cd php-sdk
+
+# Install dependencies
+composer install
+
+# The SDK is now ready to use in examples/
+```
+
+### Troubleshooting
+
+**Service won't start:**
+```bash
+# Check detailed logs
+sudo journalctl -u plasmd -n 50 --no-pager
+
+# Verify binary is executable
+ls -l /usr/bin/plasmd
+
+# Test manual execution
+/usr/bin/plasmd --version
+```
+
+**PHP client can't find daemon:**
+- Ensure plasmd is running: `sudo systemctl status plasmd`
+- Check network connectivity
+- Verify firewall allows required ports
+
+**Signature verification fails:**
+- Ensure `php-sodium` extension is installed: `php -m | grep sodium`
+- Install if missing: `sudo apt install php-sodium` (Ubuntu) or `brew install php` (macOS)
+
+## Quick Start
+
+### Local Execution Test
+
+```bash
+# From repository root
+cd examples
+php local_test.php
 ```
 
 Expected output:
 ```
-Discovered node: plasm@203.0.113.42
-Sending job: hello.wasm
-Result: dlroW ,olleH
+Submitting job: hello.wasm
+Job ID: <uuid>
+Waiting for result...
+Output: dlroW ,olleH
+Exit code: 0
 Receipt verified ✓
+```
+
+### Remote Execution Test
+
+```bash
+# Ensure plasmd is running on a remote node
+# From repository root
+cd examples
+php remote_test.php
+```
+
+Expected output:
+```
+Phase Remote Execution Test
+===========================
+
+Discovering nodes...
+✓ Node discovered: <peer-id>
+  Architecture: x86_64
+  Runtime: wasmtime-27
+
+Submitting job: hello.wasm
+✓ Job submitted: <job-id>
+
+Waiting for execution...
+✓ Execution complete
+
+Result:
+  Output: dlroW ,olleH
+  Exit code: 0
+  Wall time: 235ms
+
+Receipt Verification:
+✓ Signature valid
+✓ Module hash matches
+✓ Receipt verified
+
+Test complete!
 ```
 
 ---
