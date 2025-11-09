@@ -59,3 +59,22 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[package.metadata.deb]
+maintainer = "PhaseBased <hello@phasebased.com>"
+copyright = "2025, PhaseBased <hello@phasebased.com>"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Phase is an open protocol for distributed computation. \
+Plasm is the local runtime engine that turns any computer into a node in the network. \
+This package provides the plasmd daemon for executing WebAssembly workloads."""
+depends = "$auto, systemd"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/plasmd", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/plasm/", "644"],
+    ["systemd/plasmd.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "plasmd", enable = false }

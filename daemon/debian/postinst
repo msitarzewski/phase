@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Create plasm state directory
+mkdir -p /var/lib/plasm
+chmod 755 /var/lib/plasm
+
+# Reload systemd daemon to recognize new service
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null || true
+fi
+
+echo "Plasm daemon installed successfully."
+echo "To start the service, run: sudo systemctl start plasmd"
+echo "To enable on boot, run: sudo systemctl enable plasmd"
+
+#DEBHELPER#
+
+exit 0
