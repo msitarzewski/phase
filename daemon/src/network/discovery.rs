@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use libp2p::{
     identity::Keypair,
@@ -10,7 +11,8 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::peer::{PeerCapabilities, PeerInfo};
-use super::protocol::{JobOffer, JobResponse, RejectionReason};
+use super::protocol::{JobOffer, JobResponse, RejectionReason, JobRequest, JobResult};
+use super::execution::ExecutionHandler;
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct Discovery {
     swarm: Swarm<KademliaBehaviour<MemoryStore>>,
     local_peer_id: PeerId,
     capabilities: PeerCapabilities,
+    execution_handler: ExecutionHandler,
+    signing_key: SigningKey,
 }
 
 impl Discovery {
@@ -50,6 +54,17 @@ impl Discovery {
         let local_peer_id = PeerId::from(keypair.public());
 
         info!("Local peer ID: {}", local_peer_id);
+
+        // Generate Ed25519 signing key for receipts (separate from libp2p keypair)
+        use rand::RngCore;
+        let mut secret_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+
+        // Create execution handler
+        let execution_handler = ExecutionHandler::new(signing_key.clone());
+
+        info!("Node public key: {}", execution_handler.public_key_hex());
 
         // Create Kademlia behaviour
         let store = MemoryStore::new(local_peer_id);
@@ -82,6 +97,8 @@ impl Discovery {
             swarm,
             local_peer_id,
             capabilities: config.capabilities,
+            execution_handler,
+            signing_key,
         })
     }
 
@@ -111,6 +128,16 @@ impl Discovery {
     /// Get local capabilities
     pub fn capabilities(&self) -> &PeerCapabilities {
         &self.capabilities
+    }
+
+    /// Get node's public key (hex-encoded)
+    pub fn public_key_hex(&self) -> String {
+        self.execution_handler.public_key_hex()
+    }
+
+    /// Execute a job request (for testing/local execution)
+    pub async fn execute_job(&self, request: JobRequest) -> Result<JobResult> {
+        self.execution_handler.execute_job(request).await
     }
 
     /// Advertise this node's capabilities on the DHT

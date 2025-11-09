@@ -94,13 +94,31 @@ class Receipt
             return true;
         }
 
-        // TODO: Implement Ed25519 signature verification (Milestone 3)
-        throw new \RuntimeException('Signature verification not yet implemented');
+        // Use provided public key or the one from receipt
+        if ($publicKey === null) {
+            return Crypto::verifyReceipt($this);
+        }
+
+        // Verify with provided public key
+        $message = sprintf(
+            "%s|%s|%d|%d|%d",
+            $this->version,
+            $this->moduleHash,
+            $this->exitCode,
+            $this->wallTimeMs,
+            $this->timestamp
+        );
+
+        return Crypto::verifySignature($message, $this->signature, $publicKey);
     }
 
     // Getters
+    public function getVersion(): string { return $this->version; }
+    public function getModuleHash(): string { return $this->moduleHash; }
     public function getExitCode(): int { return $this->exitCode; }
     public function getWallTimeMs(): int { return $this->wallTimeMs; }
     public function getTimestamp(): int { return $this->timestamp; }
+    public function getNodePubkey(): string { return $this->nodePubkey; }
+    public function getSignature(): string { return $this->signature; }
     public function isSuccess(): bool { return $this->exitCode === 0; }
 }
