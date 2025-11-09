@@ -1,0 +1,29 @@
+{
+    "name": "phasebased/plasm-php",
+    "description": "PHP client SDK for Phase distributed WASM execution",
+    "type": "library",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "PhaseBased",
+            "email": "hello@phasebased.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Plasm\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Plasm\\Tests\\": "tests/"
+        }
+    }
+}
