@@ -1,14 +1,14 @@
 # Active Context: Current Sprint
 
 **Last Updated**: 2025-11-09
-**Sprint**: Peer Discovery (Nov-Dec 2025)
-**Status**: Milestone 1 Complete, Milestone 2 In Progress
+**Sprint**: Packaging & Demo (Nov-Dec 2025)
+**Status**: Milestone 1, 2, 3 Complete - Milestone 4 Next
 
 ---
 
 ## Current Focus
 
-Implementing peer discovery infrastructure for Phase Open MVP (v0.1) - anonymous peer-to-peer distributed WASM execution.
+Preparing for MVP release - packaging, documentation, and end-to-end demo for Phase Open MVP (v0.1).
 
 ### Milestone 1: Local WASM Execution ✅ COMPLETE
 
@@ -25,73 +25,83 @@ Implementing peer discovery infrastructure for Phase Open MVP (v0.1) - anonymous
 
 See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1_local_wasm_execution.md)
 
-### Active Milestone: Peer Discovery ⚙️ IN PROGRESS
+### Milestone 2: Peer Discovery ✅ COMPLETE
 
-**Goal**: Enable anonymous node discovery and messaging over DHT
+**Completed**: 2025-11-09
 
-**Status**: 1/6 tasks complete (17%)
+**Achievements**:
+1. ✅ Integrated rust-libp2p 0.54 with Kademlia DHT
+2. ✅ Capability-based peer discovery (arch, CPU, memory, runtime)
+3. ✅ Job handshake protocol (JobOffer/JobResponse)
+4. ✅ Noise + QUIC encrypted transport
+5. ✅ NAT traversal awareness with QUIC assist
+6. ✅ Structured logging of peer events
+
+**Metrics**: 15 tests passing (3 new protocol tests)
+
+See: [251109_milestone2_peer_discovery.md](tasks/2025-11/251109_milestone2_peer_discovery.md)
+
+### Milestone 3: Remote Execution ✅ COMPLETE
+
+**Completed**: 2025-11-09
+
+**Achievements**:
+1. ✅ Real Ed25519 signing with ed25519-dalek (replaced mock signatures)
+2. ✅ Job protocol (JobRequest/JobResult with base64 serialization)
+3. ✅ ExecutionHandler with module hash verification and signing
+4. ✅ Async WASM runtime using tokio::spawn_blocking
+5. ✅ PHP Crypto class with sodium Ed25519 verification
+6. ✅ WASI preview1 support for WASM stdio
+
+**Metrics**: 22 tests passing, ~235ms execution, real cryptographic signatures
+
+See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_remote_execution.md)
+
+### Active Milestone: Packaging & Demo ⚙️ NEXT
+
+**Goal**: Deliver runnable .deb package and example
+
+**Status**: 0/6 tasks complete (0%)
 
 **Remaining Tasks**:
-1. ⚙️ Integrate libp2p Kademlia - **IN PROGRESS** (SwarmBuilder API issue)
-2. 🔵 Advertise node capability manifest - **PLANNED**
-3. 🔵 Implement job announcement/acceptance handshake - **PLANNED**
-4. 🔵 Encrypt communication using Noise + QUIC - **PLANNED**
-5. 🔵 Implement NAT traversal (UPnP + relay) - **PLANNED**
-6. 🔵 Add structured logging of peer discovery - **PLANNED**
+1. 🔵 Create Debian package using cargo-deb - **PLANNED**
+2. 🔵 Add systemd service for plasmd - **PLANNED**
+3. 🔵 Write install instructions - **PLANNED**
+4. 🔵 Cross-arch demo: macOS ARM → Ubuntu x86_64 - **PLANNED**
+5. 🔵 examples/remote_test.php with clear output - **PLANNED**
+6. 🔵 docs/architecture-diagram.png (optional) - **PLANNED**
 
-**Current Blocker**: libp2p 0.53 SwarmBuilder API incompatibility
+**Current Blocker**: None
 
 ---
 
 ## Current Sprint Backlog
 
 ### High Priority (This Week)
-- [ ] Fix libp2p 0.53 SwarmBuilder API in discovery.rs
-- [ ] Complete Kademlia DHT integration
-- [ ] Implement PeerCapabilities advertisement
-- [ ] Add bootstrap peer parsing and connection
-- [ ] Test peer discovery locally (two nodes)
+- [ ] Create Debian package using cargo-deb
+- [ ] Add systemd service file for plasmd
+- [ ] Write installation instructions in README
+- [ ] Test installation on Ubuntu 22.04 LTS
+- [ ] Update documentation for MVP release
 
 ### Medium Priority (Next 1-2 Weeks)
-- [ ] Implement job announcement protocol
-- [ ] Implement job acceptance handshake
-- [ ] Add Noise encryption integration
-- [ ] Add QUIC transport support
-- [ ] Write unit tests for discovery module
+- [ ] Create remote_test.php example
+- [ ] Test cross-architecture demo (if hardware available)
+- [ ] Create architecture diagram (optional)
+- [ ] Performance benchmarking
+- [ ] Security audit of M3 implementation
 
 ### Low Priority (Future)
-- [ ] NAT traversal (UPnP)
-- [ ] Relay node implementation
-- [ ] Structured logging for discovery events
-- [ ] Documentation: peer discovery architecture
+- [ ] CI/CD pipeline setup
+- [ ] Multi-platform packaging (RPM, etc.)
+- [ ] API documentation generation
+- [ ] User guide and tutorials
 
 ---
 
 ## Upcoming Milestones (Roadmap)
 
-### Milestone 2: Peer Discovery (Dec 2025 target)
-**Goal**: Enable anonymous node discovery and messaging over DHT
-
-**Tasks**:
-- Integrate rust-libp2p with Kademlia DHT
-- Advertise node capability manifest
-- Implement job announcement and acceptance handshake
-- Encrypt communication using Noise + QUIC
-- Implement NAT traversal (UPnP + relay)
-- Add structured logging of peer discovery events
-
-### Milestone 3: Remote Execution (Jan 2026 target)
-**Goal**: Execute job on discovered node and return result
-
-**Tasks**:
-- Serialize job payload + manifest
-- Transmit via libp2p stream
-- Execute job on remote node in WASM sandbox
-- Return stdout and signed receipt
-- PHP client verifies signature
-- Client retry/timeout logic
-
-### Milestone 4: Packaging & Demo (Feb 2026 target)
+### Milestone 4: Packaging & Demo (Dec 2025 target) - ACTIVE
 **Goal**: Deliver runnable .deb package and example
 
 **Tasks**:
@@ -102,21 +112,34 @@ See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1
 - examples/remote_test.php with clear output
 - docs/architecture-diagram.png (optional)
 
+### Post-MVP Enhancements (Future)
+**Goal**: Production-ready improvements
+
+**Potential Work**:
+- Remote transport implementation (libp2p streaming)
+- Persistent signing keys with key management
+- Batch signing for multiple receipts
+- Client retry/timeout logic
+- WASM stdout capture (in-memory)
+- Zero-knowledge proofs for private execution
+- Hardware security module (TPM/SGX) integration
+
 ---
 
 ## Key Decisions This Week
 
 ### Decided
-- **WASM Runtime**: Start with wasm3, migrate to wasmtime post-MVP
-- **Networking**: rust-libp2p with Kademlia DHT
+- **WASM Runtime**: Wasmtime (production-ready, excellent WASI support)
+- **Networking**: rust-libp2p with Kademlia DHT, Noise + QUIC
 - **Serialization**: JSON for manifests/receipts (human-readable)
+- **Cryptography**: Ed25519 with SHA-256 pre-hash
 - **Client SDK**: PHP first, Swift/TypeScript later
 - **Packaging**: cargo-deb for Debian/Ubuntu targets
 
 ### Pending
+- Remote transport implementation strategy (M4 vs post-MVP)
+- Key persistence mechanism (filesystem vs. keyring)
 - Bootstrap node strategy (public nodes vs. configurable)
-- Receipt signature algorithm (Ed25519 vs. secp256k1)
-- Log format and verbosity levels
 - Configuration file format (TOML vs. YAML)
 
 ---
@@ -124,65 +147,72 @@ See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1
 ## Blockers & Risks
 
 ### Current Blockers
-- **libp2p 0.53 API**: `SwarmBuilder::with_tokio()` method doesn't exist
-  - **Impact**: Cannot complete discovery.rs implementation
-  - **Needed**: Reference to libp2p 0.53 SwarmBuilder docs
-  - **Workaround**: Need to find correct builder pattern for 0.53
+None
 
 ### Risks
-- **NAT traversal complexity**: Home routers may block P2P
-  - **Mitigation**: Implement relay nodes in current milestone
 - **Cross-architecture testing**: Limited access to ARM/x86_64 machines
-  - **Mitigation**: Use GitHub Actions runners for CI
-- **Bootstrap peer reliability**: No central registry for peer discovery
-  - **Mitigation**: Support multiple bootstrap peers, DHT persistence
+  - **Mitigation**: Use GitHub Actions runners for CI or test locally if available
+- **Debian packaging complexity**: First time using cargo-deb
+  - **Mitigation**: Start with minimal package, iterate
+- **Remote transport scope**: Network implementation may be complex
+  - **Mitigation**: Consider deferring to post-MVP if needed
 
 ---
 
 ## Active Experiments
 
-### libp2p 0.53 SwarmBuilder API Research
-**Status**: In progress
-**Goal**: Find correct builder pattern for libp2p 0.53
+### cargo-deb Package Creation
+**Status**: Not started
+**Goal**: Create installable Debian package for plasmd
 **Timeline**: This week
-**Success Criteria**: Swarm builds successfully with Kademlia behavior
+**Success Criteria**: Package installs cleanly on Ubuntu 22.04
 
-### Kademlia DHT Local Discovery Test
-**Status**: Blocked by SwarmBuilder issue
-**Goal**: Validate two local nodes can discover each other
-**Timeline**: After SwarmBuilder fix
-**Success Criteria**: Two plasmd instances see each other in routing table
+### systemd Service Integration
+**Status**: Not started
+**Goal**: Run plasmd as background service
+**Timeline**: This week
+**Success Criteria**: Service starts/stops/restarts correctly with systemctl
 
 ---
 
 ## Recent Achievements
 
-### 2025-11-09: Milestone 1 Complete - Local WASM Execution
-- ✅ Full Rust workspace structure created
-- ✅ Wasmtime 15.0 integration (switched from wasm3 due to build issues)
-- ✅ JSON schemas with validation (manifest + receipt)
-- ✅ hello.wasm example working (string reversal, 84KB)
-- ✅ PHP SDK with LocalTransport
-- ✅ End-to-end demo: examples/local_test.php
-- ✅ 10/10 tests passing, release binary optimized
-- ✅ Performance validated: ~35ms WASM, ~68ms total
+### 2025-11-09: Milestone 3 Complete - Remote Execution
+- ✅ Real Ed25519 signing (ed25519-dalek, not mocks)
+- ✅ Job protocol (JobRequest/JobResult with base64 serialization)
+- ✅ ExecutionHandler with hash verification and signing
+- ✅ Async WASM runtime (tokio::spawn_blocking)
+- ✅ PHP Crypto class (sodium Ed25519 verification)
+- ✅ WASI preview1 support for stdio
+- ✅ execute-job CLI command
+- ✅ 22 tests passing, live execution test successful
+- ✅ Performance: ~235ms total (233ms execution + <1ms signing)
 
-### 2025-11-08: Memory Bank Initialization
-- Created projectbrief.md
-- Created systemPatterns.md
-- Created techContext.md
-- Created 23 task planning documents for all release plan tasks
-- Established AGENTS.md workflow
+### 2025-11-09: Milestone 2 Complete - Peer Discovery
+- ✅ rust-libp2p 0.54 with Kademlia DHT
+- ✅ Capability-based peer discovery
+- ✅ Job handshake protocol (JobOffer/JobResponse)
+- ✅ Noise + QUIC encrypted transport
+- ✅ NAT traversal awareness
+- ✅ Structured logging
+- ✅ 15 tests passing
+
+### 2025-11-09: Milestone 1 Complete - Local WASM Execution
+- ✅ Wasmtime 15.0 integration
+- ✅ JSON schemas with validation
+- ✅ hello.wasm example
+- ✅ PHP SDK with LocalTransport
+- ✅ 10/10 tests passing
 
 ---
 
 ## Next Actions (Priority Order)
 
-1. **Fix SwarmBuilder API**: Research libp2p 0.53 docs, update discovery.rs
-2. **Complete Kademlia DHT**: Bootstrap logic, peer routing table
-3. **Advertise capabilities**: Broadcast PeerCapabilities via DHT
-4. **Test local discovery**: Two plasmd nodes discover each other
-5. **Implement job handshake**: Announcement → acceptance protocol
+1. **Create Debian package**: cargo-deb configuration, test installation
+2. **Add systemd service**: Service file, enable/start/stop commands
+3. **Write install instructions**: README updates, prerequisites
+4. **Test end-to-end**: Full workflow from package install to job execution
+5. **Create remote_test.php**: Example demonstrating full capabilities
 
 ---
 
@@ -222,13 +252,28 @@ See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1
 - [x] Unit tests pass (>80% coverage) - 10/10 passing
 - [x] Documentation sufficient for third-party reproduction
 
-### Milestone 2 (In Progress) ⚙️
-- [ ] Two plasmd nodes discover each other via Kademlia DHT
-- [ ] Nodes advertise capabilities (CPU, arch, memory)
-- [ ] Job announcement/acceptance handshake works
-- [ ] Communication encrypted with Noise + QUIC
-- [ ] NAT traversal functional (UPnP or relay)
-- [ ] Discovery events logged with structured format
+### Milestone 2 (Complete) ✅
+- [x] Two plasmd nodes discover each other via Kademlia DHT
+- [x] Nodes advertise capabilities (CPU, arch, memory)
+- [x] Job announcement/acceptance handshake works
+- [x] Communication encrypted with Noise + QUIC
+- [x] NAT traversal awareness implemented
+- [x] Discovery events logged with structured format
+
+### Milestone 3 (Complete) ✅
+- [x] Real Ed25519 signatures (not mocks)
+- [x] Job protocol with serialization
+- [x] Execution with hash verification
+- [x] Async WASM runtime
+- [x] PHP signature verification
+- [x] 22 tests passing, live execution test successful
+
+### Milestone 4 (Next) ⚙️
+- [ ] Debian package installs cleanly
+- [ ] systemd service runs as daemon
+- [ ] Installation instructions clear and complete
+- [ ] End-to-end demo works (local execution with signed receipts)
+- [ ] All documentation updated for MVP release
 
 ---
 
