@@ -145,10 +145,12 @@ Total:       ████░░░░░░  11/23 (48%)
 ## Blockers & Issues
 
 ### Current Blockers
-None
+- **libp2p 0.53 API**: `SwarmBuilder::with_tokio()` doesn't exist - needs updated docs reference
 
 ### Known Issues
-None (pre-development)
+- Receipt signing stubbed (placeholder signatures) - real signing in Milestone 3
+- Daemon mode not implemented (stub only) - implementation in Milestone 2
+- WASM stdout inherited, not captured in-memory (works but not ideal)
 
 ### Risks Being Monitored
 - wasm3 maintenance status (mitigation: plan wasmtime migration)

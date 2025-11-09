@@ -1,50 +1,69 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2025-11-08
-**Sprint**: MVP Foundation (Nov 2025)
-**Status**: Planning & Architecture
+**Last Updated**: 2025-11-09
+**Sprint**: Peer Discovery (Nov-Dec 2025)
+**Status**: Milestone 1 Complete, Milestone 2 In Progress
 
 ---
 
 ## Current Focus
 
-Building the foundational components for Phase Open MVP (v0.1) - anonymous peer-to-peer distributed WASM execution.
+Implementing peer discovery infrastructure for Phase Open MVP (v0.1) - anonymous peer-to-peer distributed WASM execution.
 
-### Active Milestone: Local WASM Execution
+### Milestone 1: Local WASM Execution ✅ COMPLETE
 
-**Goal**: Run WASM workloads locally via plasm daemon
+**Completed**: 2025-11-09
 
-**Status**: Planning complete, ready for implementation
+**Achievements**:
+1. ✅ Rust workspace with daemon/, php-sdk/, examples/, wasm-examples/
+2. ✅ Wasmtime 15.0 runtime with resource limits and WASI support
+3. ✅ JSON schemas (manifest.schema.json, receipt.schema.json)
+4. ✅ hello.wasm example (string reversal, 84KB binary)
+5. ✅ PHP client SDK with LocalTransport + working demo
+
+**Metrics**: 10/10 tests passing, ~35ms WASM execution, ~68ms total
+
+See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1_local_wasm_execution.md)
+
+### Active Milestone: Peer Discovery ⚙️ IN PROGRESS
+
+**Goal**: Enable anonymous node discovery and messaging over DHT
+
+**Status**: 1/6 tasks complete (17%)
 
 **Remaining Tasks**:
-1. Initialize repo structure (daemon/, php-sdk/, examples/) - **PLANNED**
-2. Implement wasm3 runner: load .wasm, run, capture stdout - **PLANNED**
-3. Define manifest.json & receipt.json schemas - **PLANNED**
-4. Provide example job hello.wasm (reverse string) - **PLANNED**
-5. Create PHP client library and local demo script - **PLANNED**
+1. ⚙️ Integrate libp2p Kademlia - **IN PROGRESS** (SwarmBuilder API issue)
+2. 🔵 Advertise node capability manifest - **PLANNED**
+3. 🔵 Implement job announcement/acceptance handshake - **PLANNED**
+4. 🔵 Encrypt communication using Noise + QUIC - **PLANNED**
+5. 🔵 Implement NAT traversal (UPnP + relay) - **PLANNED**
+6. 🔵 Add structured logging of peer discovery - **PLANNED**
+
+**Current Blocker**: libp2p 0.53 SwarmBuilder API incompatibility
 
 ---
 
 ## Current Sprint Backlog
 
 ### High Priority (This Week)
-- [ ] Set up Rust workspace structure (daemon/, libs/)
-- [ ] Integrate wasm3 with basic load/execute/capture
-- [ ] Define and implement manifest.json schema
-- [ ] Define and implement receipt.json schema
-- [ ] Create hello.wasm example (reverse string in Rust → WASM)
+- [ ] Fix libp2p 0.53 SwarmBuilder API in discovery.rs
+- [ ] Complete Kademlia DHT integration
+- [ ] Implement PeerCapabilities advertisement
+- [ ] Add bootstrap peer parsing and connection
+- [ ] Test peer discovery locally (two nodes)
 
-### Medium Priority (Next Week)
-- [ ] Build PHP client SDK skeleton (Composer package)
-- [ ] Implement local transport (in-process execution)
-- [ ] Create examples/local_test.php demo
-- [ ] Write unit tests for WASM execution
-- [ ] Set up CI/CD pipeline (GitHub Actions)
+### Medium Priority (Next 1-2 Weeks)
+- [ ] Implement job announcement protocol
+- [ ] Implement job acceptance handshake
+- [ ] Add Noise encryption integration
+- [ ] Add QUIC transport support
+- [ ] Write unit tests for discovery module
 
 ### Low Priority (Future)
-- [ ] Documentation: architecture diagram
-- [ ] Documentation: developer setup guide
-- [ ] Benchmarking: execution overhead measurement
+- [ ] NAT traversal (UPnP)
+- [ ] Relay node implementation
+- [ ] Structured logging for discovery events
+- [ ] Documentation: peer discovery architecture
 
 ---
 
@@ -105,35 +124,48 @@ Building the foundational components for Phase Open MVP (v0.1) - anonymous peer-
 ## Blockers & Risks
 
 ### Current Blockers
-None
+- **libp2p 0.53 API**: `SwarmBuilder::with_tokio()` method doesn't exist
+  - **Impact**: Cannot complete discovery.rs implementation
+  - **Needed**: Reference to libp2p 0.53 SwarmBuilder docs
+  - **Workaround**: Need to find correct builder pattern for 0.53
 
 ### Risks
-- **wasm3 maintenance**: Project not actively maintained
-  - **Mitigation**: Plan wasmtime migration early
 - **NAT traversal complexity**: Home routers may block P2P
-  - **Mitigation**: Implement relay nodes in Milestone 2
+  - **Mitigation**: Implement relay nodes in current milestone
 - **Cross-architecture testing**: Limited access to ARM/x86_64 machines
   - **Mitigation**: Use GitHub Actions runners for CI
+- **Bootstrap peer reliability**: No central registry for peer discovery
+  - **Mitigation**: Support multiple bootstrap peers, DHT persistence
 
 ---
 
 ## Active Experiments
 
-### wasm3 Integration Proof-of-Concept
-**Status**: Researching Rust bindings
-**Goal**: Validate wasm3 can execute WASM and capture stdout
+### libp2p 0.53 SwarmBuilder API Research
+**Status**: In progress
+**Goal**: Find correct builder pattern for libp2p 0.53
 **Timeline**: This week
-**Success Criteria**: Hello world WASM executes, stdout captured
+**Success Criteria**: Swarm builds successfully with Kademlia behavior
 
-### libp2p DHT Bootstrap
-**Status**: Not started
-**Goal**: Validate Kademlia discovery works without central server
-**Timeline**: Next sprint (Milestone 2)
-**Success Criteria**: Two local nodes discover each other via DHT
+### Kademlia DHT Local Discovery Test
+**Status**: Blocked by SwarmBuilder issue
+**Goal**: Validate two local nodes can discover each other
+**Timeline**: After SwarmBuilder fix
+**Success Criteria**: Two plasmd instances see each other in routing table
 
 ---
 
 ## Recent Achievements
+
+### 2025-11-09: Milestone 1 Complete - Local WASM Execution
+- ✅ Full Rust workspace structure created
+- ✅ Wasmtime 15.0 integration (switched from wasm3 due to build issues)
+- ✅ JSON schemas with validation (manifest + receipt)
+- ✅ hello.wasm example working (string reversal, 84KB)
+- ✅ PHP SDK with LocalTransport
+- ✅ End-to-end demo: examples/local_test.php
+- ✅ 10/10 tests passing, release binary optimized
+- ✅ Performance validated: ~35ms WASM, ~68ms total
 
 ### 2025-11-08: Memory Bank Initialization
 - Created projectbrief.md
@@ -146,11 +178,11 @@ None
 
 ## Next Actions (Priority Order)
 
-1. **Create Rust workspace**: Set up daemon/, libs/, examples/ structure
-2. **Integrate wasm3**: Add dependency, create WasmRuntime trait
-3. **Define schemas**: Manifest and Receipt JSON schemas with validation
-4. **Build hello.wasm**: Rust program that reverses stdin → stdout
-5. **Test local execution**: Unit tests for WASM load/execute/capture
+1. **Fix SwarmBuilder API**: Research libp2p 0.53 docs, update discovery.rs
+2. **Complete Kademlia DHT**: Bootstrap logic, peer routing table
+3. **Advertise capabilities**: Broadcast PeerCapabilities via DHT
+4. **Test local discovery**: Two plasmd nodes discover each other
+5. **Implement job handshake**: Announcement → acceptance protocol
 
 ---
 
@@ -180,15 +212,24 @@ None
 
 ---
 
-## Success Metrics (Milestone 1)
+## Success Metrics
 
-- [ ] `plasmd` binary compiles without errors
-- [ ] `hello.wasm` executes and outputs "dlroW ,olleH"
-- [ ] PHP client can submit job locally and retrieve result
-- [ ] Receipt includes module hash, wall time, exit code
-- [ ] Unit tests pass (>80% coverage)
-- [ ] Documentation sufficient for third-party reproduction
+### Milestone 1 (Complete) ✅
+- [x] `plasmd` binary compiles without errors
+- [x] `hello.wasm` executes and outputs "dlroW ,olleH"
+- [x] PHP client can submit job locally and retrieve result
+- [x] Receipt includes module hash, wall time, exit code
+- [x] Unit tests pass (>80% coverage) - 10/10 passing
+- [x] Documentation sufficient for third-party reproduction
+
+### Milestone 2 (In Progress) ⚙️
+- [ ] Two plasmd nodes discover each other via Kademlia DHT
+- [ ] Nodes advertise capabilities (CPU, arch, memory)
+- [ ] Job announcement/acceptance handshake works
+- [ ] Communication encrypted with Noise + QUIC
+- [ ] NAT traversal functional (UPnP or relay)
+- [ ] Discovery events logged with structured format
 
 ---
 
-**This document is updated weekly. Last review: 2025-11-08**
+**This document is updated weekly. Last review: 2025-11-09**
