@@ -113,9 +113,17 @@ impl Discovery {
 
     /// Bootstrap the DHT
     pub fn bootstrap(&mut self) -> Result<()> {
-        self.swarm.behaviour_mut().bootstrap()?;
-        info!("DHT bootstrap initiated");
-        Ok(())
+        match self.swarm.behaviour_mut().bootstrap() {
+            Ok(_) => {
+                info!("DHT bootstrap initiated");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("DHT bootstrap failed (this is normal for standalone nodes): {}", e);
+                warn!("Node will wait for incoming connections or manual peer additions");
+                Ok(())  // Not fatal - continue running
+            }
+        }
     }
 
     /// Get local peer ID
