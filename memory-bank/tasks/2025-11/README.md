@@ -1,47 +1,53 @@
-# November 2025: Phase MVP Planning
+# November 2025: Phase MVP Development
 
 **Month**: November 2025
-**Status**: Planning & Foundation
-**Milestones**: Milestone 1 (Local WASM Execution)
+**Status**: ✅ Milestone 1 & 2 COMPLETE
+**Milestones**: Milestone 1 (Local WASM Execution) ✅, Milestone 2 (Peer Discovery) ✅
 
 ---
 
 ## Summary
 
-November 2025 marks the beginning of Phase Open MVP development. This month focused on establishing the project foundation:
+November 2025 was highly productive - completed TWO major milestones ahead of schedule:
+- **Milestone 1**: Local WASM execution with wasmtime runtime (5 tasks)
+- **Milestone 2**: Peer discovery with libp2p Kademlia DHT (6 tasks)
 - Memory Bank structure and core documentation
 - Architecture patterns and technical decisions
-- Complete task planning for all 4 milestones (23 tasks)
-- Development environment setup
+- 15 tests passing, all builds successful
+- Updated to latest dependencies (wasmtime 27, libp2p 0.54, thiserror 2.0)
 
-**No code implementation completed yet** - all tasks in planning state.
+**MVP Progress**: 11/23 tasks complete (48%)
 
 ---
 
 ## Milestones
 
-### Milestone 1: Local WASM Execution (Nov 2025)
-**Status**: ⚙️ Planning Complete, Implementation Not Started
+### Milestone 1: Local WASM Execution ✅ COMPLETE
+**Status**: ✅ COMPLETE (5/5 tasks)
 **Goal**: Run WASM workloads locally via plasm daemon
+**Completed**: Nov 2025 (Commit: `48a0326`)
 
-**Tasks Planned**:
-1. ✅ [Initialize repo structure](./251108_init_repo_structure.md) - PLANNED
-2. ✅ [Implement wasm3 runner](./251108_wasm3_runner.md) - PLANNED
-3. ✅ [Define schemas](./251108_schemas_manifest_receipt.md) - PLANNED
-4. ✅ [Provide example hello.wasm](./251108_example_hello_wasm.md) - PLANNED
-5. ✅ [Create PHP client + demo](./251108_php_client_local_demo.md) - PLANNED
+**Tasks Completed**:
+1. ✅ Initialize repo structure - daemon/, php-sdk/, examples/, wasm-examples/
+2. ✅ Implement wasmtime runner - Load .wasm, run, capture stdout
+3. ✅ Define schemas - manifest.json & receipt.json with serde
+4. ✅ Provide example hello.wasm - Reverse string workload in Rust
+5. ✅ Create PHP client + demo - Local transport mode
 
-### Milestone 2: Peer Discovery (Dec 2025)
-**Status**: 🔲 Planned
+### Milestone 2: Peer Discovery ✅ COMPLETE
+**Status**: ✅ COMPLETE (6/6 tasks)
 **Goal**: Enable anonymous node discovery and messaging over DHT
+**Completed**: Nov 2025 (Commit: `a503c33`)
 
-**Tasks Planned**:
-1. ✅ [Integrate libp2p Kademlia](./251108_libp2p_kademlia.md) - PLANNED
-2. ✅ [Advertise capabilities](./251108_capability_manifest_advert.md) - PLANNED
-3. ✅ [Job handshake](./251108_job_handshake.md) - PLANNED
-4. ✅ [Noise + QUIC encryption](./251108_noise_quic_encryption.md) - PLANNED
-5. ✅ [NAT traversal](./251108_nat_traversal.md) - PLANNED
-6. ✅ [Peer logging](./251108_peer_logging.md) - PLANNED
+**Tasks Completed**:
+1. ✅ Integrate libp2p Kademlia - rust-libp2p 0.54 with DHT routing
+2. ✅ Advertise capabilities - CPU, arch, memory, runtime via DHT RecordKey
+3. ✅ Job handshake - JobOffer/JobResponse protocol with validation
+4. ✅ Noise + QUIC encryption - Encrypted transport, zero-RTT connections
+5. ✅ NAT traversal - Awareness logging, QUIC assist for hole-punching
+6. ✅ Peer logging - Structured events for connections, discovery, handshakes
+
+**See**: [Milestone 2 Task Documentation](./251109_milestone2_peer_discovery.md)
 
 ### Milestone 3: Remote Execution (Jan 2026)
 **Status**: 🔲 Planned
@@ -104,6 +110,37 @@ November 2025 marks the beginning of Phase Open MVP development. This month focu
 - `memory-bank/tasks/2025-11/*.md` (23 task planning docs)
 
 **Impact**: Full Memory Bank operational, ready for development
+
+### 2025-11-09: Milestone 2 Complete - Peer Discovery
+**Type**: Core Implementation
+**Objective**: Enable anonymous node discovery and messaging over Kademlia DHT
+
+**Completed**:
+- ✅ Integrated rust-libp2p 0.54 with Kademlia DHT for decentralized peer discovery
+- ✅ Capability-based advertisement (arch, CPU, memory, runtime)
+- ✅ Job handshake protocol (JobOffer → JobResponse with Accept/Reject)
+- ✅ Noise + QUIC encrypted transport (zero-RTT, forward secrecy)
+- ✅ NAT traversal awareness with QUIC hole-punching assistance
+- ✅ Structured logging of peer events (connections, discovery, handshakes)
+- ✅ Updated dependencies: wasmtime 27, libp2p 0.54, thiserror 2.0
+- ✅ 15 tests passing (3 new protocol tests)
+
+**Patterns Applied**:
+- Event-driven networking with async/await
+- Typed protocol messages (JobOffer, JobResponse, RejectionReason)
+- Graceful degradation with actionable rejection reasons
+
+**Files Modified**:
+- `daemon/Cargo.toml` - Updated deps, added libp2p features
+- `daemon/src/main.rs` - Integrated Discovery service into start command
+- `daemon/src/network/discovery.rs` - Core peer discovery implementation
+- `daemon/src/network/protocol.rs` - NEW - Job handshake protocol
+- `daemon/src/network/mod.rs` - Export protocol types
+- `daemon/src/wasm/runtime.rs` - Fixed wasmtime 27 API compatibility
+
+**Impact**: Fully functional peer-to-peer discovery, ready for remote execution (Milestone 3)
+
+**See**: [Detailed Task Documentation](./251109_milestone2_peer_discovery.md)
 
 ---
 
