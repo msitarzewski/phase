@@ -4,6 +4,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum WasmError {
     #[error("Failed to create WASM runtime: {0}")]
     RuntimeCreationError(String),
@@ -58,7 +59,7 @@ pub trait WasmRuntime {
 /// Wasmtime-based WASM runtime implementation (with full WASI support)
 pub struct Wasm3Runtime {
     max_memory_bytes: u64,
-    stack_size_bytes: u64,
+    _stack_size_bytes: u64,
 }
 
 impl Wasm3Runtime {
@@ -66,7 +67,7 @@ impl Wasm3Runtime {
     pub fn new() -> Self {
         Self {
             max_memory_bytes: 128 * 1024 * 1024, // 128 MB
-            stack_size_bytes: 64 * 1024,         // 64 KB
+            _stack_size_bytes: 64 * 1024,        // 64 KB
         }
     }
 
@@ -77,8 +78,9 @@ impl Wasm3Runtime {
     }
 
     /// Set stack size
+    #[allow(dead_code)]
     pub fn with_stack_size(mut self, bytes: u64) -> Self {
-        self.stack_size_bytes = bytes;
+        self._stack_size_bytes = bytes;
         self
     }
 
@@ -102,10 +104,9 @@ impl Wasm3Runtime {
     fn execute_sync(
         wasm_bytes: &[u8],
         timeout: Duration,
-        max_memory_bytes: u64,
+        _max_memory_bytes: u64,
     ) -> Result<ExecutionResult> {
         use wasmtime::*;
-        use wasmtime_wasi::{WasiCtxBuilder, ResourceTable, WasiView};
 
         info!("Executing WASM module ({} bytes)", wasm_bytes.len());
         let start = Instant::now();
@@ -227,7 +228,7 @@ mod tests {
             .with_stack_size(128 * 1024);
 
         assert_eq!(runtime.max_memory_bytes, 256 * 1024 * 1024);
-        assert_eq!(runtime.stack_size_bytes, 128 * 1024);
+        assert_eq!(runtime._stack_size_bytes, 128 * 1024);
     }
 
     #[test]

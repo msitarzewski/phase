@@ -82,6 +82,7 @@ impl Receipt {
     }
 
     /// Verify the receipt signature
+    #[allow(dead_code)]
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<bool, String> {
         // Decode signature
         let signature_bytes = hex::decode(&self.signature)
@@ -107,6 +108,7 @@ impl Receipt {
     }
 
     /// Verify using hex-encoded public key
+    #[allow(dead_code)]
     pub fn verify_with_pubkey_hex(&self, pubkey_hex: &str) -> Result<bool, String> {
         let pubkey_bytes = hex::decode(pubkey_hex)
             .map_err(|e| format!("Invalid pubkey hex: {}", e))?;
@@ -126,12 +128,14 @@ impl Receipt {
     }
 
     /// Deserialize from JSON
+    #[allow(dead_code)]
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json)
             .map_err(|e| format!("Failed to deserialize receipt: {}", e))
     }
 
     /// Load from JSON file
+    #[allow(dead_code)]
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read file: {}", e))?;
@@ -139,6 +143,7 @@ impl Receipt {
     }
 
     /// Save to JSON file
+    #[allow(dead_code)]
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), String> {
         let json = self.to_json()?;
         std::fs::write(path, json)

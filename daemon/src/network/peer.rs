@@ -2,6 +2,7 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
 /// Information about a discovered peer
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     /// Peer ID
@@ -42,6 +43,7 @@ impl Default for PeerCapabilities {
 }
 
 impl PeerInfo {
+    #[allow(dead_code)]
     pub fn new(peer_id: PeerId, capabilities: PeerCapabilities) -> Self {
         Self {
             peer_id: peer_id.to_string(),
