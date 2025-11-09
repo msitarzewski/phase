@@ -112,6 +112,8 @@ cargo deb
 # Package will be created at: target/debian/plasm_0.1.0_amd64.deb
 ```
 
+**For detailed build instructions, troubleshooting, and verification steps**, see the comprehensive build guide: **[docs/building-on-ubuntu.md](docs/building-on-ubuntu.md)**
+
 ### Installing on Ubuntu/Debian
 
 ```bash
