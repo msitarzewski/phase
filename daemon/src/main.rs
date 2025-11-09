@@ -5,6 +5,7 @@ use tracing_subscriber;
 
 mod config;
 mod wasm;
+mod network;
 
 use wasm::runtime::WasmRuntime;
 
