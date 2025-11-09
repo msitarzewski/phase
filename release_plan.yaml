@@ -1,42 +1,87 @@
 version: 0.1
 title: Phase Open MVP Release Plan
+updated: 2025-11-09
+progress: 17/23 tasks (74%)
 
 milestones:
-  - name: "Local WASM Execution"
+  - name: "Milestone 1: Local WASM Execution"
     goal: "Run WASM workloads locally via plasm daemon"
+    status: COMPLETE
+    completed: 2025-11-09
+    commit: 48a0326
     tasks:
-      - "Initialize repo structure (daemon/, php-sdk/, examples/)"
-      - "Implement wasm3 runner: load .wasm, run, capture stdout"
-      - "Define manifest.json & receipt.json schemas"
-      - "Provide example job hello.wasm (reverse string)"
-      - "Create PHP client library and local demo script"
+      - task: "Initialize repo structure (daemon/, php-sdk/, examples/)"
+        status: DONE
+      - task: "Implement wasmtime runner: load .wasm, run, capture stdout"
+        status: DONE
+        note: "Used wasmtime instead of wasm3 (better WASI support)"
+      - task: "Define manifest.json & receipt.json schemas"
+        status: DONE
+      - task: "Provide example job hello.wasm (reverse string)"
+        status: DONE
+      - task: "Create PHP client library and local demo script"
+        status: DONE
 
-  - name: "Peer Discovery"
+  - name: "Milestone 2: Peer Discovery"
     goal: "Enable anonymous node discovery and messaging over DHT"
+    status: COMPLETE
+    completed: 2025-11-09
+    commit: a503c33
     tasks:
-      - "Integrate rust-libp2p with Kademlia DHT"
-      - "Advertise node capability manifest (CPU, arch, port)"
-      - "Implement job announcement and acceptance handshake"
-      - "Encrypt communication using Noise + QUIC"
-      - "Implement NAT traversal (UPnP + relay)"
-      - "Add structured logging of peer discovery events"
+      - task: "Integrate rust-libp2p with Kademlia DHT"
+        status: DONE
+        note: "Using libp2p 0.54"
+      - task: "Advertise node capability manifest (CPU, arch, memory, runtime)"
+        status: DONE
+      - task: "Implement job announcement and acceptance handshake"
+        status: DONE
+        note: "JobOffer/JobResponse protocol with validation"
+      - task: "Encrypt communication using Noise + QUIC"
+        status: DONE
+      - task: "Implement NAT traversal awareness (QUIC assist)"
+        status: DONE
+        note: "Awareness logging, QUIC hole-punching support"
+      - task: "Add structured logging of peer discovery events"
+        status: DONE
 
-  - name: "Remote Execution"
+  - name: "Milestone 3: Remote Execution"
     goal: "Execute job on discovered node and return result"
+    status: COMPLETE
+    completed: 2025-11-09
+    commit: b57c0b1
     tasks:
-      - "Serialize job payload + manifest"
-      - "Transmit via libp2p stream"
-      - "Execute job on remote node in WASM sandbox"
-      - "Return stdout and signed receipt"
-      - "PHP client verifies signature"
-      - "Client retry/timeout logic"
+      - task: "Implement Ed25519 signing for receipts"
+        status: DONE
+        note: "Real crypto with ed25519-dalek, canonical message format"
+      - task: "Job protocol (JobRequest/JobResult)"
+        status: DONE
+        note: "Base64 serialization for WASM bytes"
+      - task: "ExecutionHandler with hash verification"
+        status: DONE
+        note: "Module hash verification + signing"
+      - task: "Async WASM runtime integration"
+        status: DONE
+        note: "tokio::spawn_blocking for sync WASM in async context"
+      - task: "PHP signature verification"
+        status: DONE
+        note: "Crypto class using sodium extension"
+      - task: "Testing and CLI command"
+        status: DONE
+        note: "22 tests passing, execute-job CLI command"
 
-  - name: "Packaging & Demo"
+  - name: "Milestone 4: Packaging & Demo"
     goal: "Deliver runnable .deb package and example"
+    status: NOT_STARTED
     tasks:
-      - "Create Debian package using cargo-deb"
-      - "Add systemd service for plasmd"
-      - "Write install instructions"
-      - "Cross-arch demo: macOS ARM client → Ubuntu x86_64 node"
-      - "examples/remote_test.php with clear output"
-      - "docs/architecture-diagram.png (optional)"
+      - task: "Create Debian package using cargo-deb"
+        status: TODO
+      - task: "Add systemd service for plasmd"
+        status: TODO
+      - task: "Write install instructions"
+        status: TODO
+      - task: "Cross-arch demo: macOS ARM client → Ubuntu x86_64 node"
+        status: TODO
+      - task: "examples/remote_test.php with clear output"
+        status: TODO
+      - task: "docs/architecture-diagram.png (optional)"
+        status: TODO
