@@ -57,8 +57,28 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Start { config } => {
             info!("Starting plasmd with config: {}", config);
-            // TODO: Implement daemon mode (Milestone 2+)
-            info!("Daemon mode not yet implemented (coming in Milestone 2)");
+
+            // Create discovery configuration
+            let disc_config = network::DiscoveryConfig::default();
+
+            // Create discovery service
+            let mut discovery = network::Discovery::new(disc_config)?;
+
+            // Start listening
+            discovery.listen("/ip4/0.0.0.0/tcp/0")?;
+
+            // Bootstrap DHT
+            discovery.bootstrap()?;
+
+            // Advertise this node's capabilities
+            discovery.advertise_capabilities()?;
+
+            info!("Phase daemon started. Peer ID: {}", discovery.local_peer_id());
+            info!("Capabilities: {:?}", discovery.capabilities());
+
+            // Run event loop
+            discovery.run().await?;
+
             Ok(())
         }
         Commands::Run { wasm_file, args, quiet } => {

@@ -10,6 +10,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::peer::{PeerCapabilities, PeerInfo};
+use super::protocol::{JobOffer, JobResponse, RejectionReason};
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -52,12 +53,11 @@ impl Discovery {
 
         // Create Kademlia behaviour
         let store = MemoryStore::new(local_peer_id);
-        let kad_config = KademliaConfig::default();
-        let mut kad_behaviour = KademliaBehaviour::with_config(local_peer_id, store, kad_config);
+        let kad_behaviour = KademliaBehaviour::new(local_peer_id, store);
 
         // Add bootstrap peers
         for peer_addr in &config.bootstrap_peers {
-            if let Ok(addr) = peer_addr.parse::<Multiaddr>() {
+            if let Ok(_addr) = peer_addr.parse::<Multiaddr>() {
                 // Extract peer ID and add
                 // Note: Bootstrap peer format should be: /ip4/x.x.x.x/tcp/port/p2p/PeerID
                 debug!("Adding bootstrap peer: {}", peer_addr);
@@ -65,15 +65,17 @@ impl Discovery {
             }
         }
 
-        // Build swarm
+        // Build swarm with tokio executor
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
-                Default::default(),
+                libp2p::tcp::Config::default(),
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
+            .with_quic()
             .with_behaviour(|_key| kad_behaviour)?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
         Ok(Self {
@@ -111,6 +113,99 @@ impl Discovery {
         &self.capabilities
     }
 
+    /// Advertise this node's capabilities on the DHT
+    pub fn advertise_capabilities(&mut self) -> Result<()> {
+        use libp2p::kad::RecordKey;
+
+        // Create a capability identifier key
+        let capability_key = format!(
+            "/phase/capability/{}/{}",
+            self.capabilities.arch,
+            self.capabilities.wasm_runtime
+        );
+
+        let key = RecordKey::new(&capability_key.as_bytes());
+
+        // Start providing this capability
+        self.swarm.behaviour_mut().start_providing(key)
+            .context("Failed to advertise capabilities")?;
+
+        info!("Advertising capabilities: {}", capability_key);
+        Ok(())
+    }
+
+    /// Discover peers with specific capability
+    pub fn discover_peers(&mut self, arch: &str, runtime: &str) -> Result<()> {
+        use libp2p::kad::RecordKey;
+
+        let capability_key = format!("/phase/capability/{}/{}", arch, runtime);
+        let key = RecordKey::new(&capability_key.as_bytes());
+
+        self.swarm.behaviour_mut().get_providers(key);
+
+        info!("Discovering peers with capability: {}", capability_key);
+        Ok(())
+    }
+
+    /// Handle incoming job offer
+    pub fn handle_job_offer(&self, offer: JobOffer) -> JobResponse {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        info!("Received job offer: {} (module: {})", offer.job_id, offer.module_hash);
+
+        // Check architecture compatibility
+        if offer.requirements.arch != self.capabilities.arch {
+            return JobResponse::Rejected {
+                job_id: offer.job_id,
+                reason: RejectionReason::ArchMismatch {
+                    required: offer.requirements.arch,
+                    available: self.capabilities.arch.clone(),
+                },
+            };
+        }
+
+        // Check runtime compatibility
+        if !self.capabilities.wasm_runtime.contains(&offer.requirements.wasm_runtime.split('-').next().unwrap_or("")) {
+            return JobResponse::Rejected {
+                job_id: offer.job_id,
+                reason: RejectionReason::RuntimeNotSupported {
+                    required: offer.requirements.wasm_runtime,
+                },
+            };
+        }
+
+        // Check resource availability
+        if offer.requirements.cpu_cores > self.capabilities.cpu_cores {
+            return JobResponse::Rejected {
+                job_id: offer.job_id,
+                reason: RejectionReason::InsufficientResources {
+                    missing: format!("CPU: need {}, have {}", offer.requirements.cpu_cores, self.capabilities.cpu_cores),
+                },
+            };
+        }
+
+        if offer.requirements.memory_mb > self.capabilities.memory_mb {
+            return JobResponse::Rejected {
+                job_id: offer.job_id,
+                reason: RejectionReason::InsufficientResources {
+                    missing: format!("Memory: need {} MB, have {} MB", offer.requirements.memory_mb, self.capabilities.memory_mb),
+                },
+            };
+        }
+
+        // Job accepted
+        let estimated_start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        JobResponse::Accepted {
+            job_id: offer.job_id,
+            estimated_start,
+            node_peer_id: self.local_peer_id.to_string(),
+        }
+    }
+
     /// Run the discovery event loop
     pub async fn run(&mut self) -> Result<()> {
         loop {
@@ -120,6 +215,16 @@ impl Discovery {
                 }
                 Some(SwarmEvent::NewListenAddr { address, .. }) => {
                     info!("Listening on new address: {}", address);
+
+                    // Log NAT traversal info
+                    if address.to_string().contains("127.0.0.1") || address.to_string().contains("localhost") {
+                        debug!("Local address - no NAT traversal needed");
+                    } else if address.to_string().contains("0.0.0.0") {
+                        info!("Listening on all interfaces - configure port forwarding for NAT traversal");
+                        info!("Note: QUIC transport assists with NAT traversal");
+                    } else {
+                        info!("External address detected: {}", address);
+                    }
                 }
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
                     info!("Connected to peer: {}", peer_id);

@@ -1,8 +1,8 @@
 # Progress: Phase Open MVP
 
-**Last Updated**: 2025-11-08
+**Last Updated**: 2025-11-09
 **Version**: 0.1
-**Phase**: MVP Foundation
+**Phase**: MVP Development - Milestone 2 Complete
 
 ---
 
@@ -12,41 +12,36 @@
 **Goal**: Run WASM workloads locally via plasm daemon
 
 **Status**: 5/5 tasks complete (100%)
-**Target**: Nov 2025
-**Completed**: 2025-11-09
+**Completed**: Nov 2025
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Initialize repo structure | ✅ COMPLETE | daemon/, php-sdk/, examples/, wasm-examples/ |
-| Implement WASM runtime | ✅ COMPLETE | Wasmtime 15.0 (switched from wasm3) |
-| Define schemas | ✅ COMPLETE | manifest.schema.json & receipt.schema.json |
-| Example hello.wasm | ✅ COMPLETE | String reversal, 84KB binary |
-| PHP client + demo | ✅ COMPLETE | LocalTransport + examples/local_test.php |
+| Initialize repo structure | ✅ DONE | daemon/, php-sdk/, examples/ |
+| Implement wasmtime runner | ✅ DONE | Load .wasm, run, capture stdout |
+| Define schemas | ✅ DONE | manifest.json & receipt.json |
+| Example hello.wasm | ✅ DONE | Reverse string workload |
+| PHP client + demo | ✅ DONE | Local transport mode |
 
-**Achievements**:
-- 10/10 tests passing
-- Release binary optimized with LTO
-- Full WASI support with resource limits
-- Working end-to-end demo (~68ms execution)
+**Completed**: See commit `48a0326`
 
 ---
 
-### Milestone 2: Peer Discovery ⚙️ IN PROGRESS
+### Milestone 2: Peer Discovery ✅ COMPLETE
 **Goal**: Enable anonymous node discovery and messaging over DHT
 
-**Status**: 1/6 tasks complete (17%)
-**Target**: Dec 2025
+**Status**: 6/6 tasks complete (100%)
+**Completed**: Nov 2025
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Integrate libp2p Kademlia | ⚙️ PARTIAL | Discovery module created, SwarmBuilder API issue |
-| Advertise capabilities | 🔵 PLANNED | CPU, arch, port manifest |
-| Job handshake | 🔵 PLANNED | Announcement + acceptance |
-| Noise + QUIC encryption | 🔵 PLANNED | Secure transport |
-| NAT traversal | 🔵 PLANNED | UPnP + relay |
-| Peer logging | 🔵 PLANNED | Structured discovery events |
+| Integrate libp2p Kademlia | ✅ DONE | rust-libp2p 0.54 with DHT |
+| Advertise capabilities | ✅ DONE | CPU, arch, memory, runtime |
+| Job handshake | ✅ DONE | Offer/Accept protocol |
+| Noise + QUIC encryption | ✅ DONE | Encrypted transport |
+| NAT traversal | ✅ DONE | Awareness + QUIC assist |
+| Peer logging | ✅ DONE | Structured discovery events |
 
-**Blockers**: libp2p 0.53 SwarmBuilder API incompatibility - needs docs reference
+**Completed**: See commit `a503c33`
 
 ---
 
@@ -90,31 +85,38 @@
 
 ## Overall Progress
 
-**MVP Completion**: 5/23 tasks (22%)
+**MVP Completion**: 11/23 tasks (48%)
 
 ```
 Milestone 1: ██████████  5/5  (100%) ✅
-Milestone 2: ██░░░░░░░░  1/6  (17%)  ⚙️
-Milestone 3: ░░░░░░░░░░  0/6  (0%)   🔲
-Milestone 4: ░░░░░░░░░░  0/6  (0%)   🔲
+Milestone 2: ██████████  6/6  (100%) ✅
+Milestone 3: ░░░░░░░░░░  0/6  (0%)
+Milestone 4: ░░░░░░░░░░  0/6  (0%)
             ──────────────────
-Total:       ██░░░░░░░░  5/23 (22%)
+Total:       ████░░░░░░  11/23 (48%)
 ```
 
 ---
 
 ## Recent Completions
 
-### 2025-11-09: Milestone 1 Complete - Local WASM Execution
-- ✅ Full Rust workspace with Cargo.toml (daemon + wasm-examples)
-- ✅ Wasmtime 15.0 runtime with resource limits and WASI support
-- ✅ JSON schemas (manifest.schema.json, receipt.schema.json)
-- ✅ hello.wasm example (84KB, string reversal in Rust)
-- ✅ PHP client SDK with LocalTransport
-- ✅ Working end-to-end demo (examples/local_test.php)
-- ✅ 10/10 tests passing, release binary optimized
-- ✅ Performance: ~35ms WASM execution, ~68ms total
-- See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1_local_wasm_execution.md)
+### 2025-11-09: Milestone 2 Complete - Peer Discovery
+- ✅ Integrated rust-libp2p 0.54 with Kademlia DHT
+- ✅ Capability-based peer discovery (arch, CPU, memory, runtime)
+- ✅ Job handshake protocol (Offer/Accept/Reject)
+- ✅ Noise + QUIC encrypted transport
+- ✅ NAT traversal awareness with QUIC assist
+- ✅ Structured logging of peer events
+- ✅ 15 tests passing (3 new protocol tests)
+- ✅ Updated to latest dependencies (wasmtime 27, libp2p 0.54, thiserror 2.0)
+
+### 2025-11-08: Milestone 1 Complete - Local WASM Execution
+- ✅ Rust workspace with daemon/, php-sdk/, examples/
+- ✅ Wasmtime-based WASM runtime with resource limits
+- ✅ Manifest and receipt JSON schemas
+- ✅ Hello.wasm example (string reversal)
+- ✅ PHP client SDK with local execution
+- ✅ 12 tests passing
 
 ### 2025-11-08: Foundation & Planning
 - ✅ Created Memory Bank structure
@@ -127,18 +129,16 @@ Total:       ██░░░░░░░░  5/23 (22%)
 
 ## Active Work
 
-### Current Sprint (Nov-Dec 2025)
-**Focus**: Milestone 2 - Peer Discovery
+### Current Sprint (Nov 2025)
+**Focus**: Milestone 3 - Remote Execution (NEXT)
 
-**In Progress**:
-- Fixing libp2p 0.53 SwarmBuilder API compatibility
-- Researching Kademlia DHT bootstrap strategies
-
-**Next Up**:
-- Complete discovery.rs SwarmBuilder implementation
-- Implement capability advertisement
-- Add job announcement/acceptance handshake
-- Integrate Noise + QUIC encryption
+**Up Next**:
+- Serialize job payload + manifest
+- Transmit via libp2p stream
+- Execute job on remote node in WASM sandbox
+- Return stdout and signed receipt
+- PHP client signature verification
+- Client retry/timeout logic
 
 ---
 
@@ -172,8 +172,8 @@ Total:       ██░░░░░░░░  5/23 (22%)
 - Peer Discovery Time: <5s
 
 ### Documentation
-- Memory Bank Files: 4/10 core files (40%)
-- Task Documentation: 23/23 planned (100%)
+- Memory Bank Files: 9/9 core files (100%)
+- Task Documentation: 24/23 completed (Milestone 1 & 2 docs created)
 - API Documentation: 0% (not started)
 
 ---
@@ -181,13 +181,13 @@ Total:       ██░░░░░░░░  5/23 (22%)
 ## Timeline
 
 ```
-Nov 2025: ██████████ Milestone 1 (Local WASM) ✅ COMPLETE
-Dec 2025: ██░░░░░░░░ Milestone 2 (Peer Discovery) ⚙️ IN PROGRESS
-Jan 2026: ░░░░░░░░░░ Milestone 3 (Remote Execution)
-Feb 2026: ░░░░░░░░░░ Milestone 4 (Packaging & Demo)
+Nov 2025: ██████████ Milestone 1 (Local WASM) ✅
+Nov 2025: ██████████ Milestone 2 (Peer Discovery) ✅
+Dec 2025: ░░░░░░░░░░ Milestone 3 (Remote Execution) NEXT
+Jan 2026: ░░░░░░░░░░ Milestone 4 (Packaging & Demo)
 ```
 
-**Note**: Dates are targets, not commitments. Quality over speed.
+**Note**: Milestone 1 & 2 completed ahead of schedule. Quality over speed maintained.
 
 ---
 

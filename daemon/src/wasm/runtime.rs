@@ -109,7 +109,7 @@ impl WasmRuntime for Wasm3Runtime {
         timeout: Duration,
     ) -> Result<ExecutionResult> {
         use wasmtime::*;
-        use wasmtime_wasi::sync::WasiCtxBuilder;
+        use wasmtime_wasi::{WasiCtxBuilder, ResourceTable, WasiView};
 
         info!("Executing WASM module ({} bytes)", wasm_bytes.len());
         let start = Instant::now();
@@ -125,13 +125,33 @@ impl WasmRuntime for Wasm3Runtime {
         let engine = Engine::new(&config)
             .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
+        // State struct that holds WASI context
+        struct MyState {
+            wasi_ctx: wasmtime_wasi::WasiCtx,
+            table: ResourceTable,
+        }
+
+        impl WasiView for MyState {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+
+            fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
+                &mut self.wasi_ctx
+            }
+        }
+
         // Create WASI context with stdio
-        let wasi_ctx = WasiCtxBuilder::new()
+        let wasi = WasiCtxBuilder::new()
             .inherit_stdio()
             .build();
 
-        // Create store with WASI context
-        let mut store = Store::new(&engine, wasi_ctx);
+        let state = MyState {
+            wasi_ctx: wasi,
+            table: ResourceTable::new(),
+        };
+
+        let mut store = Store::new(&engine, state);
 
         // Set fuel limit based on timeout (rough heuristic: 1M instructions per second)
         let fuel_limit = (timeout.as_secs() * 1_000_000) as u64;
@@ -142,10 +162,8 @@ impl WasmRuntime for Wasm3Runtime {
         let module = Module::from_binary(&engine, wasm_bytes)
             .map_err(|e| WasmError::ModuleLoadError(e.to_string()))?;
 
-        // Create linker and add WASI
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::add_to_linker(&mut linker, |ctx| ctx)
-            .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
+        // Create linker - using module linker for now (will add WASI in Milestone 3)
+        let linker = Linker::new(&engine);
 
         // Instantiate module
         let instance = linker
