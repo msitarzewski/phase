@@ -1,0 +1,440 @@
+# System Patterns: Phase Architecture
+
+**Last Updated**: 2025-11-08
+**Version**: 0.1
+**Status**: MVP - Patterns Emerging
+
+---
+
+## Table of Contents
+
+1. [Core Architecture](#core-architecture)
+2. [WASM Execution Pattern](#wasm-execution-pattern)
+3. [Peer Discovery Pattern](#peer-discovery-pattern)
+4. [Job Lifecycle Pattern](#job-lifecycle-pattern)
+5. [Security & Sandboxing](#security--sandboxing)
+6. [Data Flow Patterns](#data-flow-patterns)
+7. [Error Handling](#error-handling)
+8. [Testing Patterns](#testing-patterns)
+
+---
+
+## Core Architecture
+
+### Layered Architecture
+
+```
+┌─────────────────────────────────────────┐
+│         Client SDKs (PHP, etc.)         │
+├─────────────────────────────────────────┤
+│       Phase Protocol (Manifests)        │
+├─────────────────────────────────────────┤
+│      libp2p (DHT, QUIC, Noise)          │
+├─────────────────────────────────────────┤
+│      Plasm Runtime (Rust Daemon)        │
+├─────────────────────────────────────────┤
+│       WASM Runtime (wasm3/wasmtime)     │
+└─────────────────────────────────────────┘
+```
+
+**Pattern**: Clear separation of concerns
+- **Protocol layer**: Defines messages, schemas, handshakes
+- **Transport layer**: Handles encrypted peer-to-peer communication
+- **Runtime layer**: Executes jobs in sandboxed environment
+- **Client layer**: Provides language-specific bindings
+
+**When to Use**: Always maintain these boundaries. Don't mix protocol logic with transport or execution.
+
+---
+
+## WASM Execution Pattern
+
+### Sandboxed Execution Model
+
+**Pattern**: WASM-only, sandboxed execution with explicit capabilities
+
+```rust
+// Pattern: Load WASM module
+let wasm_bytes = fs::read(&wasm_path)?;
+let module_hash = hash_module(&wasm_bytes);
+
+// Pattern: Initialize runtime with constraints
+let runtime = Wasm3Runtime::new()
+    .with_memory_limit(manifest.memory_mb * 1024 * 1024)
+    .with_cpu_quota(manifest.cpu_seconds)
+    .with_timeout(manifest.timeout_seconds)
+    .build()?;
+
+// Pattern: Execute and capture output
+let result = runtime.execute(&wasm_bytes, &args)?;
+let stdout = result.stdout;
+let stderr = result.stderr;
+let exit_code = result.exit_code;
+
+// Pattern: Generate receipt
+let receipt = Receipt {
+    module_hash,
+    wall_time_ms: result.wall_time,
+    cpu_time_ms: result.cpu_time,
+    exit_code,
+    signature: sign_receipt(&receipt_data, &node_key),
+};
+```
+
+**Key Principles**:
+- Default-deny: No host access unless explicitly granted
+- Resource limits: Memory, CPU, timeout all constrained
+- Deterministic hashing: Module hash for verification
+- Signed receipts: Cryptographic proof of execution
+
+**When to Use**: Every WASM job execution. Never bypass sandbox.
+
+---
+
+## Peer Discovery Pattern
+
+### Kademlia DHT Discovery
+
+**Pattern**: Anonymous peer discovery using libp2p Kademlia DHT
+
+```rust
+// Pattern: Initialize libp2p with Kademlia
+let local_key = Keypair::generate_ed25519();
+let local_peer_id = PeerId::from(local_key.public());
+
+let transport = build_quic_transport(&local_key)?; // QUIC + Noise
+let behaviour = Kademlia::new(local_peer_id.clone());
+
+let swarm = Swarm::new(transport, behaviour, local_peer_id);
+
+// Pattern: Bootstrap to DHT
+for bootstrap_addr in config.bootstrap_nodes {
+    swarm.behaviour_mut().add_address(&bootstrap_peer_id, bootstrap_addr);
+}
+swarm.behaviour_mut().bootstrap()?;
+
+// Pattern: Advertise capabilities
+let capability_key = format!("/phase/capability/{}", capability_id);
+swarm.behaviour_mut().start_providing(capability_key.into_bytes())?;
+
+// Pattern: Discover peers with capability
+swarm.behaviour_mut().get_providers(capability_key.into_bytes());
+```
+
+**Key Principles**:
+- Anonymous: No identity required, ephemeral peer IDs
+- Decentralized: No central bootstrap (configurable bootstrap nodes)
+- Capability-based: Discover peers by advertised capabilities
+- Persistent peerstore: Cache discovered peers for faster reconnection
+
+**When to Use**:
+- Node startup: Bootstrap to DHT
+- Job submission: Discover peers with required capabilities
+- Periodic: Re-advertise capabilities (every 30min)
+
+---
+
+## Job Lifecycle Pattern
+
+### End-to-End Job Flow
+
+**Pattern**: Client → Discovery → Handshake → Execution → Receipt
+
+```
+1. CLIENT: Create manifest + WASM payload
+   ├─ Manifest: {"cpu": 1, "memory_mb": 128, "timeout_sec": 30}
+   └─ Payload: hello.wasm (module bytes)
+
+2. DISCOVERY: Find capable peer via DHT
+   ├─ Query: /phase/capability/wasm3-x86_64
+   └─ Response: [peer_id_1, peer_id_2, ...]
+
+3. HANDSHAKE: Negotiate job acceptance
+   ├─ CLIENT → NODE: JobRequest {manifest, module_hash}
+   ├─ NODE → CLIENT: JobAccepted {job_id, estimated_start}
+   └─ Or: JobRejected {reason}
+
+4. TRANSMISSION: Send WASM payload
+   ├─ CLIENT → NODE: Stream WASM bytes over libp2p
+   └─ NODE: Validate hash matches manifest
+
+5. EXECUTION: Run job in sandbox
+   ├─ Load WASM into runtime
+   ├─ Apply resource limits
+   ├─ Execute and capture stdout/stderr
+   └─ Generate signed receipt
+
+6. RESULT: Return output + receipt
+   ├─ NODE → CLIENT: JobResult {stdout, stderr, exit_code, receipt}
+   └─ CLIENT: Verify signature, validate receipt
+
+7. CLEANUP: Ephemeral state disposal
+   ├─ Delete WASM module
+   ├─ Clear runtime memory
+   └─ Log event for audit
+```
+
+**Key Principles**:
+- Manifest-first: Always define resources before transmission
+- Hash verification: Validate module integrity
+- Signed receipts: Cryptographic proof of execution
+- Stateless nodes: No persistent job storage (ephemeral only)
+
+**When to Use**: Every job submission and execution cycle
+
+---
+
+## Security & Sandboxing
+
+### Defense-in-Depth Model
+
+**Pattern**: Multiple layers of isolation and verification
+
+```
+┌─────────────────────────────────────────┐
+│  Layer 1: Network (Encrypted QUIC)     │  ← Noise protocol, TLS-like security
+├─────────────────────────────────────────┤
+│  Layer 2: Process (Daemon isolation)   │  ← systemd service, limited perms
+├─────────────────────────────────────────┤
+│  Layer 3: WASM Sandbox                 │  ← No syscalls, no file/network access
+├─────────────────────────────────────────┤
+│  Layer 4: Resource Limits              │  ← Memory, CPU, timeout enforcement
+└─────────────────────────────────────────┘
+```
+
+**Security Checklist** (every execution):
+- [ ] WASM module hash verified before execution
+- [ ] Resource limits enforced (memory, CPU, timeout)
+- [ ] No host filesystem access (sandboxed)
+- [ ] No network access from WASM
+- [ ] No syscall access from WASM
+- [ ] Receipt signed with node's private key
+- [ ] Client verifies receipt signature before trusting result
+
+**When to Use**: Always. Never bypass any security layer.
+
+---
+
+## Data Flow Patterns
+
+### Manifest Schema
+
+**Pattern**: Declare job requirements upfront
+
+```json
+{
+  "version": "0.1",
+  "module_hash": "sha256:abc123...",
+  "resources": {
+    "cpu_cores": 1,
+    "memory_mb": 128,
+    "timeout_seconds": 30
+  },
+  "capabilities": ["wasm3", "x86_64"],
+  "priority": "normal"
+}
+```
+
+**Key Fields**:
+- `module_hash`: Cryptographic hash for verification
+- `resources`: Explicit resource requirements
+- `capabilities`: Required node features (runtime, arch)
+- `priority`: Scheduling hint (normal/low/high)
+
+### Receipt Schema
+
+**Pattern**: Cryptographic proof of execution
+
+```json
+{
+  "version": "0.1",
+  "job_id": "uuid-here",
+  "module_hash": "sha256:abc123...",
+  "node_peer_id": "12D3KooW...",
+  "execution": {
+    "wall_time_ms": 1234,
+    "cpu_time_ms": 987,
+    "memory_peak_mb": 45,
+    "exit_code": 0
+  },
+  "timestamp": "2025-11-08T12:00:00Z",
+  "signature": "base64-signature-here"
+}
+```
+
+**Key Fields**:
+- `module_hash`: Links execution to specific WASM module
+- `node_peer_id`: Anonymous node identifier
+- `execution`: Measured resource usage
+- `signature`: Ed25519 signature over receipt fields
+
+**Verification**:
+```rust
+// Pattern: Verify receipt signature
+let receipt_bytes = serialize_receipt_for_signing(&receipt);
+let signature = Signature::from_bytes(&receipt.signature)?;
+let public_key = PublicKey::from_peer_id(&receipt.node_peer_id)?;
+public_key.verify(&receipt_bytes, &signature)?;
+```
+
+---
+
+## Error Handling
+
+### Graceful Degradation Pattern
+
+**Pattern**: Fail gracefully, provide actionable errors
+
+```rust
+// Pattern: Result-based error handling
+pub enum ExecutionError {
+    ModuleLoadFailed { path: String, reason: String },
+    ResourceLimitExceeded { resource: String, limit: u64, actual: u64 },
+    TimeoutExceeded { timeout_sec: u64 },
+    RuntimeError { message: String },
+    SignatureVerificationFailed { reason: String },
+}
+
+// Pattern: Error context
+impl ExecutionError {
+    pub fn context(&self) -> String {
+        match self {
+            Self::ModuleLoadFailed { path, reason } =>
+                format!("Failed to load WASM module '{}': {}", path, reason),
+            Self::ResourceLimitExceeded { resource, limit, actual } =>
+                format!("{} limit exceeded: {} > {} allowed", resource, actual, limit),
+            // ...
+        }
+    }
+}
+
+// Pattern: Logging at boundaries
+log::error!("Execution failed: {}", error.context());
+```
+
+**Key Principles**:
+- Typed errors: Use enums for different error cases
+- Context-rich: Include actionable information
+- Log at boundaries: Integration points, not internal logic
+- Never panic: Use `Result<T, E>` everywhere
+
+**When to Use**: All fallible operations. No unwraps in production code.
+
+---
+
+## Testing Patterns
+
+### Test Structure
+
+**Pattern**: Unit, integration, and cross-architecture tests
+
+```rust
+// Pattern: Unit test for WASM execution
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wasm_execution_success() {
+        let runtime = Wasm3Runtime::new().build().unwrap();
+        let wasm_bytes = include_bytes!("../fixtures/hello.wasm");
+        let result = runtime.execute(wasm_bytes, &[]).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("Hello"));
+    }
+
+    #[test]
+    fn test_memory_limit_enforcement() {
+        let runtime = Wasm3Runtime::new()
+            .with_memory_limit(1024) // 1KB
+            .build()
+            .unwrap();
+        let wasm_bytes = include_bytes!("../fixtures/memory_hog.wasm");
+        let result = runtime.execute(wasm_bytes, &[]);
+
+        assert!(matches!(result, Err(ExecutionError::ResourceLimitExceeded { .. })));
+    }
+}
+```
+
+**Pattern**: Integration test for peer discovery
+```rust
+#[tokio::test]
+async fn test_peer_discovery() {
+    let node1 = spawn_test_node().await;
+    let node2 = spawn_test_node().await;
+
+    // Node1 advertises capability
+    node1.advertise("wasm3-x86_64").await.unwrap();
+
+    // Node2 discovers Node1
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let peers = node2.discover("wasm3-x86_64").await.unwrap();
+
+    assert!(peers.contains(&node1.peer_id()));
+}
+```
+
+**Test Principles**:
+- Deterministic: No flaky tests (fixed seeds, timeouts, retries)
+- Independent: No shared state between tests
+- Fast: Unit tests < 100ms, integration < 5s
+- Clear names: `test_<scenario>_<expected_outcome>`
+
+**When to Use**:
+- Unit tests: All core logic (WASM runtime, manifest parsing, receipt signing)
+- Integration tests: Peer discovery, job lifecycle, end-to-end flows
+- Cross-arch tests: macOS ARM client → Ubuntu x86_64 node (manual demo)
+
+---
+
+## Anti-Patterns (Avoid These)
+
+### ❌ Centralized Discovery
+**Bad**: Single bootstrap node or central registry
+**Good**: Configurable bootstrap nodes, Kademlia DHT
+
+### ❌ Unsandboxed Execution
+**Bad**: Running arbitrary code with host access
+**Good**: WASM-only, default-deny sandbox
+
+### ❌ Unsigned Receipts
+**Bad**: Trusting execution results without verification
+**Good**: Cryptographic signatures on all receipts
+
+### ❌ Blocking I/O in Event Loop
+**Bad**: Synchronous file/network I/O in async runtime
+**Good**: Async I/O everywhere, spawn_blocking for CPU work
+
+### ❌ Hardcoded Configuration
+**Bad**: Hardcoded bootstrap nodes, timeouts, limits
+**Good**: Configuration file, environment variables, CLI flags
+
+---
+
+## Pattern Evolution
+
+As the codebase grows, document new patterns here:
+
+**When to Add a Pattern**:
+- Used in 3+ places across codebase
+- Solves a recurring architectural problem
+- Establishes a convention (naming, structure, error handling)
+
+**Format**:
+```markdown
+### Pattern Name
+
+**Pattern**: One-sentence summary
+
+**Code Example**: Concrete implementation
+
+**Key Principles**: 3-5 bullet points
+
+**When to Use**: Specific scenarios
+```
+
+---
+
+**Remember**: Patterns are discovered, not invented. Extract patterns from working code, don't impose patterns prematurely.

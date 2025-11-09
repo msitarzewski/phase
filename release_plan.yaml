@@ -1,0 +1,42 @@
+version: 0.1
+title: Phase Open MVP Release Plan
+
+milestones:
+  - name: "Local WASM Execution"
+    goal: "Run WASM workloads locally via plasm daemon"
+    tasks:
+      - "Initialize repo structure (daemon/, php-sdk/, examples/)"
+      - "Implement wasm3 runner: load .wasm, run, capture stdout"
+      - "Define manifest.json & receipt.json schemas"
+      - "Provide example job hello.wasm (reverse string)"
+      - "Create PHP client library and local demo script"
+
+  - name: "Peer Discovery"
+    goal: "Enable anonymous node discovery and messaging over DHT"
+    tasks:
+      - "Integrate rust-libp2p with Kademlia DHT"
+      - "Advertise node capability manifest (CPU, arch, port)"
+      - "Implement job announcement and acceptance handshake"
+      - "Encrypt communication using Noise + QUIC"
+      - "Implement NAT traversal (UPnP + relay)"
+      - "Add structured logging of peer discovery events"
+
+  - name: "Remote Execution"
+    goal: "Execute job on discovered node and return result"
+    tasks:
+      - "Serialize job payload + manifest"
+      - "Transmit via libp2p stream"
+      - "Execute job on remote node in WASM sandbox"
+      - "Return stdout and signed receipt"
+      - "PHP client verifies signature"
+      - "Client retry/timeout logic"
+
+  - name: "Packaging & Demo"
+    goal: "Deliver runnable .deb package and example"
+    tasks:
+      - "Create Debian package using cargo-deb"
+      - "Add systemd service for plasmd"
+      - "Write install instructions"
+      - "Cross-arch demo: macOS ARM client → Ubuntu x86_64 node"
+      - "examples/remote_test.php with clear output"
+      - "docs/architecture-diagram.png (optional)"
