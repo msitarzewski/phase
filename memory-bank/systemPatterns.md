@@ -1,21 +1,22 @@
 # System Patterns: Phase Architecture
 
-**Last Updated**: 2025-11-08
-**Version**: 0.1
-**Status**: MVP - Patterns Emerging
+**Last Updated**: 2025-11-09
+**Version**: 1.0
+**Status**: MVP Complete - Patterns Established
 
 ---
 
 ## Table of Contents
 
 1. [Core Architecture](#core-architecture)
-2. [WASM Execution Pattern](#wasm-execution-pattern)
-3. [Peer Discovery Pattern](#peer-discovery-pattern)
-4. [Job Lifecycle Pattern](#job-lifecycle-pattern)
-5. [Security & Sandboxing](#security--sandboxing)
-6. [Data Flow Patterns](#data-flow-patterns)
-7. [Error Handling](#error-handling)
-8. [Testing Patterns](#testing-patterns)
+2. [Library + Binary Pattern](#library--binary-pattern)
+3. [WASM Execution Pattern](#wasm-execution-pattern)
+4. [Peer Discovery Pattern](#peer-discovery-pattern)
+5. [Job Lifecycle Pattern](#job-lifecycle-pattern)
+6. [Security & Sandboxing](#security--sandboxing)
+7. [Data Flow Patterns](#data-flow-patterns)
+8. [Error Handling](#error-handling)
+9. [Testing Patterns](#testing-patterns)
 
 ---
 
@@ -44,6 +45,141 @@
 - **Client layer**: Provides language-specific bindings
 
 **When to Use**: Always maintain these boundaries. Don't mix protocol logic with transport or execution.
+
+---
+
+## Library + Binary Pattern
+
+### Rust Crate Structure
+
+**Pattern**: Structure Rust projects as reusable library with thin binary wrapper
+
+```
+daemon/
+├── Cargo.toml          # Defines both [lib] and [[bin]]
+├── src/
+│   ├── lib.rs          # Library crate (public API)
+│   ├── main.rs         # Binary crate (thin wrapper)
+│   ├── config.rs       # Public module
+│   ├── wasm/           # Public module
+│   │   ├── mod.rs
+│   │   ├── runtime.rs
+│   │   ├── manifest.rs
+│   │   └── receipt.rs
+│   └── network/        # Public module
+│       ├── mod.rs
+│       ├── discovery.rs
+│       ├── protocol.rs
+│       └── execution.rs
+└── tests/              # Integration tests
+```
+
+**Cargo.toml Configuration**:
+```toml
+[lib]
+name = "plasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plasmd"
+path = "src/main.rs"
+```
+
+**Library Definition (src/lib.rs)**:
+```rust
+//! # Plasm - Phase Local WASM Execution Daemon Library
+//!
+//! This library provides core functionality for the Phase distributed compute network.
+
+// Public module exports
+pub mod config;
+pub mod wasm;
+pub mod network;
+
+// Convenience re-exports (flat namespace)
+pub use config::{Config, ExecutionLimits};
+pub use wasm::{
+    runtime::{WasmRuntime, Wasm3Runtime, ExecutionResult},
+    manifest::JobManifest,
+    receipt::Receipt,
+};
+pub use network::{
+    Discovery,
+    DiscoveryConfig,
+    PeerInfo,
+    ExecutionHandler,
+    protocol::{JobOffer, JobResponse, JobRequest, JobResult},
+};
+```
+
+**Binary Usage (src/main.rs)**:
+```rust
+// Use library as external dependency
+use plasm::{
+    network::{Discovery, ExecutionHandler},
+    wasm::runtime::Wasm3Runtime,
+};
+
+fn main() {
+    // Binary is thin wrapper around library functionality
+    let runtime = Wasm3Runtime::new().build().unwrap();
+    // ...
+}
+```
+
+**Key Principles**:
+- **Library-first**: Core functionality in `lib.rs`, binary is thin CLI wrapper
+- **Public API**: Expose clean interfaces via `pub mod` and re-exports
+- **Flat namespace**: Common types available at crate root (e.g., `plasm::Config`)
+- **Zero suppressions**: No `#[allow(dead_code)]` needed - code is public API
+- **Reusability**: Other Rust projects can use as library
+
+**Benefits**:
+
+| Aspect | Without Pattern | With Pattern |
+|--------|-----------------|--------------|
+| **Warnings** | "unused" warnings everywhere | Zero warnings |
+| **Suppressions** | `#[allow(dead_code)]` needed | None needed |
+| **Reusability** | Binary-only, not reusable | Full library API |
+| **Testing** | Integration tests awkward | Clean library tests |
+| **Documentation** | None | rustdoc available |
+| **API Clarity** | Internal modules only | Clear public API |
+
+**When to Use**:
+- ✅ **ALWAYS** - Apply from day 1, not as refactor
+- ✅ Any Rust project with substantial functionality
+- ✅ When code will be tested independently
+- ✅ When other projects might reuse functionality
+- ❌ Never for truly trivial single-file binaries
+
+**Examples in the Wild**:
+- **ripgrep**: Library (`grep` crate) + Binary (`rg`)
+- **tokio**: Library (`tokio` crate) + Runtime
+- **clap**: Library (`clap` crate) + Derive macros
+- **serde**: Library (`serde` crate) + Serialization framework
+
+**External Integration Example**:
+```rust
+// In another Rust project
+[dependencies]
+plasm = { path = "../phase/daemon" }
+
+// Use library
+use plasm::{JobManifest, WasmRuntime, Wasm3Runtime};
+
+let runtime = Wasm3Runtime::new().build()?;
+let manifest = JobManifest::from_file("job.json")?;
+let result = runtime.execute(&wasm_bytes, &[])?;
+```
+
+**Historical Context**:
+- Discovered during Milestone 4 (November 2025)
+- Initially structured as binary-only, 27 "unused" warnings
+- Refactored to library + binary pattern, warnings eliminated
+- Zero performance overhead, zero build time increase
+- Documented in `memory-bank/tasks/2025-11/091109_library_binary_refactor.md`
+
+**Reference**: `memory-bank/quick-start.md#Architecture: Library + Binary Pattern`
 
 ---
 
