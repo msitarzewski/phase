@@ -38,6 +38,15 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Execute a job from JSON request (for testing M3 signing)
+    ExecuteJob {
+        /// Path to WASM file
+        wasm_file: String,
+
+        /// Arguments to pass to WASM module
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Show version information
     Version,
 }
@@ -94,7 +103,7 @@ async fn main() -> Result<()> {
 
             // Create runtime and execute
             let runtime = wasm::runtime::Wasm3Runtime::new();
-            let result = runtime.execute(&wasm_bytes, &args_refs)?;
+            let result = runtime.execute(&wasm_bytes, &args_refs).await?;
 
             // In quiet mode, suppress logs - WASM stdout is already inherited
             // In normal mode, show the placeholder message
@@ -103,6 +112,59 @@ async fn main() -> Result<()> {
             }
 
             std::process::exit(result.exit_code as i32);
+        }
+        Commands::ExecuteJob { wasm_file, args } => {
+            use network::{JobRequest, JobRequirements};
+            use sha2::{Digest, Sha256};
+
+            info!("Executing job from: {}", wasm_file);
+
+            // Load WASM file
+            let wasm_bytes = std::fs::read(&wasm_file)?;
+
+            // Compute module hash
+            let mut hasher = Sha256::new();
+            hasher.update(&wasm_bytes);
+            let module_hash = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+            // Create job request
+            let request = JobRequest::new(
+                format!("job-{}", uuid::Uuid::new_v4()),
+                module_hash,
+                wasm_bytes,
+                args,
+                JobRequirements {
+                    cpu_cores: 1,
+                    memory_mb: 128,
+                    timeout_seconds: 30,
+                    arch: std::env::consts::ARCH.to_string(),
+                    wasm_runtime: format!("wasmtime-{}", env!("CARGO_PKG_VERSION")),
+                },
+            );
+
+            // Create execution handler with a fresh signing key
+            use ed25519_dalek::SigningKey;
+            use rand::RngCore;
+            let mut secret_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut secret_bytes);
+            let signing_key = SigningKey::from_bytes(&secret_bytes);
+            let handler = network::ExecutionHandler::new(signing_key);
+
+            // Execute job
+            let result = handler.execute_job(request).await?;
+
+            // Output result as JSON
+            let json_output = serde_json::json!({
+                "job_id": result.job_id,
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "receipt": serde_json::from_str::<serde_json::Value>(&result.receipt_json)?
+            });
+
+            println!("{}", serde_json::to_string_pretty(&json_output)?);
+
+            Ok(())
         }
         Commands::Version => {
             println!("plasmd version {}", env!("CARGO_PKG_VERSION"));

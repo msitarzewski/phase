@@ -41,12 +41,13 @@ pub struct ExecutionResult {
 }
 
 /// Trait for WASM runtime implementations
+#[async_trait::async_trait]
 pub trait WasmRuntime {
     /// Execute a WASM module with arguments
-    fn execute(&self, wasm_bytes: &[u8], args: &[&str]) -> Result<ExecutionResult>;
+    async fn execute(&self, wasm_bytes: &[u8], args: &[&str]) -> Result<ExecutionResult>;
 
     /// Execute with explicit timeout
-    fn execute_with_timeout(
+    async fn execute_with_timeout(
         &self,
         wasm_bytes: &[u8],
         args: &[&str],
@@ -96,17 +97,12 @@ impl Default for Wasm3Runtime {
     }
 }
 
-impl WasmRuntime for Wasm3Runtime {
-    fn execute(&self, wasm_bytes: &[u8], args: &[&str]) -> Result<ExecutionResult> {
-        // Default timeout: 5 minutes
-        self.execute_with_timeout(wasm_bytes, args, Duration::from_secs(300))
-    }
-
-    fn execute_with_timeout(
-        &self,
+// Inherent methods for Wasm3Runtime
+impl Wasm3Runtime {
+    fn execute_sync(
         wasm_bytes: &[u8],
-        _args: &[&str],
         timeout: Duration,
+        max_memory_bytes: u64,
     ) -> Result<ExecutionResult> {
         use wasmtime::*;
         use wasmtime_wasi::{WasiCtxBuilder, ResourceTable, WasiView};
@@ -125,33 +121,12 @@ impl WasmRuntime for Wasm3Runtime {
         let engine = Engine::new(&config)
             .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
-        // State struct that holds WASI context
-        struct MyState {
-            wasi_ctx: wasmtime_wasi::WasiCtx,
-            table: ResourceTable,
-        }
-
-        impl WasiView for MyState {
-            fn table(&mut self) -> &mut ResourceTable {
-                &mut self.table
-            }
-
-            fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
-                &mut self.wasi_ctx
-            }
-        }
-
-        // Create WASI context with stdio
-        let wasi = WasiCtxBuilder::new()
+        // Create WASI preview1 context with stdio
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
             .inherit_stdio()
-            .build();
+            .build_p1();
 
-        let state = MyState {
-            wasi_ctx: wasi,
-            table: ResourceTable::new(),
-        };
-
-        let mut store = Store::new(&engine, state);
+        let mut store = Store::new(&engine, wasi);
 
         // Set fuel limit based on timeout (rough heuristic: 1M instructions per second)
         let fuel_limit = (timeout.as_secs() * 1_000_000) as u64;
@@ -162,8 +137,10 @@ impl WasmRuntime for Wasm3Runtime {
         let module = Module::from_binary(&engine, wasm_bytes)
             .map_err(|e| WasmError::ModuleLoadError(e.to_string()))?;
 
-        // Create linker - using module linker for now (will add WASI in Milestone 3)
-        let linker = Linker::new(&engine);
+        // Create linker and add WASI (preview 1)
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
+            .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
         // Instantiate module
         let instance = linker
@@ -204,6 +181,32 @@ impl WasmRuntime for Wasm3Runtime {
             wall_time_ms,
             module_hash,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl WasmRuntime for Wasm3Runtime {
+    async fn execute(&self, wasm_bytes: &[u8], args: &[&str]) -> Result<ExecutionResult> {
+        // Default timeout: 5 minutes
+        self.execute_with_timeout(wasm_bytes, args, Duration::from_secs(300)).await
+    }
+
+    async fn execute_with_timeout(
+        &self,
+        wasm_bytes: &[u8],
+        _args: &[&str],
+        timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        // Clone data for move into spawn_blocking
+        let wasm_bytes = wasm_bytes.to_vec();
+        let max_memory = self.max_memory_bytes;
+
+        // Run blocking WASM execution in blocking thread pool
+        let result = tokio::task::spawn_blocking(move || {
+            Self::execute_sync(&wasm_bytes, timeout, max_memory)
+        }).await?;
+
+        result
     }
 }
 
