@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber;
 
 // Use the plasm library crate
@@ -25,6 +25,12 @@ enum Commands {
         /// Configuration file path
         #[arg(short, long, default_value = "/etc/plasm/config.json")]
         config: String,
+
+        /// Peer multiaddrs to connect to (can be specified multiple times)
+        /// Format: /ip4/192.168.1.25/tcp/12345/p2p/12D3Koo...
+        /// Or: /ip4/192.168.1.25/tcp/12345 (peer ID will be discovered)
+        #[arg(short, long)]
+        peer: Vec<String>,
     },
     /// Execute a WASM module locally (for testing)
     Run {
@@ -65,7 +71,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { config } => {
+        Commands::Start { config, peer } => {
             info!("Starting plasmd with config: {}", config);
 
             // Create discovery configuration
@@ -85,6 +91,16 @@ async fn main() -> Result<()> {
 
             info!("Phase daemon started. Peer ID: {}", discovery.local_peer_id());
             info!("Capabilities: {:?}", discovery.capabilities());
+
+            // Dial manually specified peers
+            for peer_addr in &peer {
+                info!("Connecting to peer: {}", peer_addr);
+                if let Err(e) = discovery.dial_peer(peer_addr) {
+                    warn!("Failed to dial peer {}: {}", peer_addr, e);
+                } else {
+                    info!("Dialing initiated to: {}", peer_addr);
+                }
+            }
 
             // Run event loop
             discovery.run().await?;
