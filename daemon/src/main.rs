@@ -5,6 +5,7 @@ use tracing_subscriber;
 
 // Use the plasm library crate
 use plasm::{
+    config::Config,
     network::{Discovery, DiscoveryConfig, ExecutionHandler, JobRequest, JobRequirements},
     wasm::runtime::{WasmRuntime, Wasm3Runtime},
 };
@@ -20,19 +21,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a default config file
+    Init {
+        /// Where to create the config file (default: ~/.config/plasm/config.json)
+        #[arg(short, long)]
+        path: Option<String>,
+    },
     /// Start the daemon
     Start {
-        /// Configuration file path
-        #[arg(short, long, default_value = "/etc/plasm/config.json")]
-        config: String,
+        /// Configuration file path (default: auto-detect from ~/.config/plasm/ or /etc/plasm/)
+        #[arg(short, long)]
+        config: Option<String>,
 
-        /// Listen addresses (can be specified multiple times)
+        /// Listen addresses (overrides config file, can be specified multiple times)
         /// Format: /ip4/0.0.0.0/tcp/8000 or /ip4/192.168.1.144/tcp/8000
-        /// Default: /ip4/0.0.0.0/tcp/0 (random port)
         #[arg(short, long)]
         listen: Vec<String>,
 
-        /// Peer multiaddrs to connect to (can be specified multiple times)
+        /// Peer multiaddrs to connect to (overrides config file, can be specified multiple times)
         /// Format: /ip4/192.168.1.25/tcp/12345/p2p/12D3Koo...
         /// Or: /ip4/192.168.1.25/tcp/12345 (peer ID will be discovered)
         #[arg(short, long)]
@@ -77,8 +83,49 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init { path } => {
+            let config_path = if let Some(p) = path {
+                let path = std::path::PathBuf::from(p);
+                let config = Config::default();
+                config.save(&path)?;
+                path
+            } else {
+                Config::init_user_config()?
+            };
+
+            println!("Initialized config at: {}", config_path.display());
+            println!("\nDefault config:");
+            println!("{}", serde_json::to_string_pretty(&Config::default())?);
+            println!("\nEdit this file to configure:");
+            println!("  - listen_addrs: Addresses to listen on");
+            println!("  - peer_addrs: Peers to connect to on startup");
+            println!("  - bootstrap_peers: DHT bootstrap nodes");
+
+            Ok(())
+        }
         Commands::Start { config, listen, peer } => {
-            info!("Starting plasmd with config: {}", config);
+            // Load config from file (with fallback chain)
+            let mut cfg = Config::load_or_default(config.as_deref())?;
+
+            // CLI flags override config file
+            if !listen.is_empty() {
+                cfg.listen_addrs = listen;
+            }
+            if !peer.is_empty() {
+                cfg.peer_addrs = peer;
+            }
+
+            // Determine listen addresses (use default if empty)
+            let listen_addrs = if cfg.listen_addrs.is_empty() {
+                vec!["/ip4/0.0.0.0/tcp/0".to_string()]
+            } else {
+                cfg.listen_addrs.clone()
+            };
+
+            info!("Starting plasmd");
+            if let Some(user_config) = Config::default_user_config_path() {
+                info!("Config search path: {}", user_config.display());
+            }
 
             // Create discovery configuration
             let disc_config = DiscoveryConfig::default();
@@ -86,13 +133,7 @@ async fn main() -> Result<()> {
             // Create discovery service
             let mut discovery = Discovery::new(disc_config)?;
 
-            // Start listening on specified addresses (or default)
-            let listen_addrs = if listen.is_empty() {
-                vec!["/ip4/0.0.0.0/tcp/0".to_string()]
-            } else {
-                listen
-            };
-
+            // Start listening on configured addresses
             for addr in &listen_addrs {
                 discovery.listen(addr)?;
             }
@@ -106,8 +147,8 @@ async fn main() -> Result<()> {
             info!("Phase daemon started. Peer ID: {}", discovery.local_peer_id());
             info!("Capabilities: {:?}", discovery.capabilities());
 
-            // Dial manually specified peers
-            for peer_addr in &peer {
+            // Dial configured peers
+            for peer_addr in &cfg.peer_addrs {
                 info!("Connecting to peer: {}", peer_addr);
                 if let Err(e) = discovery.dial_peer(peer_addr) {
                     warn!("Failed to dial peer {}: {}", peer_addr, e);
