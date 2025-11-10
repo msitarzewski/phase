@@ -26,6 +26,12 @@ enum Commands {
         #[arg(short, long, default_value = "/etc/plasm/config.json")]
         config: String,
 
+        /// Listen addresses (can be specified multiple times)
+        /// Format: /ip4/0.0.0.0/tcp/8000 or /ip4/192.168.1.144/tcp/8000
+        /// Default: /ip4/0.0.0.0/tcp/0 (random port)
+        #[arg(short, long)]
+        listen: Vec<String>,
+
         /// Peer multiaddrs to connect to (can be specified multiple times)
         /// Format: /ip4/192.168.1.25/tcp/12345/p2p/12D3Koo...
         /// Or: /ip4/192.168.1.25/tcp/12345 (peer ID will be discovered)
@@ -71,7 +77,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { config, peer } => {
+        Commands::Start { config, listen, peer } => {
             info!("Starting plasmd with config: {}", config);
 
             // Create discovery configuration
@@ -80,8 +86,16 @@ async fn main() -> Result<()> {
             // Create discovery service
             let mut discovery = Discovery::new(disc_config)?;
 
-            // Start listening
-            discovery.listen("/ip4/0.0.0.0/tcp/0")?;
+            // Start listening on specified addresses (or default)
+            let listen_addrs = if listen.is_empty() {
+                vec!["/ip4/0.0.0.0/tcp/0".to_string()]
+            } else {
+                listen
+            };
+
+            for addr in &listen_addrs {
+                discovery.listen(addr)?;
+            }
 
             // Bootstrap DHT
             discovery.bootstrap()?;
