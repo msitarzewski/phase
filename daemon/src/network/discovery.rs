@@ -161,6 +161,16 @@ impl Discovery {
         self.execution_handler.public_key_hex()
     }
 
+    /// Manually dial a peer by multiaddr
+    pub fn dial_peer(&mut self, addr: &str) -> Result<()> {
+        let multiaddr: Multiaddr = addr.parse()
+            .context("Failed to parse peer address")?;
+
+        self.swarm.dial(multiaddr.clone())?;
+        info!("Dialing peer at: {}", multiaddr);
+        Ok(())
+    }
+
     /// Execute a job request (for testing/local execution)
     pub async fn execute_job(&self, request: JobRequest) -> Result<JobResult> {
         self.execution_handler.execute_job(request).await
