@@ -47,6 +47,7 @@ clap = { version = "4.0", features = ["derive"] }
 
 # Utilities
 uuid = { version = "1.0", features = ["v4"] }
+dirs = "5.0"  # Platform-independent paths
 
 # Networking (libp2p) - Updated to latest
 libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify", "mdns"] }
