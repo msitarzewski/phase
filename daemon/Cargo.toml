@@ -49,7 +49,7 @@ clap = { version = "4.0", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4"] }
 
 # Networking (libp2p) - Updated to latest
-libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify"] }
+libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify", "mdns"] }
 futures = "0.3"
 num_cpus = "1.0"
 rand = "0.8"
