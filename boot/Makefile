@@ -197,20 +197,40 @@ esp: dirs kernel-$(ARCH)
 	@mkdir -p $(ESP_BUILD)/loader/entries
 	@mkdir -p $(ESP_BUILD)/dtbs
 
-	# Copy bootloader (systemd-boot)
+	# Copy bootloader (prefer systemd-boot, fallback to GRUB)
 	@if [ "$(ARCH)" = "x86_64" ]; then \
 		if [ -f "$(SYSTEMD_BOOT_X86)" ]; then \
+			echo "  Using systemd-boot (x86_64)"; \
 			cp $(SYSTEMD_BOOT_X86) $(ESP_BUILD)/EFI/BOOT/BOOTX64.EFI; \
+		elif command -v grub-mkstandalone >/dev/null 2>&1; then \
+			echo "  Building GRUB EFI bootloader (x86_64)..."; \
+			grub-mkstandalone -O x86_64-efi \
+				-o $(ESP_BUILD)/EFI/BOOT/BOOTX64.EFI \
+				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain" \
+				--locales="" --fonts="" \
+				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub.cfg"; \
 		else \
-			echo "$(COLOR_YELLOW)  Warning: systemd-boot not found, creating placeholder$(COLOR_RESET)"; \
-			touch $(ESP_BUILD)/EFI/BOOT/BOOTX64.EFI; \
+			echo "$(COLOR_RED)  ERROR: No bootloader available!$(COLOR_RESET)"; \
+			echo "  Install either: systemd-boot or grub-efi-amd64-bin"; \
+			echo "    sudo apt install systemd-boot"; \
+			echo "    sudo apt install grub-efi-amd64-bin"; \
+			exit 1; \
 		fi \
 	elif [ "$(ARCH)" = "arm64" ]; then \
 		if [ -f "$(SYSTEMD_BOOT_ARM)" ]; then \
+			echo "  Using systemd-boot (ARM64)"; \
 			cp $(SYSTEMD_BOOT_ARM) $(ESP_BUILD)/EFI/BOOT/BOOTAA64.EFI; \
+		elif command -v grub-mkstandalone >/dev/null 2>&1; then \
+			echo "  Building GRUB EFI bootloader (ARM64)..."; \
+			grub-mkstandalone -O arm64-efi \
+				-o $(ESP_BUILD)/EFI/BOOT/BOOTAA64.EFI \
+				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain" \
+				--locales="" --fonts="" \
+				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub.cfg"; \
 		else \
-			echo "$(COLOR_YELLOW)  Warning: systemd-boot ARM64 not found, creating placeholder$(COLOR_RESET)"; \
-			touch $(ESP_BUILD)/EFI/BOOT/BOOTAA64.EFI; \
+			echo "$(COLOR_RED)  ERROR: No bootloader available!$(COLOR_RESET)"; \
+			echo "  Install either: systemd-boot or grub-efi-arm64-bin"; \
+			exit 1; \
 		fi \
 	fi
 
