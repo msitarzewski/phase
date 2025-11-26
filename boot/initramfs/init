@@ -114,6 +114,35 @@ setup_console() {
 }
 
 #------------------------------------------------------------------------------
+# Load Kernel Modules
+#------------------------------------------------------------------------------
+
+load_modules() {
+    echo "Loading kernel modules..."
+
+    # Load virtio modules for QEMU/VM networking (in dependency order)
+    if [ -d /lib/modules ]; then
+        KVER=$(uname -r)
+        if [ -d "/lib/modules/$KVER" ]; then
+            # Order matters: packet (for DHCP) -> virtio base -> pci helpers -> pci -> failover -> net
+            for mod in af_packet virtio virtio_ring virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci failover net_failover virtio_net; do
+                modpath=$(find /lib/modules/$KVER -name "${mod}.ko" 2>/dev/null | head -1)
+                if [ -n "$modpath" ]; then
+                    insmod "$modpath" 2>/dev/null && echo "  Loaded: $mod" || true
+                fi
+            done
+        fi
+    fi
+
+    # Give devices time to appear
+    sleep 2
+
+    # Show available interfaces
+    echo "Available interfaces:"
+    ls /sys/class/net/ 2>/dev/null || echo "  (none)"
+}
+
+#------------------------------------------------------------------------------
 # Network Initialization
 #------------------------------------------------------------------------------
 
@@ -149,13 +178,19 @@ setup_network() {
             iface=$(basename "$iface")
             [ "$iface" = "lo" ] && continue
 
-            ip link set "$iface" up 2>/dev/null || continue
+            echo "Trying interface: $iface"
+            ip link set "$iface" up 2>/dev/null || { echo "  Failed to bring up"; continue; }
+            echo "  Interface up, requesting DHCP..."
 
             if command -v udhcpc >/dev/null 2>&1; then
-                udhcpc -i "$iface" -q -n 2>/dev/null && {
-                    NETWORK_STATUS="DHCP on $iface"
+                # Use longer timeout for DHCP
+                if udhcpc -i "$iface" -t 5 -T 3 -n 2>&1; then
+                    NETWORK_IP=$(ip addr show "$iface" | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+                    NETWORK_STATUS="DHCP on $iface ($NETWORK_IP)"
                     break
-                }
+                else
+                    echo "  DHCP failed on $iface"
+                fi
             elif command -v dhcpcd >/dev/null 2>&1; then
                 dhcpcd -q "$iface" 2>/dev/null && {
                     NETWORK_STATUS="DHCP on $iface"
@@ -273,6 +308,9 @@ main() {
     echo ""
 
     parse_cmdline
+    echo ""
+
+    load_modules
     echo ""
 
     setup_network
