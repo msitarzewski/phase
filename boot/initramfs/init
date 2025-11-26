@@ -1,0 +1,325 @@
+#!/bin/sh
+#
+# Phase Boot - Init Script (PID 1)
+#
+# This is the first userspace process that runs when the Phase Boot
+# initramfs is loaded by the kernel. It sets up the minimal environment
+# needed to bootstrap the Phase network discovery system.
+#
+
+set -e
+
+#------------------------------------------------------------------------------
+# Configuration & Defaults
+#------------------------------------------------------------------------------
+
+PHASE_VERSION="0.1.0-M2"
+SCRIPTS_DIR="/scripts"
+PHASE_MODE="internet"
+PHASE_CHANNEL=""
+PHASE_CACHE="true"
+PHASE_NOWRITE="false"
+
+#------------------------------------------------------------------------------
+# Mount Essential Filesystems
+#------------------------------------------------------------------------------
+
+mount_essential() {
+    echo "Mounting essential filesystems..."
+
+    # /proc - Process information pseudo-filesystem
+    mount -t proc proc /proc
+
+    # /sys - Kernel and device information
+    mount -t sysfs sysfs /sys
+
+    # /dev - Device nodes (devtmpfs is auto-populated by kernel)
+    mount -t devtmpfs devtmpfs /dev
+
+    # /run - Runtime data (tmpfs, volatile)
+    mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+
+    echo "Essential filesystems mounted."
+}
+
+#------------------------------------------------------------------------------
+# Parse Kernel Command Line
+#------------------------------------------------------------------------------
+
+parse_cmdline() {
+    echo "Parsing kernel command line..."
+
+    # Read kernel command line
+    if [ -f /proc/cmdline ]; then
+        CMDLINE=$(cat /proc/cmdline)
+
+        # Parse each parameter
+        for param in $CMDLINE; do
+            case "$param" in
+                phase.mode=*)
+                    PHASE_MODE="${param#phase.mode=}"
+                    ;;
+                phase.channel=*)
+                    PHASE_CHANNEL="${param#phase.channel=}"
+                    ;;
+                phase.cache=*)
+                    PHASE_CACHE="${param#phase.cache=}"
+                    ;;
+                phase.nowrite=*)
+                    PHASE_NOWRITE="${param#phase.nowrite=}"
+                    ;;
+            esac
+        done
+    fi
+
+    # Validate mode
+    case "$PHASE_MODE" in
+        internet|local|private)
+            ;;
+        *)
+            echo "Warning: Unknown phase.mode=$PHASE_MODE, defaulting to 'internet'"
+            PHASE_MODE="internet"
+            ;;
+    esac
+
+    echo "Mode: $PHASE_MODE"
+    [ -n "$PHASE_CHANNEL" ] && echo "Channel: $PHASE_CHANNEL"
+}
+
+#------------------------------------------------------------------------------
+# Set Up Console
+#------------------------------------------------------------------------------
+
+setup_console() {
+    echo "Setting up console..."
+
+    # Ensure stdin, stdout, stderr are properly connected
+    exec 0</dev/console
+    exec 1>/dev/console
+    exec 2>/dev/console
+
+    # Set up job control for the shell
+    setsid sh -c 'exec sh </dev/console >/dev/console 2>&1' || true
+}
+
+#------------------------------------------------------------------------------
+# Network Initialization
+#------------------------------------------------------------------------------
+
+setup_network() {
+    echo "Initializing network..."
+
+    # Use modular network scripts if available
+    if [ -x "$SCRIPTS_DIR/net-init.sh" ]; then
+        echo "Using modular network initialization..."
+        if "$SCRIPTS_DIR/net-init.sh"; then
+            if [ -f /tmp/network.status ] && [ "$(cat /tmp/network.status)" = "up" ]; then
+                NETWORK_STATUS="UP ($(cat /tmp/network.interface 2>/dev/null || echo 'unknown'))"
+                NETWORK_IP=$(cat /tmp/network.ip 2>/dev/null || echo "unknown")
+            else
+                NETWORK_STATUS="DOWN"
+            fi
+        else
+            NETWORK_STATUS="FAILED"
+        fi
+    else
+        # Fallback to basic network initialization
+        echo "Modular scripts not available, using basic initialization..."
+
+        # Bring up loopback interface
+        ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || {
+            echo "Warning: Failed to bring up loopback interface"
+        }
+
+        # Find and configure network interfaces
+        NETWORK_STATUS="No network configured"
+
+        for iface in /sys/class/net/*; do
+            iface=$(basename "$iface")
+            [ "$iface" = "lo" ] && continue
+
+            ip link set "$iface" up 2>/dev/null || continue
+
+            if command -v udhcpc >/dev/null 2>&1; then
+                udhcpc -i "$iface" -q -n 2>/dev/null && {
+                    NETWORK_STATUS="DHCP on $iface"
+                    break
+                }
+            elif command -v dhcpcd >/dev/null 2>&1; then
+                dhcpcd -q "$iface" 2>/dev/null && {
+                    NETWORK_STATUS="DHCP on $iface"
+                    break
+                }
+            fi
+        done
+    fi
+
+    echo "Network: $NETWORK_STATUS"
+}
+
+#------------------------------------------------------------------------------
+# Phase Discovery (M2+)
+#------------------------------------------------------------------------------
+
+run_discovery() {
+    echo "Starting Phase discovery..."
+
+    # Skip discovery in some cases
+    if [ "$PHASE_MODE" = "local" ]; then
+        echo "Local mode: Using mDNS discovery (if available)"
+        DISCOVERY_METHOD="mdns"
+    else
+        echo "Using DHT discovery..."
+        DISCOVERY_METHOD="dht"
+    fi
+
+    # Check for phase-discover binary
+    if [ -x "/bin/phase-discover" ]; then
+        echo "Running phase-discover..."
+
+        # Build discovery arguments
+        DISCOVER_ARGS="--arch $(uname -m) --channel ${PHASE_CHANNEL:-stable}"
+
+        # Add ephemeral flag for private mode
+        if [ "$PHASE_MODE" = "private" ]; then
+            DISCOVER_ARGS="$DISCOVER_ARGS --ephemeral"
+        fi
+
+        # Run discovery with timeout
+        if /bin/phase-discover $DISCOVER_ARGS --timeout 30 --quiet > /tmp/manifest_url 2>/dev/null; then
+            MANIFEST_URL=$(cat /tmp/manifest_url)
+            echo "Discovered manifest: $MANIFEST_URL"
+            return 0
+        else
+            echo "Discovery failed or timed out"
+            return 1
+        fi
+    else
+        echo "phase-discover not available (M2 binary not installed)"
+        echo "Skipping discovery - will drop to shell"
+        return 1
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Print Boot Banner
+#------------------------------------------------------------------------------
+
+print_banner() {
+    cat <<'EOF'
+
+  ____  _                      ____              _
+ |  _ \| |__   __ _ ___  ___  | __ )  ___   ___ | |_
+ | |_) | '_ \ / _` / __|/ _ \ |  _ \ / _ \ / _ \| __|
+ |  __/| | | | (_| \__ \  __/ | |_) | (_) | (_) | |_
+ |_|   |_| |_|\__,_|___/\___| |____/ \___/ \___/ \__|
+
+EOF
+
+    echo "Phase Boot v$PHASE_VERSION"
+    echo "================================"
+    echo ""
+    echo "Mode:    $PHASE_MODE"
+    echo "Network: $NETWORK_STATUS"
+    [ -n "$PHASE_CHANNEL" ] && echo "Channel: $PHASE_CHANNEL"
+    echo ""
+    echo "Configuration:"
+    echo "  Cache:   $PHASE_CACHE"
+    echo "  No-Write: $PHASE_NOWRITE"
+    echo ""
+    echo "--------------------------------"
+    echo ""
+    echo "Available commands:"
+    echo "  ip addr          - Show network configuration"
+    echo "  ip route         - Show routing table"
+    echo "  mount            - Show mounted filesystems"
+    echo "  ps               - Show running processes"
+    echo "  cat /proc/cmdline - Show kernel command line"
+    if [ -x "$SCRIPTS_DIR/net-diag.sh" ]; then
+        echo "  $SCRIPTS_DIR/net-diag.sh - Network diagnostics"
+    fi
+    if [ -x "/bin/phase-discover" ]; then
+        echo "  phase-discover   - Manual manifest discovery"
+    fi
+    echo ""
+    echo "Phase Boot initialized."
+    echo ""
+}
+
+#------------------------------------------------------------------------------
+# Main Initialization Sequence
+#------------------------------------------------------------------------------
+
+main() {
+    # Clear screen for clean boot
+    clear 2>/dev/null || true
+
+    echo "Phase Boot initializing..."
+    echo ""
+
+    # Execute initialization steps
+    mount_essential
+    echo ""
+
+    parse_cmdline
+    echo ""
+
+    setup_network
+    echo ""
+
+    # Attempt Phase discovery (M2+)
+    DISCOVERY_SUCCESS=false
+    if [ "$NETWORK_STATUS" != "DOWN" ] && [ "$NETWORK_STATUS" != "FAILED" ]; then
+        echo "Network available, attempting discovery..."
+        if run_discovery; then
+            DISCOVERY_SUCCESS=true
+            echo ""
+            echo "Discovery successful!"
+            # M3+ will continue to fetch and verify manifest here
+        else
+            echo ""
+            echo "Discovery not available or failed."
+        fi
+    else
+        echo "Network not available, skipping discovery."
+    fi
+    echo ""
+
+    print_banner
+
+    # If discovery succeeded and we have kexec, M4+ will proceed to kexec
+    # For now (M2), drop to shell for manual testing
+    if [ "$DISCOVERY_SUCCESS" = true ] && [ -n "$MANIFEST_URL" ]; then
+        echo "Manifest URL: $MANIFEST_URL"
+        echo "M3/M4 features not yet implemented - dropping to shell"
+    fi
+
+    echo "Starting interactive shell..."
+    echo ""
+
+    # Execute shell as PID 1
+    exec /bin/sh
+}
+
+#------------------------------------------------------------------------------
+# Cleanup Handler (if we ever get here)
+#------------------------------------------------------------------------------
+
+cleanup() {
+    echo ""
+    echo "Phase Boot shutting down..."
+    umount /run 2>/dev/null || true
+    umount /dev 2>/dev/null || true
+    umount /sys 2>/dev/null || true
+    umount /proc 2>/dev/null || true
+}
+
+# Register cleanup handler
+trap cleanup EXIT
+
+# Run main initialization
+main
+
+# Should never reach here due to 'exec /bin/sh' in main()
+echo "ERROR: Init script terminated unexpectedly"
+exit 1

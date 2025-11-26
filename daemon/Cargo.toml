@@ -15,6 +15,18 @@ path = "src/lib.rs"
 name = "plasmd"
 path = "src/main.rs"
 
+[[bin]]
+name = "phase-discover"
+path = "src/bin/phase_discover.rs"
+
+[[bin]]
+name = "phase-verify"
+path = "src/bin/phase_verify.rs"
+
+[[bin]]
+name = "phase-fetch"
+path = "src/bin/phase_fetch.rs"
+
 [dependencies]
 # WASM Runtime (using wasmtime for better compatibility)
 wasmtime = "27"
@@ -54,6 +66,9 @@ libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux",
 futures = "0.3"
 num_cpus = "1.0"
 rand = "0.8"
+
+# HTTP client (for phase-fetch)
+reqwest = { version = "0.12", features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -1,8 +1,8 @@
 # System Patterns: Phase Architecture
 
-**Last Updated**: 2025-11-09
-**Version**: 1.0
-**Status**: MVP Complete - Patterns Established
+**Last Updated**: 2025-11-26
+**Version**: 1.1
+**Status**: MVP Complete + Phase Boot Implemented
 
 ---
 
@@ -17,6 +17,7 @@
 7. [Data Flow Patterns](#data-flow-patterns)
 8. [Error Handling](#error-handling)
 9. [Testing Patterns](#testing-patterns)
+10. [Phase Boot Patterns](#phase-boot-patterns)
 
 ---
 
@@ -522,6 +523,184 @@ async fn test_peer_discovery() {
 - Unit tests: All core logic (WASM runtime, manifest parsing, receipt signing)
 - Integration tests: Peer discovery, job lifecycle, end-to-end flows
 - Cross-arch tests: macOS ARM client → Ubuntu x86_64 node (manual demo)
+
+---
+
+## Phase Boot Patterns
+
+### Boot Flow Pattern
+
+**Pattern**: Multi-stage boot with mode-based behavior
+
+```
+UEFI Firmware
+    ↓
+systemd-boot / GRUB
+    ↓ (selects boot entry by mode)
+Kernel + Initramfs
+    ↓ (phase.mode=internet|local|private)
+/init (PID 1)
+    ↓ mounts /proc, /sys, /dev
+    ↓ parses phase.mode from cmdline
+    ↓ brings up network (DHCP)
+    ↓ discovers manifest (DHT/mDNS)
+    ↓ verifies + fetches artifacts
+    ↓ kexec into target kernel
+Target System (plasm daemon)
+```
+
+**Key Principles**:
+- Mode parsed from kernel cmdline (`phase.mode=`)
+- Each mode has distinct behavior (internet, local, private)
+- Discovery before fetch, verify before execute
+- kexec for fast kernel switch without firmware
+
+### Boot Mode Pattern
+
+**Pattern**: Three modes with increasing privacy
+
+| Mode | Network | Discovery | Persistence | Identity |
+|------|---------|-----------|-------------|----------|
+| Internet | Full | DHT | Write cache | Stable |
+| Local | LAN only | mDNS | Use cache | Stable |
+| Private | Optional Tor | DHT (ephemeral) | No writes | Ephemeral |
+
+**Implementation**:
+```bash
+# boot/initramfs/scripts/mode-handler.sh
+case "$mode" in
+    internet)
+        phase-discover --channel "$channel" --arch "$arch"
+        ;;
+    local)
+        # Try cache first, fall back to mDNS
+        if [ -f "$CACHE/manifest.json" ]; then
+            use_cached_manifest
+        else
+            phase-discover --mdns-only
+        fi
+        ;;
+    private)
+        phase-discover --ephemeral --channel "$channel"
+        ;;
+esac
+```
+
+### Verification Pipeline Pattern
+
+**Pattern**: Verify before trust
+
+```
+1. Discover manifest URL (DHT/mDNS)
+      ↓
+2. Fetch manifest JSON
+      ↓
+3. Verify Ed25519 signature (phase-verify)
+   - Load embedded root public key
+   - Verify signature over manifest
+   - Check rollback protection (version >= cached)
+      ↓
+4. Fetch artifacts (phase-fetch)
+   - Try each URL in manifest
+   - Streaming SHA256 verification
+   - Verify size matches manifest
+      ↓
+5. kexec into verified kernel
+```
+
+**Key Principles**:
+- Root public key embedded in binary (daemon/keys/root.pub.placeholder)
+- Manifest includes version for rollback protection
+- Artifacts verified by content hash (SHA256)
+- Multi-URL fallback for reliability
+
+### kexec Handoff Pattern
+
+**Pattern**: Replace running kernel without firmware
+
+```bash
+# boot/initramfs/scripts/kexec-boot.sh
+
+# 1. Load current kernel params
+CURRENT_CMDLINE=$(cat /proc/cmdline)
+
+# 2. Build final cmdline (preserve phase.*)
+FINAL_CMDLINE="root=/dev/ram0 phase.mode=$mode $CURRENT_CMDLINE"
+
+# 3. Load new kernel
+kexec -l "$KERNEL" --initrd="$INITRAMFS" --command-line="$FINAL_CMDLINE"
+
+# 4. Execute (point of no return)
+kexec -e
+```
+
+**Key Principles**:
+- Preserve kernel cmdline parameters across kexec
+- Include phase.mode in new cmdline
+- kexec -l loads, kexec -e executes
+- No BIOS/firmware involvement after initial boot
+
+### OverlayFS Pattern
+
+**Pattern**: Writable layer over read-only rootfs
+
+```
+┌─────────────────────────────────────┐
+│     Merged View (/newroot)          │  ← Applications see this
+├─────────────────────────────────────┤
+│  Upper (tmpfs) - Changes written    │  ← Ephemeral writes
+├─────────────────────────────────────┤
+│  Lower (squashfs) - Verified rootfs │  ← Read-only, verified
+└─────────────────────────────────────┘
+```
+
+**Implementation** (`overlayfs-setup.sh`):
+```bash
+# Mount verified rootfs as lower
+mount -t squashfs "$ROOTFS" /lower -o ro
+
+# Create tmpfs for upper/work
+mount -t tmpfs tmpfs /overlay
+mkdir /overlay/upper /overlay/work
+
+# Create merged view
+mount -t overlay overlay /newroot \
+    -o lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work
+```
+
+**Key Principles**:
+- Lower layer is cryptographically verified
+- Upper layer is tmpfs (lost on reboot in private mode)
+- Merged view provides normal filesystem semantics
+- No writes to verified artifacts
+
+### Build System Pattern
+
+**Pattern**: Make-based cross-architecture build
+
+```makefile
+# boot/Makefile targets
+
+# Architecture-specific
+make ARCH=x86_64  # Default
+make ARCH=arm64   # ARM64 build
+
+# Components
+make esp          # EFI System Partition
+make initramfs    # Initramfs image
+make rootfs       # SquashFS rootfs
+make image        # Full USB image
+
+# Testing
+make test-qemu-x86  # QEMU test
+make test-qemu-arm  # ARM64 QEMU test
+```
+
+**Key Principles**:
+- Single Makefile orchestrates all builds
+- ARCH variable selects target architecture
+- Components buildable independently
+- QEMU targets for easy testing
 
 ---
 

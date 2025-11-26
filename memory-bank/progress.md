@@ -83,22 +83,72 @@
 
 ---
 
+### Phase Boot: All Milestones ✅ IMPLEMENTED
+**Goal**: Bootable USB/VM for Phase network discovery and WASM execution
+
+**Status**: 7/7 milestones complete (100%)
+**Completed**: Nov 2025
+
+| Milestone | Status | Key Deliverables |
+|-----------|--------|------------------|
+| M1 - Boot Stub | ✅ DONE | Makefile, ESP partition, init script, bootloader configs |
+| M2 - Discovery | ✅ DONE | phase-discover binary, mDNS/DHT, network scripts |
+| M3 - Verification | ✅ DONE | phase-verify binary, Ed25519, manifest schema |
+| M4 - kexec Modes | ✅ DONE | kexec-boot.sh, overlayfs-setup.sh, mode handlers |
+| M5 - Packaging | ✅ DONE | USB image builder, QCOW2 builder, release scripts |
+| M6 - Plasm Integration | ✅ DONE | plasmd.service, plasm-init.sh, hello-job.sh |
+| M7 - Documentation | ✅ DONE | ARCHITECTURE, COMPONENTS, QUICKSTARTS, THREAT-MODEL |
+
+**Stats**: 14 commits, 54 files, 14,395 lines added
+
+**New Binaries**:
+- `phase_discover.rs` (270 lines) - Kademlia DHT peer discovery
+- `phase_verify.rs` (339 lines) - Ed25519 manifest verification
+- `phase_fetch.rs` (348 lines) - Content-addressable artifact fetching
+
+**Completed**: See branch `claude/initial-setup-01JKb73EpTu4mMtekxxUYZD2`
+
+---
+
 ## Overall Progress
 
-**MVP Completion**: 23/23 tasks (100%) ✅ **MVP COMPLETE**
+**Phase Open MVP**: 23/23 tasks (100%) ✅ **MVP COMPLETE**
+**Phase Boot**: 7/7 milestones (100%) ✅ **IMPLEMENTED**
 
 ```
+Phase Open MVP:
 Milestone 1: ██████████  5/5  (100%) ✅
 Milestone 2: ██████████  6/6  (100%) ✅
 Milestone 3: ██████████  6/6  (100%) ✅
 Milestone 4: ██████████  6/6  (100%) ✅
             ──────────────────
 Total:       ██████████  23/23 (100%) ✅ COMPLETE
+
+Phase Boot:
+M1 Boot Stub:  ██████████  (100%) ✅
+M2 Discovery:  ██████████  (100%) ✅
+M3 Verify:     ██████████  (100%) ✅
+M4 kexec:      ██████████  (100%) ✅
+M5 Packaging:  ██████████  (100%) ✅
+M6 Plasm:      ██████████  (100%) ✅
+M7 Docs:       ██████████  (100%) ✅
+            ──────────────────
+Total:       ██████████  7/7 (100%) ✅ IMPLEMENTED
 ```
 
 ---
 
 ## Recent Completions
+
+### 2025-11-26: Phase Boot Complete (M1-M7)
+- ✅ **M1 - Boot Stub**: Makefile (540 lines), ESP partition, init script (325 lines)
+- ✅ **M2 - Discovery**: phase-discover binary, network scripts (net-init.sh, net-wired.sh)
+- ✅ **M3 - Verification**: phase-verify binary, manifest schema (133-line JSON schema)
+- ✅ **M4 - kexec Modes**: kexec-boot.sh (301 lines), overlayfs-setup.sh (353 lines)
+- ✅ **M5 - Packaging**: build-usb-image.sh (396 lines), build-qcow2.sh (257 lines)
+- ✅ **M6 - Plasm Integration**: plasmd.service, hello-job.sh (218 lines)
+- ✅ **M7 - Documentation**: 6 comprehensive docs totaling ~6,000 lines
+- ✅ **Stats**: 14 commits, 54 files, 14,395 lines of code
 
 ### 2025-11-09: Library + Binary Pattern Refactor
 - ✅ Transformed daemon to standard Rust library + binary structure
@@ -161,7 +211,7 @@ Total:       ██████████  23/23 (100%) ✅ COMPLETE
 ## Active Work
 
 ### Current Sprint (Nov 2025)
-**Status**: ✅ **MVP COMPLETE - All 4 milestones delivered**
+**Status**: ✅ **MVP COMPLETE + Phase Boot Implemented**
 
 **Completed in November 2025**:
 - ✅ Milestone 1: Local WASM Execution (5/5 tasks)
@@ -169,8 +219,11 @@ Total:       ██████████  23/23 (100%) ✅ COMPLETE
 - ✅ Milestone 3: Remote Execution (6/6 tasks)
 - ✅ Milestone 4: Packaging & Demo (6/6 tasks)
 - ✅ Library + Binary Pattern Refactor (architectural improvement)
+- ✅ **Phase Boot M1-M7**: Full boot system implementation (54 files, 14,395 lines)
 
-**MVP Status**: Production-ready for Debian/Ubuntu deployments
+**Project Status**:
+- Phase Open MVP: Production-ready for Debian/Ubuntu deployments
+- Phase Boot: Ready for hardware testing (USB, VM)
 
 ---
 
