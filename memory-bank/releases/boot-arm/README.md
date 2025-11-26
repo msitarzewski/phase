@@ -1,6 +1,6 @@
 # Phase Boot ARM64 - Development Environment
 
-**Status**: QEMU + vmnet-shared WORKING - VM can reach host services
+**Status**: QEMU + vmnet-shared WORKING - VM-to-host WASM fetch TESTED
 **Target**: Fast iteration development on Apple Silicon
 **Last Updated**: 2025-11-26
 
@@ -26,8 +26,9 @@ make download-kernel ARCH=arm64
 cd boot
 docker run --rm -v "$(pwd):/work" -w /work ubuntu:22.04 bash -c '
   apt-get update -qq && apt-get install -y -qq busybox-static cpio gzip >/dev/null 2>&1
-  rm -rf build/initramfs-work && mkdir -p build/initramfs-work/{bin,sbin,dev,proc,sys,run,tmp,etc,lib/modules}
+  rm -rf build/initramfs-work && mkdir -p build/initramfs-work/{bin,sbin,dev,proc,sys,run,tmp,etc,lib/modules,usr/share/udhcpc}
   cp initramfs/init build/initramfs-work/init && chmod +x build/initramfs-work/init
+  cp initramfs/usr/share/udhcpc/default.script build/initramfs-work/usr/share/udhcpc/ && chmod +x build/initramfs-work/usr/share/udhcpc/default.script
   cp /bin/busybox build/initramfs-work/bin/busybox && chmod +x build/initramfs-work/bin/busybox
   cd build/initramfs-work/bin && for cmd in $(/bin/busybox --list); do ln -sf busybox $cmd 2>/dev/null; done && cd /work
   cd build/initramfs-work/sbin && ln -sf ../bin/busybox modprobe && ln -sf ../bin/busybox insmod && cd /work
@@ -86,6 +87,13 @@ With vmnet-shared networking:
 2. Mac has 192.168.2.1 on bridge102 interface
 3. VM can wget/curl services running on Mac
 4. **Proven**: VM successfully fetched from Python HTTP server on host
+
+### POC: VM-to-Host WASM Fetch (Tested 2025-11-26)
+Full end-to-end test of Phase Boot concept:
+1. Mac runs `python3 -m http.server 8080` serving `/tmp/hello.wasm`
+2. VM boots with vmnet-shared, gets 192.168.2.x IP
+3. VM runs `wget http://192.168.2.1:8080/hello.wasm`
+4. **Proven**: 84KB WASM binary successfully fetched from host to VM
 
 ### Kernel Modules Loaded
 The init script automatically loads these modules in order:
@@ -196,10 +204,11 @@ For development, QEMU direct boot is superior.
 
 ## Next Steps
 
-1. **Fix udhcpc**: Add default.script to initramfs for automatic DHCP configuration
-2. **Test with Plasm**: Run Plasm daemon on Mac, have VM discover and execute job
+1. ~~**Fix udhcpc**~~: ✅ Done - Added default.script to initramfs
+2. ~~**Test WASM fetch**~~: ✅ Done - VM successfully fetched WASM from Mac
 3. **Build phase-discover ARM64**: Cross-compile discovery binary for initramfs
-4. **Later**: Investigate Parallels console issue if needed for USB testing
+4. **Integrate Plasmd**: Add WASM runtime to initramfs for full job execution
+5. **Later**: Investigate Parallels console issue if needed for USB testing
 
 ---
 

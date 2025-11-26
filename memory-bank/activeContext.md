@@ -184,6 +184,15 @@ None
 
 ## Recent Achievements
 
+### 2025-11-26: ARM64 Development Environment + VM-to-Host WASM Fetch
+- ✅ **QEMU ARM64 with HVF**: Boot in ~2-3 seconds on Apple Silicon
+- ✅ **vmnet-shared networking**: VM gets real LAN IP (192.168.2.x)
+- ✅ **VM-to-Host POC**: Proven VM can wget from services on Mac
+- ✅ **Kernel modules**: af_packet, virtio stack loading correctly
+- ✅ **udhcpc DHCP fixed**: Added default.script for auto IP/gateway/DNS config
+- ✅ **WASM fetch tested**: VM successfully fetched 84KB hello.wasm from Mac
+- ✅ **Documentation**: memory-bank/releases/boot-arm/README.md updated
+
 ### 2025-11-26: Phase Boot Complete (M1-M7)
 - ✅ **M1 - Boot Stub**: Makefile, ESP partition, systemd-boot/GRUB configs, init script
 - ✅ **M2 - Discovery**: phase-discover binary, Kademlia DHT, mDNS, network scripts
@@ -204,11 +213,27 @@ None
 
 ## Next Actions (Priority Order)
 
-1. **Test Phase Boot in QEMU**: Run `make test-qemu-x86` to validate boot flow
-2. **Test USB image creation**: Build and test on real hardware
-3. **Validate discovery**: Test phase-discover on local network
-4. **Test hello job**: Run hello-job.sh example post-boot
-5. **CI/CD setup**: Automate Phase Boot image builds
+1. ~~**Fix udhcpc DHCP**~~: ✅ Done - Added default.script to initramfs
+2. ~~**Test WASM fetch**~~: ✅ Done - VM fetched 84KB hello.wasm from Mac
+3. **Build phase-discover ARM64**: Cross-compile for initramfs
+4. **Integrate Plasmd**: Add WASM runtime to initramfs for job execution
+5. **Test USB image creation**: Build and test on real hardware
+6. **CI/CD setup**: Automate Phase Boot image builds
+
+### Quick Boot Commands (ARM64 on Mac)
+```bash
+# User networking (isolated, no sudo)
+cd boot && qemu-system-aarch64 -M virt -cpu host -accel hvf -m 1024 \
+  -kernel build/kernel/vmlinuz-arm64 -initrd build/initramfs/initramfs-arm64.img \
+  -append "console=ttyAMA0 phase.mode=internet" \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -nographic
+
+# Shared networking (VM can reach host, requires sudo)
+sudo qemu-system-aarch64 -M virt -cpu host -accel hvf -m 512 \
+  -kernel build/kernel/vmlinuz-arm64 -initrd build/initramfs/initramfs-arm64.img \
+  -append "console=ttyAMA0 phase.mode=internet" \
+  -netdev vmnet-shared,id=net0 -device virtio-net-pci,netdev=net0 -nographic
+```
 
 ---
 
