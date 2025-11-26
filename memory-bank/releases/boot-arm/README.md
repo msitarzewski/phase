@@ -1,29 +1,14 @@
 # Phase Boot ARM64 - Development Environment
 
-**Status**: WORKING with QEMU, Parallels EFI issues deferred
+**Status**: QEMU direct boot works, EFI/ISO boot BLOCKED
 **Target**: Fast iteration development on Apple Silicon
-**Problem Solved**: USB write cycle takes 10+ minutes per test
 **Last Updated**: 2025-11-26
 
-## Current Progress
+## What Works
 
-### Working (QEMU)
-- ✅ ARM64 kernel download via Docker (Alpine linux-lts 6.12)
-- ✅ ARM64 initramfs build with busybox (statically linked)
-- ✅ Full Phase Boot init script runs successfully
-- ✅ Kernel boots, mounts filesystems, parses cmdline
-- ✅ Network initialization (gracefully handles missing NICs)
-- ✅ Phase Boot banner displays with mode info
-- ✅ Interactive shell drops to busybox
-
-### Quick Start (QEMU on Apple Silicon)
-
+### QEMU Direct Boot (bypasses EFI entirely)
 ```bash
-# Build ARM64 image
-cd boot
-./scripts/docker-build-arm64.sh
-
-# Boot with QEMU (native ARM64 via HVF)
+# This works - kernel+initrd passed directly to QEMU
 qemu-system-aarch64 \
     -M virt -cpu host -accel hvf -m 1024 \
     -kernel build/kernel/vmlinuz-arm64 \
@@ -31,14 +16,67 @@ qemu-system-aarch64 \
     -append "console=ttyAMA0 phase.mode=internet" \
     -nographic
 ```
+- Full Phase Boot init runs, drops to shell
+- ~5 second boot time with HVF acceleration
 
-### Parallels Issues (Deferred)
-Parallels has EFI boot issues that prevent ISO/disk image booting:
-- GRUB's `linux` command gives "invalid magic number" for ARM64 kernels
-- ISO EFI boot structure not recognized by Parallels UEFI
-- Direct EFISTUB boot fails with decompression errors when objcopy modifies kernel
+## What Doesn't Work (Exhaustive List)
 
-**Workaround**: Use QEMU with HVF acceleration instead - provides similar native performance.
+### 1. GRUB `linux` command on ARM64
+**Error**: `invalid magic number`
+**Tried**:
+- Alpine kernel (PE32+ EFI stub) - invalid magic
+- Ubuntu kernel (gzip compressed) - invalid magic
+- Adding gzio module to GRUB - still fails
+- Using `search --file` to find kernel partition - finds it, still invalid magic
+
+**Root cause**: GRUB's ARM64 `linux` module appears broken for these kernels
+
+### 2. GRUB `chainloader` for EFI stub kernel
+**Error**: `EFI stub: ERROR: Failed to handle fs_proto`
+**Tried**: Chainloading kernel as EFI app with `initrd=` parameter
+**Root cause**: Chainloader doesn't set up LOAD_FILE2 protocol for initrd
+
+### 3. Direct EFISTUB (kernel as BOOTAA64.EFI)
+**Error**: Kernel decompresses, then hangs at "Exiting boot services..."
+**Root cause**: Initrd not being loaded (no bootloader to load it)
+
+### 4. Unified Kernel Image (UKI) with objcopy
+**Error**: `EFI decompressor: uncompression error`
+**Tried**: Adding .initrd and .cmdline sections via objcopy
+**Root cause**: objcopy corrupts the kernel's internal compression
+
+### 5. Parallels ISO EFI boot
+**Error**: "No operating system installed" or boots to BIOS
+**Tried**:
+- xorriso with -e efiboot.img
+- Various FAT12/16/32 formats for efiboot.img
+- Different ISO structures
+**Root cause**: Parallels UEFI doesn't recognize our ISO EFI boot structure
+
+### 6. Parallels raw disk image
+**Error**: "Invalid hard disk image file"
+**Tried**:
+- Raw disk with GPT + ESP partition
+- qemu-img convert to parallels format
+**Root cause**: Parallels requires specific HDD format we can't create
+
+### 7. Parallels keyboard input
+**Error**: No keyboard response in GRUB menu
+**Tried**: Adding USB device to VM
+**Root cause**: Unknown - possibly Parallels UEFI issue
+
+## Next Approaches to Try
+
+1. **Use an existing bootable ARM64 Linux ISO** (Alpine, Ubuntu) and study how they structure their EFI boot
+2. **systemd-boot** instead of GRUB (if available for ARM64)
+3. **iPXE** for network boot
+4. **UTM** instead of Parallels (uses QEMU backend, might work better)
+5. **Copy working ISO structure** from a known-good ARM64 distro
+
+## Files Modified
+- `boot/initramfs/init` - removed `set -e` to handle errors gracefully
+- `boot/esp/EFI/BOOT/grub-arm64.cfg` - added search command
+- `boot/Makefile` - use grub-arm64.cfg for ARM64 builds
 
 ---
 
