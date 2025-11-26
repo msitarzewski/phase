@@ -220,12 +220,12 @@ verify_write() {
     # Calculate checksum of image
     info "Hashing source image ($image_size_human)..."
     local image_hash
-    image_hash=$(pv -s "$image_size" -tpreb "$IMAGE" 2>/dev/null | head -c "$image_size" | sha256sum | cut -d' ' -f1)
+    image_hash=$(pv -s "$image_size" -tpreb "$IMAGE" | sha256sum | cut -d' ' -f1)
 
-    # Calculate checksum of written data (read directly, bypass cache)
+    # Calculate checksum of written data
     info "Hashing device ($image_size_human)..."
     local device_hash
-    device_hash=$(dd if="$DEVICE" bs=4M count=$((image_size / 4194304 + 1)) iflag=direct 2>/dev/null | head -c "$image_size" | sha256sum | cut -d' ' -f1)
+    device_hash=$(dd if="$DEVICE" bs=4M count=$((image_size / 4194304 + 1)) status=none | head -c "$image_size" | pv -s "$image_size" -tpreb | sha256sum | cut -d' ' -f1)
 
     echo ""
     info "Image hash:  $image_hash"
