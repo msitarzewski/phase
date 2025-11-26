@@ -27,11 +27,11 @@ ESP_SRC := esp
 INITRAMFS_SRC := initramfs
 ROOTFS_SRC := rootfs
 
-# Image configuration
-IMAGE_SIZE := 4096  # MB (4GB)
-ESP_SIZE := 512     # MB
-CACHE_SIZE := 1024  # MB
-ROOTFS_SIZE := 512  # MB
+# Image configuration (sizes in MB)
+IMAGE_SIZE := 4096
+ESP_SIZE := 512
+CACHE_SIZE := 1024
+ROOTFS_SIZE := 512
 
 # Kernel URLs (using mainstream kernel.org stable kernels)
 KERNEL_VERSION := 6.6.59
