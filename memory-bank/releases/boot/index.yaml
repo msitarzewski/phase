@@ -1,0 +1,51 @@
+{
+  "release": "phase-boot",
+  "status": "planned",
+  "owner": "Michael S.",
+  "architectures": [
+    "x86_64",
+    "arm64"
+  ],
+  "apple_silicon": "VM-only (Parallels/UTM/QEMU)",
+  "channels": [
+    "stable",
+    "testing"
+  ],
+  "milestones": [
+    {
+      "id": "M1",
+      "name": "Boot Stub & Media Layout",
+      "file": "M1/README.md"
+    },
+    {
+      "id": "M2",
+      "name": "Network Bring-up & Discovery",
+      "file": "M2/README.md"
+    },
+    {
+      "id": "M3",
+      "name": "Verification & Fetch Pipeline",
+      "file": "M3/README.md"
+    },
+    {
+      "id": "M4",
+      "name": "kexec Handoff & Modes",
+      "file": "M4/README.md"
+    },
+    {
+      "id": "M5",
+      "name": "Packaging & VM Images",
+      "file": "M5/README.md"
+    },
+    {
+      "id": "M6",
+      "name": "Phase/Plasma Hello Job Path",
+      "file": "M6/README.md"
+    },
+    {
+      "id": "M7",
+      "name": "Docs & Secure Boot",
+      "file": "M7/README.md"
+    }
+  ]
+}
