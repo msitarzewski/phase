@@ -181,9 +181,20 @@ write_image() {
 
     echo ""
 
-    # Sync
-    info "Syncing..."
-    sync
+    # Sync with progress indicator
+    info "Syncing buffers to disk (this can take a while on slow drives)..."
+
+    # Run sync in background and show spinner
+    sync &
+    local sync_pid=$!
+    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while kill -0 $sync_pid 2>/dev/null; do
+        printf "\r  %s Flushing write cache... " "${spin[$i]}"
+        i=$(( (i + 1) % ${#spin[@]} ))
+        sleep 0.1
+    done
+    printf "\r  ✓ Sync complete!            \n"
 
     ok "Image written successfully!"
 }
