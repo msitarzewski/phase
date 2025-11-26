@@ -79,12 +79,12 @@ DEPS=(
     "sha256sum|coreutils|Checksum verification"
     "curl|curl|Downloading kernel/tools"
     "tar|tar|Archive extraction"
+    "pv|pv|Progress bar for disk operations"
 )
 
 # Optional dependencies
 OPTIONAL_DEPS=(
     "kvm|qemu-kvm|Hardware virtualization (faster QEMU)"
-    "pv|pv|Progress bar for dd operations"
     "mtools|mtools|FAT filesystem manipulation"
     "xorriso|xorriso|ISO image creation"
 )

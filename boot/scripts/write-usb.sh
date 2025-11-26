@@ -171,11 +171,10 @@ write_image() {
     info "Image size: $image_size_human"
     echo ""
 
-    # Use pv for progress if available, otherwise dd status
+    # Use pv for progress (required dependency), fallback to dd status
     if command -v pv &>/dev/null; then
         pv -s "$image_size" -tpreb "$IMAGE" | dd of="$DEVICE" bs=4M conv=fsync 2>/dev/null
     else
-        echo "  (install 'pv' for better progress: sudo apt install pv)"
         dd if="$IMAGE" of="$DEVICE" bs=4M status=progress conv=fsync
     fi
 
