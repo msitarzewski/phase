@@ -231,7 +231,7 @@ esp: dirs kernel-$(ARCH)
 				-o $(ESP_BUILD)/EFI/BOOT/BOOTAA64.EFI \
 				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain search search_fs_file search_fs_uuid search_label" \
 				--locales="" --fonts="" \
-				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub.cfg"; \
+				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub-arm64.cfg"; \
 		else \
 			echo "$(COLOR_RED)  ERROR: No bootloader available!$(COLOR_RESET)"; \
 			echo "  Install either: systemd-boot or grub-efi-arm64-bin"; \
