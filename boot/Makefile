@@ -64,7 +64,7 @@ COLOR_YELLOW := \033[33m
 #------------------------------------------------------------------------------
 
 .PHONY: all clean help deps \
-        esp kernel-x86_64 kernel-arm64 initramfs rootfs image \
+        esp kernel-x86_64 kernel-arm64 download-kernel initramfs rootfs image \
         test-qemu-x86 test-qemu-arm \
         verify dirs
 
@@ -103,6 +103,7 @@ help:
 	@echo "  $(COLOR_BLUE)test-qemu-arm$(COLOR_RESET)    - Test ARM64 image in QEMU"
 	@echo ""
 	@echo "$(COLOR_BOLD)Utility Targets:$(COLOR_RESET)"
+	@echo "  $(COLOR_BLUE)download-kernel$(COLOR_RESET)  - Download kernel for current ARCH"
 	@echo "  $(COLOR_BLUE)deps$(COLOR_RESET)             - Check/install dependencies"
 	@echo "  $(COLOR_BLUE)verify$(COLOR_RESET)           - Verify build outputs"
 	@echo "  $(COLOR_BLUE)dirs$(COLOR_RESET)             - Create build directories"
@@ -160,27 +161,31 @@ deps:
 # Kernel Download/Preparation
 #------------------------------------------------------------------------------
 
+download-kernel: dirs
+	@echo "$(COLOR_YELLOW)→ Downloading kernel for $(ARCH)...$(COLOR_RESET)"
+	@$(SCRIPTS_DIR)/download-kernel.sh --arch $(ARCH) --output $(KERNEL_DIR)
+	@echo "$(COLOR_GREEN)✓ Kernel downloaded$(COLOR_RESET)"
+
 kernel-x86_64: dirs
 	@echo "$(COLOR_YELLOW)→ Preparing x86_64 kernel...$(COLOR_RESET)"
 	@if [ ! -f "$(KERNEL_DIR)/vmlinuz-x86_64" ]; then \
-		echo "  Checking for pre-built kernel..."; \
-		if [ -f "/boot/vmlinuz" ]; then \
-			echo "  Using host kernel: /boot/vmlinuz"; \
-			cp /boot/vmlinuz $(KERNEL_DIR)/vmlinuz-x86_64; \
-		else \
-			echo "  $(COLOR_YELLOW)No kernel found. Please provide vmlinuz-x86_64$(COLOR_RESET)"; \
-			echo "  Place kernel at: $(KERNEL_DIR)/vmlinuz-x86_64"; \
-			exit 1; \
-		fi \
+		echo "  $(COLOR_RED)No kernel found at: $(KERNEL_DIR)/vmlinuz-x86_64$(COLOR_RESET)"; \
+		echo ""; \
+		echo "  Please run the kernel download script first:"; \
+		echo "    $(COLOR_CYAN)./scripts/download-kernel.sh$(COLOR_RESET)"; \
+		echo ""; \
+		exit 1; \
 	fi
 	@echo "$(COLOR_GREEN)✓ x86_64 kernel ready$(COLOR_RESET)"
 
 kernel-arm64: dirs
 	@echo "$(COLOR_YELLOW)→ Preparing ARM64 kernel...$(COLOR_RESET)"
 	@if [ ! -f "$(KERNEL_DIR)/vmlinuz-arm64" ]; then \
-		echo "  $(COLOR_YELLOW)ARM64 kernel not found$(COLOR_RESET)"; \
-		echo "  Place kernel at: $(KERNEL_DIR)/vmlinuz-arm64"; \
-		echo "  (You may need to cross-compile or download from distro)"; \
+		echo "  $(COLOR_RED)No kernel found at: $(KERNEL_DIR)/vmlinuz-arm64$(COLOR_RESET)"; \
+		echo ""; \
+		echo "  Please run the kernel download script first:"; \
+		echo "    $(COLOR_CYAN)./scripts/download-kernel.sh --arch arm64$(COLOR_RESET)"; \
+		echo ""; \
 		exit 1; \
 	fi
 	@echo "$(COLOR_GREEN)✓ ARM64 kernel ready$(COLOR_RESET)"
