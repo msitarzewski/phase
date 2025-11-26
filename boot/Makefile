@@ -206,7 +206,7 @@ esp: dirs kernel-$(ARCH)
 			echo "  Building GRUB EFI bootloader (x86_64)..."; \
 			grub-mkstandalone -O x86_64-efi \
 				-o $(ESP_BUILD)/EFI/BOOT/BOOTX64.EFI \
-				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain" \
+				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain search search_fs_file search_fs_uuid search_label" \
 				--locales="" --fonts="" \
 				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub.cfg"; \
 		else \
@@ -224,7 +224,7 @@ esp: dirs kernel-$(ARCH)
 			echo "  Building GRUB EFI bootloader (ARM64)..."; \
 			grub-mkstandalone -O arm64-efi \
 				-o $(ESP_BUILD)/EFI/BOOT/BOOTAA64.EFI \
-				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain" \
+				--modules="part_gpt part_msdos fat normal linux boot configfile loopback chain search search_fs_file search_fs_uuid search_label" \
 				--locales="" --fonts="" \
 				"boot/grub/grub.cfg=$(ESP_SRC)/EFI/BOOT/grub.cfg"; \
 		else \
