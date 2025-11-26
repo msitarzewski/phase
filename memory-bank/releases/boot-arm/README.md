@@ -1,8 +1,38 @@
 # Phase Boot ARM64 - Parallels Development Environment
 
-**Status**: Planning
+**Status**: In Progress - GRUB file path issue blocking kernel load
 **Target**: Fast iteration development on Apple Silicon via Parallels
 **Problem Solved**: USB write cycle takes 10+ minutes per test
+**Last Updated**: 2025-11-26
+
+## Current Progress
+
+### Completed
+- ✅ ARM64 kernel download via Docker (Alpine linux-lts)
+- ✅ ARM64 initramfs build with busybox
+- ✅ ARM64 GRUB EFI bootloader (BOOTAA64.EFI)
+- ✅ Bootable ISO creation (phase-boot-arm64.iso)
+- ✅ Parallels VM creation and configuration
+- ✅ GRUB menu displays correctly (3 boot modes)
+- ✅ Docker-based build script (scripts/docker-build-arm64.sh)
+- ✅ ARM64 GRUB config (esp/EFI/BOOT/grub-arm64.cfg)
+
+### Current Blocker
+**GRUB cannot find kernel file**: When GRUB tries to load `/vmlinuz-arm64`, it reports "file not found". The kernel exists in `efiboot.img` but GRUB's root filesystem points elsewhere.
+
+**Error**: `error: file '/vmlinuz-arm64' not found`
+
+**Root Cause**: ISO boot with embedded EFI boot image - GRUB's `$root` variable doesn't point to the efiboot.img FAT filesystem where the kernel resides.
+
+**Potential Solutions**:
+1. Use `(cd0)` or similar device prefix to specify the boot device
+2. Embed kernel directly into GRUB (grub-mkstandalone with memdisk)
+3. Use UEFI direct boot (chainload kernel EFI stub) instead of GRUB linux command
+4. Create a proper USB/disk image instead of ISO for Parallels
+
+### Known Issues
+- Parallels VM keyboard input not working (cursor keys don't respond)
+- Serial console not receiving output (may be ARM64 device path issue)
 
 ---
 
