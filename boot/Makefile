@@ -19,7 +19,7 @@ ESP_BUILD := $(BUILD_DIR)/esp
 INITRAMFS_BUILD := $(BUILD_DIR)/initramfs
 ROOTFS_BUILD := $(BUILD_DIR)/rootfs
 CACHE_BUILD := $(BUILD_DIR)/cache
-KERNEL_DIR := kernel
+KERNEL_DIR := $(BUILD_DIR)/kernel
 SCRIPTS_DIR := scripts
 
 # Source directories

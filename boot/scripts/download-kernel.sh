@@ -13,7 +13,7 @@ NC='\033[0m' # No Color
 
 # Default values
 ARCH="x86_64"
-OUTPUT_DIR="../build/kernel"
+OUTPUT_DIR="$(dirname "$0")/../build/kernel"
 VERSION="edge"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
