@@ -27,6 +27,13 @@ PHASE_NOWRITE="false"
 mount_essential() {
     echo "Mounting essential filesystems..."
 
+    # Create mount points if they don't exist
+    [ -d /proc ] || mkdir -p /proc
+    [ -d /sys ]  || mkdir -p /sys
+    [ -d /dev ]  || mkdir -p /dev
+    [ -d /run ]  || mkdir -p /run
+    [ -d /tmp ]  || mkdir -p /tmp
+
     # /proc - Process information pseudo-filesystem
     mount -t proc proc /proc
 
@@ -38,6 +45,9 @@ mount_essential() {
 
     # /run - Runtime data (tmpfs, volatile)
     mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+
+    # /tmp - Temporary files
+    mount -t tmpfs -o nosuid,nodev tmpfs /tmp
 
     echo "Essential filesystems mounted."
 }

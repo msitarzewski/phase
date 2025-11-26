@@ -321,6 +321,7 @@ initramfs: dirs
 	# Create other required directories
 	@mkdir -p $(INITRAMFS_BUILD)/work/proc
 	@mkdir -p $(INITRAMFS_BUILD)/work/sys
+	@mkdir -p $(INITRAMFS_BUILD)/work/run
 	@mkdir -p $(INITRAMFS_BUILD)/work/tmp
 	@mkdir -p $(INITRAMFS_BUILD)/work/mnt
 	@mkdir -p $(INITRAMFS_BUILD)/work/newroot
