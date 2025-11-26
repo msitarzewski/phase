@@ -1,0 +1,13 @@
+{
+  "listen_addrs": [
+    "/ip4/0.0.0.0/tcp/4001"
+  ],
+  "peer_addrs": [],
+  "bootstrap_peers": [],
+  "max_concurrent_jobs": 2,
+  "limits": {
+    "max_memory_bytes": 67108864,
+    "max_cpu_cores": 1,
+    "max_timeout_seconds": 180
+  }
+}
