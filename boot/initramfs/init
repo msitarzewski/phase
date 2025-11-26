@@ -13,7 +13,8 @@ set -e
 # Configuration & Defaults
 #------------------------------------------------------------------------------
 
-PHASE_VERSION="0.1.0-M1"
+PHASE_VERSION="0.1.0-M2"
+SCRIPTS_DIR="/scripts"
 PHASE_MODE="internet"
 PHASE_CHANNEL=""
 PHASE_CACHE="true"
@@ -108,56 +109,96 @@ setup_console() {
 setup_network() {
     echo "Initializing network..."
 
-    # Bring up loopback interface
-    ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || {
-        echo "Warning: Failed to bring up loopback interface"
-    }
+    # Use modular network scripts if available
+    if [ -x "$SCRIPTS_DIR/net-init.sh" ]; then
+        echo "Using modular network initialization..."
+        if "$SCRIPTS_DIR/net-init.sh"; then
+            if [ -f /tmp/network.status ] && [ "$(cat /tmp/network.status)" = "up" ]; then
+                NETWORK_STATUS="UP ($(cat /tmp/network.interface 2>/dev/null || echo 'unknown'))"
+                NETWORK_IP=$(cat /tmp/network.ip 2>/dev/null || echo "unknown")
+            else
+                NETWORK_STATUS="DOWN"
+            fi
+        else
+            NETWORK_STATUS="FAILED"
+        fi
+    else
+        # Fallback to basic network initialization
+        echo "Modular scripts not available, using basic initialization..."
 
-    # Find and configure network interfaces
-    NETWORK_STATUS="No network configured"
-
-    # Try to find Ethernet interfaces (skip loopback)
-    for iface in /sys/class/net/*; do
-        iface=$(basename "$iface")
-
-        # Skip loopback
-        [ "$iface" = "lo" ] && continue
-
-        echo "Attempting to configure interface: $iface"
-
-        # Bring interface up
-        ip link set "$iface" up 2>/dev/null || ifconfig "$iface" up 2>/dev/null || {
-            echo "Warning: Failed to bring up $iface"
-            continue
+        # Bring up loopback interface
+        ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || {
+            echo "Warning: Failed to bring up loopback interface"
         }
 
-        # Try DHCP with busybox udhcpc (common in initramfs)
-        if command -v udhcpc >/dev/null 2>&1; then
-            echo "Requesting DHCP on $iface..."
-            udhcpc -i "$iface" -q -n -s /usr/share/udhcpc/default.script 2>/dev/null || \
-            udhcpc -i "$iface" -q -n 2>/dev/null || {
-                echo "DHCP failed on $iface"
-                continue
-            }
-            NETWORK_STATUS="DHCP configured on $iface"
-            break
-        # Try dhcpcd as fallback
-        elif command -v dhcpcd >/dev/null 2>&1; then
-            echo "Requesting DHCP on $iface (dhcpcd)..."
-            dhcpcd -q "$iface" 2>/dev/null || {
-                echo "DHCP failed on $iface"
-                continue
-            }
-            NETWORK_STATUS="DHCP configured on $iface"
-            break
-        else
-            echo "No DHCP client available (udhcpc or dhcpcd)"
-            NETWORK_STATUS="Interface up, no DHCP client"
-            break
-        fi
-    done
+        # Find and configure network interfaces
+        NETWORK_STATUS="No network configured"
 
-    echo "Network initialization complete: $NETWORK_STATUS"
+        for iface in /sys/class/net/*; do
+            iface=$(basename "$iface")
+            [ "$iface" = "lo" ] && continue
+
+            ip link set "$iface" up 2>/dev/null || continue
+
+            if command -v udhcpc >/dev/null 2>&1; then
+                udhcpc -i "$iface" -q -n 2>/dev/null && {
+                    NETWORK_STATUS="DHCP on $iface"
+                    break
+                }
+            elif command -v dhcpcd >/dev/null 2>&1; then
+                dhcpcd -q "$iface" 2>/dev/null && {
+                    NETWORK_STATUS="DHCP on $iface"
+                    break
+                }
+            fi
+        done
+    fi
+
+    echo "Network: $NETWORK_STATUS"
+}
+
+#------------------------------------------------------------------------------
+# Phase Discovery (M2+)
+#------------------------------------------------------------------------------
+
+run_discovery() {
+    echo "Starting Phase discovery..."
+
+    # Skip discovery in some cases
+    if [ "$PHASE_MODE" = "local" ]; then
+        echo "Local mode: Using mDNS discovery (if available)"
+        DISCOVERY_METHOD="mdns"
+    else
+        echo "Using DHT discovery..."
+        DISCOVERY_METHOD="dht"
+    fi
+
+    # Check for phase-discover binary
+    if [ -x "/bin/phase-discover" ]; then
+        echo "Running phase-discover..."
+
+        # Build discovery arguments
+        DISCOVER_ARGS="--arch $(uname -m) --channel ${PHASE_CHANNEL:-stable}"
+
+        # Add ephemeral flag for private mode
+        if [ "$PHASE_MODE" = "private" ]; then
+            DISCOVER_ARGS="$DISCOVER_ARGS --ephemeral"
+        fi
+
+        # Run discovery with timeout
+        if /bin/phase-discover $DISCOVER_ARGS --timeout 30 --quiet > /tmp/manifest_url 2>/dev/null; then
+            MANIFEST_URL=$(cat /tmp/manifest_url)
+            echo "Discovered manifest: $MANIFEST_URL"
+            return 0
+        else
+            echo "Discovery failed or timed out"
+            return 1
+        fi
+    else
+        echo "phase-discover not available (M2 binary not installed)"
+        echo "Skipping discovery - will drop to shell"
+        return 1
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -189,13 +230,19 @@ EOF
     echo "--------------------------------"
     echo ""
     echo "Available commands:"
-    echo "  ip addr        - Show network configuration"
-    echo "  ip route       - Show routing table"
-    echo "  mount          - Show mounted filesystems"
-    echo "  ps             - Show running processes"
+    echo "  ip addr          - Show network configuration"
+    echo "  ip route         - Show routing table"
+    echo "  mount            - Show mounted filesystems"
+    echo "  ps               - Show running processes"
     echo "  cat /proc/cmdline - Show kernel command line"
+    if [ -x "$SCRIPTS_DIR/net-diag.sh" ]; then
+        echo "  $SCRIPTS_DIR/net-diag.sh - Network diagnostics"
+    fi
+    if [ -x "/bin/phase-discover" ]; then
+        echo "  phase-discover   - Manual manifest discovery"
+    fi
     echo ""
-    echo "Phase Boot initialized. Dropping to shell..."
+    echo "Phase Boot initialized."
     echo ""
 }
 
@@ -220,15 +267,37 @@ main() {
     setup_network
     echo ""
 
+    # Attempt Phase discovery (M2+)
+    DISCOVERY_SUCCESS=false
+    if [ "$NETWORK_STATUS" != "DOWN" ] && [ "$NETWORK_STATUS" != "FAILED" ]; then
+        echo "Network available, attempting discovery..."
+        if run_discovery; then
+            DISCOVERY_SUCCESS=true
+            echo ""
+            echo "Discovery successful!"
+            # M3+ will continue to fetch and verify manifest here
+        else
+            echo ""
+            echo "Discovery not available or failed."
+        fi
+    else
+        echo "Network not available, skipping discovery."
+    fi
+    echo ""
+
     print_banner
 
-    # For Milestone 1: Drop to interactive shell
-    # Future milestones will replace this with Phase discovery
-    echo "Starting interactive shell (PID 1 mode)..."
+    # If discovery succeeded and we have kexec, M4+ will proceed to kexec
+    # For now (M2), drop to shell for manual testing
+    if [ "$DISCOVERY_SUCCESS" = true ] && [ -n "$MANIFEST_URL" ]; then
+        echo "Manifest URL: $MANIFEST_URL"
+        echo "M3/M4 features not yet implemented - dropping to shell"
+    fi
+
+    echo "Starting interactive shell..."
     echo ""
 
     # Execute shell as PID 1
-    # Use 'exec' to replace the init process with the shell
     exec /bin/sh
 }
 
