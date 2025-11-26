@@ -1,0 +1,256 @@
+#!/bin/sh
+#
+# Phase Boot - Init Script (PID 1)
+#
+# This is the first userspace process that runs when the Phase Boot
+# initramfs is loaded by the kernel. It sets up the minimal environment
+# needed to bootstrap the Phase network discovery system.
+#
+
+set -e
+
+#------------------------------------------------------------------------------
+# Configuration & Defaults
+#------------------------------------------------------------------------------
+
+PHASE_VERSION="0.1.0-M1"
+PHASE_MODE="internet"
+PHASE_CHANNEL=""
+PHASE_CACHE="true"
+PHASE_NOWRITE="false"
+
+#------------------------------------------------------------------------------
+# Mount Essential Filesystems
+#------------------------------------------------------------------------------
+
+mount_essential() {
+    echo "Mounting essential filesystems..."
+
+    # /proc - Process information pseudo-filesystem
+    mount -t proc proc /proc
+
+    # /sys - Kernel and device information
+    mount -t sysfs sysfs /sys
+
+    # /dev - Device nodes (devtmpfs is auto-populated by kernel)
+    mount -t devtmpfs devtmpfs /dev
+
+    # /run - Runtime data (tmpfs, volatile)
+    mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+
+    echo "Essential filesystems mounted."
+}
+
+#------------------------------------------------------------------------------
+# Parse Kernel Command Line
+#------------------------------------------------------------------------------
+
+parse_cmdline() {
+    echo "Parsing kernel command line..."
+
+    # Read kernel command line
+    if [ -f /proc/cmdline ]; then
+        CMDLINE=$(cat /proc/cmdline)
+
+        # Parse each parameter
+        for param in $CMDLINE; do
+            case "$param" in
+                phase.mode=*)
+                    PHASE_MODE="${param#phase.mode=}"
+                    ;;
+                phase.channel=*)
+                    PHASE_CHANNEL="${param#phase.channel=}"
+                    ;;
+                phase.cache=*)
+                    PHASE_CACHE="${param#phase.cache=}"
+                    ;;
+                phase.nowrite=*)
+                    PHASE_NOWRITE="${param#phase.nowrite=}"
+                    ;;
+            esac
+        done
+    fi
+
+    # Validate mode
+    case "$PHASE_MODE" in
+        internet|local|private)
+            ;;
+        *)
+            echo "Warning: Unknown phase.mode=$PHASE_MODE, defaulting to 'internet'"
+            PHASE_MODE="internet"
+            ;;
+    esac
+
+    echo "Mode: $PHASE_MODE"
+    [ -n "$PHASE_CHANNEL" ] && echo "Channel: $PHASE_CHANNEL"
+}
+
+#------------------------------------------------------------------------------
+# Set Up Console
+#------------------------------------------------------------------------------
+
+setup_console() {
+    echo "Setting up console..."
+
+    # Ensure stdin, stdout, stderr are properly connected
+    exec 0</dev/console
+    exec 1>/dev/console
+    exec 2>/dev/console
+
+    # Set up job control for the shell
+    setsid sh -c 'exec sh </dev/console >/dev/console 2>&1' || true
+}
+
+#------------------------------------------------------------------------------
+# Network Initialization
+#------------------------------------------------------------------------------
+
+setup_network() {
+    echo "Initializing network..."
+
+    # Bring up loopback interface
+    ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || {
+        echo "Warning: Failed to bring up loopback interface"
+    }
+
+    # Find and configure network interfaces
+    NETWORK_STATUS="No network configured"
+
+    # Try to find Ethernet interfaces (skip loopback)
+    for iface in /sys/class/net/*; do
+        iface=$(basename "$iface")
+
+        # Skip loopback
+        [ "$iface" = "lo" ] && continue
+
+        echo "Attempting to configure interface: $iface"
+
+        # Bring interface up
+        ip link set "$iface" up 2>/dev/null || ifconfig "$iface" up 2>/dev/null || {
+            echo "Warning: Failed to bring up $iface"
+            continue
+        }
+
+        # Try DHCP with busybox udhcpc (common in initramfs)
+        if command -v udhcpc >/dev/null 2>&1; then
+            echo "Requesting DHCP on $iface..."
+            udhcpc -i "$iface" -q -n -s /usr/share/udhcpc/default.script 2>/dev/null || \
+            udhcpc -i "$iface" -q -n 2>/dev/null || {
+                echo "DHCP failed on $iface"
+                continue
+            }
+            NETWORK_STATUS="DHCP configured on $iface"
+            break
+        # Try dhcpcd as fallback
+        elif command -v dhcpcd >/dev/null 2>&1; then
+            echo "Requesting DHCP on $iface (dhcpcd)..."
+            dhcpcd -q "$iface" 2>/dev/null || {
+                echo "DHCP failed on $iface"
+                continue
+            }
+            NETWORK_STATUS="DHCP configured on $iface"
+            break
+        else
+            echo "No DHCP client available (udhcpc or dhcpcd)"
+            NETWORK_STATUS="Interface up, no DHCP client"
+            break
+        fi
+    done
+
+    echo "Network initialization complete: $NETWORK_STATUS"
+}
+
+#------------------------------------------------------------------------------
+# Print Boot Banner
+#------------------------------------------------------------------------------
+
+print_banner() {
+    cat <<'EOF'
+
+  ____  _                      ____              _
+ |  _ \| |__   __ _ ___  ___  | __ )  ___   ___ | |_
+ | |_) | '_ \ / _` / __|/ _ \ |  _ \ / _ \ / _ \| __|
+ |  __/| | | | (_| \__ \  __/ | |_) | (_) | (_) | |_
+ |_|   |_| |_|\__,_|___/\___| |____/ \___/ \___/ \__|
+
+EOF
+
+    echo "Phase Boot v$PHASE_VERSION"
+    echo "================================"
+    echo ""
+    echo "Mode:    $PHASE_MODE"
+    echo "Network: $NETWORK_STATUS"
+    [ -n "$PHASE_CHANNEL" ] && echo "Channel: $PHASE_CHANNEL"
+    echo ""
+    echo "Configuration:"
+    echo "  Cache:   $PHASE_CACHE"
+    echo "  No-Write: $PHASE_NOWRITE"
+    echo ""
+    echo "--------------------------------"
+    echo ""
+    echo "Available commands:"
+    echo "  ip addr        - Show network configuration"
+    echo "  ip route       - Show routing table"
+    echo "  mount          - Show mounted filesystems"
+    echo "  ps             - Show running processes"
+    echo "  cat /proc/cmdline - Show kernel command line"
+    echo ""
+    echo "Phase Boot initialized. Dropping to shell..."
+    echo ""
+}
+
+#------------------------------------------------------------------------------
+# Main Initialization Sequence
+#------------------------------------------------------------------------------
+
+main() {
+    # Clear screen for clean boot
+    clear 2>/dev/null || true
+
+    echo "Phase Boot initializing..."
+    echo ""
+
+    # Execute initialization steps
+    mount_essential
+    echo ""
+
+    parse_cmdline
+    echo ""
+
+    setup_network
+    echo ""
+
+    print_banner
+
+    # For Milestone 1: Drop to interactive shell
+    # Future milestones will replace this with Phase discovery
+    echo "Starting interactive shell (PID 1 mode)..."
+    echo ""
+
+    # Execute shell as PID 1
+    # Use 'exec' to replace the init process with the shell
+    exec /bin/sh
+}
+
+#------------------------------------------------------------------------------
+# Cleanup Handler (if we ever get here)
+#------------------------------------------------------------------------------
+
+cleanup() {
+    echo ""
+    echo "Phase Boot shutting down..."
+    umount /run 2>/dev/null || true
+    umount /dev 2>/dev/null || true
+    umount /sys 2>/dev/null || true
+    umount /proc 2>/dev/null || true
+}
+
+# Register cleanup handler
+trap cleanup EXIT
+
+# Run main initialization
+main
+
+# Should never reach here due to 'exec /bin/sh' in main()
+echo "ERROR: Init script terminated unexpectedly"
+exit 1

@@ -1,0 +1,15 @@
+# Phase Boot profile
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PS1='phase-boot# '
+export HOME=/root
+export TERM=linux
+
+# Phase environment
+export PHASE_MODE="${PHASE_MODE:-internet}"
+export PHASE_VERSION="0.1.0-M1"
+
+alias ll='ls -la'
+alias ..='cd ..'
+
+echo "Phase Boot v${PHASE_VERSION} - Mode: ${PHASE_MODE}"
