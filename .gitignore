@@ -21,3 +21,7 @@ composer.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Local AI tool configs
+.cascade_todo.json
+.claude/
