@@ -1,14 +1,14 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2025-11-09
-**Sprint**: Packaging & Demo (Nov-Dec 2025)
-**Status**: Milestone 1, 2, 3 Complete - Milestone 4 Next
+**Last Updated**: 2025-11-26
+**Sprint**: Phase Boot Implementation (Nov 2025)
+**Status**: Phase Open MVP Complete, Phase Boot M1-M7 Implemented
 
 ---
 
 ## Current Focus
 
-Preparing for MVP release - packaging, documentation, and end-to-end demo for Phase Open MVP (v0.1).
+Phase Boot - bootable USB/VM image for Phase network discovery and WASM execution. All 7 milestones implemented.
 
 ### Milestone 1: Local WASM Execution ✅ COMPLETE
 
@@ -57,19 +57,30 @@ See: [251109_milestone2_peer_discovery.md](tasks/2025-11/251109_milestone2_peer_
 
 See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_remote_execution.md)
 
-### Active Milestone: Packaging & Demo ⚙️ NEXT
+### Phase Boot: All Milestones ✅ IMPLEMENTED
 
-**Goal**: Deliver runnable .deb package and example
+**Completed**: 2025-11-26
 
-**Status**: 0/6 tasks complete (0%)
+**Achievements**:
+1. ✅ **M1 - Boot Stub & Media Layout**: Makefile, ESP partition, init script, bootloader configs
+2. ✅ **M2 - Network & Discovery**: phase-discover binary, mDNS/DHT, network scripts
+3. ✅ **M3 - Verification & Fetch**: phase-verify binary, Ed25519 signatures, manifest schema
+4. ✅ **M4 - kexec Handoff & Modes**: kexec-boot.sh, overlayfs-setup.sh, mode handlers
+5. ✅ **M5 - Packaging & VM Images**: USB image builder, QCOW2 builder, release scripts
+6. ✅ **M6 - Phase/Plasma Integration**: plasmd.service, plasm-init.sh, hello-job.sh example
+7. ✅ **M7 - Documentation**: ARCHITECTURE.md, COMPONENTS.md, QUICKSTART guides, THREAT-MODEL.md, TROUBLESHOOTING.md
 
-**Remaining Tasks**:
-1. 🔵 Create Debian package using cargo-deb - **PLANNED**
-2. 🔵 Add systemd service for plasmd - **PLANNED**
-3. 🔵 Write install instructions - **PLANNED**
-4. 🔵 Cross-arch demo: macOS ARM → Ubuntu x86_64 - **PLANNED**
-5. 🔵 examples/remote_test.php with clear output - **PLANNED**
-6. 🔵 docs/architecture-diagram.png (optional) - **PLANNED**
+**New Binaries**:
+- `phase-discover` - Kademlia DHT peer discovery
+- `phase-verify` - Ed25519 manifest signature verification
+- `phase-fetch` - Content-addressable artifact fetching
+
+**Boot Modes**:
+| Mode | Description |
+|------|-------------|
+| Internet | Full network, DHT discovery, downloads from web |
+| Local | LAN-only, mDNS discovery, uses cache |
+| Private | No writes, optional Tor, ephemeral identity |
 
 **Current Blocker**: None
 
@@ -77,50 +88,48 @@ See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_rem
 
 ## Current Sprint Backlog
 
-### High Priority (This Week)
-- [ ] Create Debian package using cargo-deb
-- [ ] Add systemd service file for plasmd
-- [ ] Write installation instructions in README
-- [ ] Test installation on Ubuntu 22.04 LTS
-- [ ] Update documentation for MVP release
+### Completed (Phase Boot)
+- [x] M1: Boot stub, Makefile, ESP partition, init script
+- [x] M2: Network bring-up, mDNS discovery, DHT integration
+- [x] M3: Manifest schema, Ed25519 verification, phase-verify binary
+- [x] M4: kexec orchestration, overlayfs setup, mode handlers
+- [x] M5: USB image builder, QCOW2 builder, release scripts
+- [x] M6: Plasm daemon integration, systemd service, hello-job example
+- [x] M7: Architecture docs, quickstart guides, threat model, troubleshooting
 
-### Medium Priority (Next 1-2 Weeks)
-- [ ] Create remote_test.php example
-- [ ] Test cross-architecture demo (if hardware available)
-- [ ] Create architecture diagram (optional)
-- [ ] Performance benchmarking
-- [ ] Security audit of M3 implementation
-
-### Low Priority (Future)
-- [ ] CI/CD pipeline setup
-- [ ] Multi-platform packaging (RPM, etc.)
-- [ ] API documentation generation
-- [ ] User guide and tutorials
+### Next Steps (Post Phase Boot)
+- [ ] Test USB boot on real hardware (x86_64, ARM64)
+- [ ] Test QEMU/KVM VM boot
+- [ ] CI/CD pipeline for Phase Boot images
+- [ ] Secure Boot investigation and implementation
+- [ ] Production key management for signing
 
 ---
 
-## Upcoming Milestones (Roadmap)
+## Completed Releases
 
-### Milestone 4: Packaging & Demo (Dec 2025 target) - ACTIVE
-**Goal**: Deliver runnable .deb package and example
+### Phase Open MVP ✅ COMPLETE (Nov 2025)
+**Goal**: Core WASM execution and networking
+- Milestone 1: Local WASM Execution
+- Milestone 2: Peer Discovery
+- Milestone 3: Remote Execution
+- Milestone 4: Packaging & Demo
 
-**Tasks**:
-- Create Debian package using cargo-deb
-- Add systemd service for plasmd
-- Write install instructions
-- Cross-arch demo: macOS ARM client → Ubuntu x86_64 node
-- examples/remote_test.php with clear output
-- docs/architecture-diagram.png (optional)
+### Phase Boot ✅ IMPLEMENTED (Nov 2025)
+**Goal**: Bootable USB/VM for Phase network
+- M1-M7: All milestones implemented
+- 54 files, 14,395 lines of code
+- x86_64 and ARM64 support
+- Three boot modes: Internet, Local, Private
 
-### Post-MVP Enhancements (Future)
+### Post-Boot Enhancements (Future)
 **Goal**: Production-ready improvements
 
 **Potential Work**:
-- Remote transport implementation (libp2p streaming)
-- Persistent signing keys with key management
-- Batch signing for multiple receipts
-- Client retry/timeout logic
-- WASM stdout capture (in-memory)
+- Secure Boot signing chain
+- Production key management
+- Hardware testing on various platforms
+- Performance optimization
 - Zero-knowledge proofs for private execution
 - Hardware security module (TPM/SGX) integration
 
@@ -161,58 +170,45 @@ None
 
 ## Active Experiments
 
-### cargo-deb Package Creation
-**Status**: Not started
-**Goal**: Create installable Debian package for plasmd
-**Timeline**: This week
-**Success Criteria**: Package installs cleanly on Ubuntu 22.04
+### Phase Boot Hardware Testing
+**Status**: Ready for testing
+**Goal**: Validate USB boot on real x86_64 and ARM64 hardware
+**Success Criteria**: System boots, discovers network, executes hello job
 
-### systemd Service Integration
-**Status**: Not started
-**Goal**: Run plasmd as background service
-**Timeline**: This week
-**Success Criteria**: Service starts/stops/restarts correctly with systemctl
+### Secure Boot Investigation
+**Status**: Documented in M7
+**Goal**: Investigate Secure Boot signing requirements
+**Success Criteria**: Document signing chain requirements
 
 ---
 
 ## Recent Achievements
 
-### 2025-11-09: Milestone 3 Complete - Remote Execution
-- ✅ Real Ed25519 signing (ed25519-dalek, not mocks)
-- ✅ Job protocol (JobRequest/JobResult with base64 serialization)
-- ✅ ExecutionHandler with hash verification and signing
-- ✅ Async WASM runtime (tokio::spawn_blocking)
-- ✅ PHP Crypto class (sodium Ed25519 verification)
-- ✅ WASI preview1 support for stdio
-- ✅ execute-job CLI command
-- ✅ 22 tests passing, live execution test successful
-- ✅ Performance: ~235ms total (233ms execution + <1ms signing)
+### 2025-11-26: Phase Boot Complete (M1-M7)
+- ✅ **M1 - Boot Stub**: Makefile, ESP partition, systemd-boot/GRUB configs, init script
+- ✅ **M2 - Discovery**: phase-discover binary, Kademlia DHT, mDNS, network scripts
+- ✅ **M3 - Verification**: phase-verify binary, Ed25519 signatures, manifest schema
+- ✅ **M4 - kexec**: kexec-boot.sh, overlayfs-setup.sh, mode-handler.sh
+- ✅ **M5 - Packaging**: build-usb-image.sh, build-qcow2.sh, release.sh
+- ✅ **M6 - Plasm Integration**: plasmd.service, plasm-init.sh, hello-job.sh
+- ✅ **M7 - Documentation**: ARCHITECTURE, COMPONENTS, QUICKSTARTS, THREAT-MODEL, TROUBLESHOOTING
+- ✅ **New Rust Binaries**: phase_discover, phase_verify, phase_fetch
+- ✅ **14 commits, 54 files, 14,395 lines added**
 
-### 2025-11-09: Milestone 2 Complete - Peer Discovery
-- ✅ rust-libp2p 0.54 with Kademlia DHT
-- ✅ Capability-based peer discovery
-- ✅ Job handshake protocol (JobOffer/JobResponse)
-- ✅ Noise + QUIC encrypted transport
-- ✅ NAT traversal awareness
-- ✅ Structured logging
-- ✅ 15 tests passing
-
-### 2025-11-09: Milestone 1 Complete - Local WASM Execution
-- ✅ Wasmtime 15.0 integration
-- ✅ JSON schemas with validation
-- ✅ hello.wasm example
-- ✅ PHP SDK with LocalTransport
-- ✅ 10/10 tests passing
+### 2025-11-09: Phase Open MVP Complete
+- ✅ Milestone 1-4 complete (Local WASM, Peer Discovery, Remote Execution, Packaging)
+- ✅ 22 tests passing, 0 warnings
+- ✅ Library + binary pattern refactor
 
 ---
 
 ## Next Actions (Priority Order)
 
-1. **Create Debian package**: cargo-deb configuration, test installation
-2. **Add systemd service**: Service file, enable/start/stop commands
-3. **Write install instructions**: README updates, prerequisites
-4. **Test end-to-end**: Full workflow from package install to job execution
-5. **Create remote_test.php**: Example demonstrating full capabilities
+1. **Test Phase Boot in QEMU**: Run `make test-qemu-x86` to validate boot flow
+2. **Test USB image creation**: Build and test on real hardware
+3. **Validate discovery**: Test phase-discover on local network
+4. **Test hello job**: Run hello-job.sh example post-boot
+5. **CI/CD setup**: Automate Phase Boot image builds
 
 ---
 
@@ -268,13 +264,22 @@ None
 - [x] PHP signature verification
 - [x] 22 tests passing, live execution test successful
 
-### Milestone 4 (Next) ⚙️
-- [ ] Debian package installs cleanly
-- [ ] systemd service runs as daemon
-- [ ] Installation instructions clear and complete
-- [ ] End-to-end demo works (local execution with signed receipts)
-- [ ] All documentation updated for MVP release
+### Milestone 4 (Complete) ✅
+- [x] Debian package installs cleanly
+- [x] systemd service runs as daemon
+- [x] Installation instructions clear and complete
+- [x] End-to-end demo works (local execution with signed receipts)
+- [x] All documentation updated for MVP release
+
+### Phase Boot (Complete) ✅
+- [x] M1: Boot stub, Makefile, ESP partition, init script
+- [x] M2: Network bring-up, phase-discover binary, DHT integration
+- [x] M3: phase-verify binary, Ed25519 verification, manifest schema
+- [x] M4: kexec orchestration, overlayfs setup, mode handlers
+- [x] M5: USB image builder, QCOW2 builder, release scripts
+- [x] M6: Plasm integration, systemd service, hello-job example
+- [x] M7: Architecture docs, quickstart guides, threat model
 
 ---
 
-**This document is updated weekly. Last review: 2025-11-09**
+**This document is updated weekly. Last review: 2025-11-26**
