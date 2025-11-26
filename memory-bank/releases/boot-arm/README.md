@@ -1,6 +1,6 @@
 # Phase Boot ARM64 - Development Environment
 
-**Status**: QEMU direct boot WORKING with networking
+**Status**: QEMU + vmnet-shared WORKING - VM can reach host services
 **Target**: Fast iteration development on Apple Silicon
 **Last Updated**: 2025-11-26
 
@@ -39,7 +39,7 @@ docker run --rm -v "$(pwd):/work" -w /work ubuntu:22.04 bash -c '
   cd build/initramfs-work && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9 > ../initramfs/initramfs-arm64.img'
 ```
 
-### Step 3: Boot (~2-3 seconds)
+### Step 3a: Boot with User Networking (isolated, no sudo)
 ```bash
 qemu-system-aarch64 \
   -M virt -cpu host -accel hvf -m 1024 \
@@ -50,20 +50,42 @@ qemu-system-aarch64 \
   -nographic
 ```
 
+### Step 3b: Boot with vmnet-shared (VM on host network, requires sudo)
+```bash
+sudo qemu-system-aarch64 \
+  -M virt -cpu host -accel hvf -m 512 \
+  -kernel build/kernel/vmlinuz-arm64 \
+  -initrd build/initramfs/initramfs-arm64.img \
+  -append "console=ttyAMA0 phase.mode=internet" \
+  -netdev vmnet-shared,id=net0 \
+  -device virtio-net-pci,netdev=net0 \
+  -nographic
+```
+
+This puts the VM on the same network as your Mac (192.168.2.x via bridge102).
+The VM can reach services running on your Mac.
+
 Press `Ctrl+A X` to exit QEMU.
 
 ## What Works
 
 ### QEMU Direct Boot with Networking
 - **Boot time**: ~2-3 seconds with HVF acceleration
-- **Networking**: DHCP via virtio-net (IP: 10.0.2.15)
+- **User networking**: DHCP via virtio-net (IP: 10.0.2.15) - isolated
+- **vmnet-shared**: VM gets real LAN IP (192.168.2.x) - can reach host
 - **Console**: Full serial console via ttyAMA0
 - **Init flow**: Complete Phase Boot init runs
   - Mounts filesystems
   - Loads kernel modules (af_packet, virtio stack)
-  - Configures network via DHCP
   - Attempts phase-discover (placeholder for M2)
   - Drops to interactive shell
+
+### POC: VM to Host Communication (Tested 2025-11-26)
+With vmnet-shared networking:
+1. VM boots and gets IP on 192.168.2.x subnet
+2. Mac has 192.168.2.1 on bridge102 interface
+3. VM can wget/curl services running on Mac
+4. **Proven**: VM successfully fetched from Python HTTP server on host
 
 ### Kernel Modules Loaded
 The init script automatically loads these modules in order:
@@ -96,9 +118,25 @@ dmesg | head -50     # Kernel messages
 
 ---
 
-## What Doesn't Work (Deferred)
+## Known Issues
 
-### Parallels EFI Boot
+### udhcpc DHCP Config ✅ FIXED
+**Status**: Fixed (2025-11-26)
+**Solution**: Added `/usr/share/udhcpc/default.script` to initramfs
+
+**Files created**:
+- `boot/initramfs/usr/share/udhcpc/default.script` - DHCP callback script
+- Updated `boot/initramfs/init` to use `-s /usr/share/udhcpc/default.script`
+
+**Result**: DHCP now auto-configures IP, gateway, and DNS:
+```
+udhcpc[eth0]: Configuring: 10.0.2.15/255.255.255.0
+udhcpc[eth0]: Adding gateway: 10.0.2.2
+udhcpc[eth0]: Setting DNS: 10.0.2.3
+Network: DHCP on eth0 (10.0.2.15)
+```
+
+### Parallels EFI Boot (Deferred)
 **Status**: Kernel boots but hangs after "Exiting boot services..."
 **Symptoms**:
 - GRUB loads and shows menu
@@ -158,12 +196,13 @@ For development, QEMU direct boot is superior.
 
 ## Next Steps
 
-1. **M2**: Build `phase-discover` binary for ARM64
-2. **M3**: Test discovery flow with actual network
-3. **Later**: Investigate Parallels console issue if needed for USB testing
+1. **Fix udhcpc**: Add default.script to initramfs for automatic DHCP configuration
+2. **Test with Plasm**: Run Plasm daemon on Mac, have VM discover and execute job
+3. **Build phase-discover ARM64**: Cross-compile discovery binary for initramfs
+4. **Later**: Investigate Parallels console issue if needed for USB testing
 
 ---
 
 **Owner**: Michael S.
 **Created**: 2025-11-26
-**Working**: QEMU with networking
+**Working**: QEMU with vmnet-shared networking, VM-to-host communication proven

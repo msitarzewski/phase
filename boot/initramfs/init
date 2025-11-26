@@ -183,9 +183,20 @@ setup_network() {
             echo "  Interface up, requesting DHCP..."
 
             if command -v udhcpc >/dev/null 2>&1; then
-                # Use longer timeout for DHCP
-                if udhcpc -i "$iface" -t 5 -T 3 -n 2>&1; then
-                    NETWORK_IP=$(ip addr show "$iface" | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+                # Use explicit script path and longer timeout for DHCP
+                UDHCPC_SCRIPT="/usr/share/udhcpc/default.script"
+                if [ -x "$UDHCPC_SCRIPT" ]; then
+                    UDHCPC_OPTS="-s $UDHCPC_SCRIPT"
+                else
+                    UDHCPC_OPTS=""
+                fi
+                if udhcpc -i "$iface" $UDHCPC_OPTS -t 5 -T 3 -n 2>&1; then
+                    # Read IP from status file (set by default.script) or from interface
+                    if [ -f /tmp/network.ip ]; then
+                        NETWORK_IP=$(cat /tmp/network.ip)
+                    else
+                        NETWORK_IP=$(ip addr show "$iface" | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+                    fi
                     NETWORK_STATUS="DHCP on $iface ($NETWORK_IP)"
                     break
                 else
