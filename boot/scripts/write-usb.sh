@@ -163,17 +163,19 @@ confirm_write() {
 #------------------------------------------------------------------------------
 
 write_image() {
-    info "Writing image to $DEVICE..."
-
-    local image_size
+    local image_size image_size_human
     image_size=$(stat -c%s "$IMAGE")
+    image_size_human=$(numfmt --to=iec-i --suffix=B "$image_size" 2>/dev/null || echo "$((image_size / 1048576)) MiB")
 
+    info "Writing image to $DEVICE..."
+    info "Image size: $image_size_human"
     echo ""
 
     # Use pv for progress if available, otherwise dd status
     if command -v pv &>/dev/null; then
-        pv -tpreb "$IMAGE" | dd of="$DEVICE" bs=4M conv=fsync 2>/dev/null
+        pv -s "$image_size" -tpreb "$IMAGE" | dd of="$DEVICE" bs=4M conv=fsync 2>/dev/null
     else
+        echo "  (install 'pv' for better progress: sudo apt install pv)"
         dd if="$IMAGE" of="$DEVICE" bs=4M status=progress conv=fsync
     fi
 
