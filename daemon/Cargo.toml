@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "plasmd"
 path = "src/main.rs"
 
+[[bin]]
+name = "phase-discover"
+path = "src/bin/phase_discover.rs"
+
 [dependencies]
 # WASM Runtime (using wasmtime for better compatibility)
 wasmtime = "27"

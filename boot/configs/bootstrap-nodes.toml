@@ -1,0 +1,38 @@
+# Phase Boot - Bootstrap Nodes Configuration
+#
+# These nodes are used for initial DHT discovery when booting.
+# The phase-discover binary connects to these nodes to join the
+# Phase network and query for boot manifests.
+#
+# Format:
+#   [[bootstrap]]
+#   peer_id = "12D3KooW..."
+#   address = "/ip4/<ip>/tcp/<port>/p2p/<peer_id>"
+#
+# Multiple addresses per peer are supported.
+
+# ============================================================
+# PLACEHOLDER BOOTSTRAP NODES
+# ============================================================
+# TODO: Replace with actual Phase network bootstrap nodes
+# when the network is deployed.
+
+# Example node (not active):
+# [[bootstrap]]
+# peer_id = "12D3KooWExample1..."
+# address = "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWExample1..."
+
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
+# For local testing, run a plasmd node and add it here:
+#
+# [[bootstrap]]
+# peer_id = "12D3KooWLocalTest..."
+# address = "/ip4/192.168.1.100/tcp/4001/p2p/12D3KooWLocalTest..."
+
+# ============================================================
+# COMMUNITY NODES
+# ============================================================
+# Community-operated bootstrap nodes can be added here.
+# Please verify the operator's identity before adding.
