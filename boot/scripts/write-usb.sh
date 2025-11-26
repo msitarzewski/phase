@@ -169,6 +169,7 @@ write_image() {
 
     info "Writing image to $DEVICE..."
     info "Image size: $image_size_human"
+    info "Note: Sync will flush buffers after write (can be slow on USB drives)"
     echo ""
 
     # Use pv for progress (required dependency), fallback to dd status
@@ -205,21 +206,38 @@ write_image() {
 verify_write() {
     info "Verifying write..."
 
-    local image_size
+    local image_size image_size_human
     image_size=$(stat -c%s "$IMAGE")
+    image_size_human=$(numfmt --to=iec-i --suffix=B "$image_size" 2>/dev/null || echo "$((image_size / 1048576)) MiB")
+
+    # Drop filesystem caches to ensure we read from disk, not memory
+    info "Dropping caches to ensure fresh read from device..."
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    # Re-read partition table
+    blockdev --rereadpt "$DEVICE" 2>/dev/null || true
 
     # Calculate checksum of image
+    info "Hashing source image ($image_size_human)..."
     local image_hash
-    image_hash=$(head -c "$image_size" "$IMAGE" | sha256sum | cut -d' ' -f1)
+    image_hash=$(pv -s "$image_size" -tpreb "$IMAGE" 2>/dev/null | head -c "$image_size" | sha256sum | cut -d' ' -f1)
 
-    # Calculate checksum of written data
+    # Calculate checksum of written data (read directly, bypass cache)
+    info "Hashing device ($image_size_human)..."
     local device_hash
-    device_hash=$(head -c "$image_size" "$DEVICE" | sha256sum | cut -d' ' -f1)
+    device_hash=$(dd if="$DEVICE" bs=4M count=$((image_size / 4194304 + 1)) iflag=direct 2>/dev/null | head -c "$image_size" | sha256sum | cut -d' ' -f1)
+
+    echo ""
+    info "Image hash:  $image_hash"
+    info "Device hash: $device_hash"
 
     if [[ "$image_hash" == "$device_hash" ]]; then
         ok "Verification passed!"
     else
-        fail "Verification FAILED! Checksums do not match."
+        warn "Checksums do not match!"
+        warn "This may indicate a write error or bad USB drive."
+        warn "Try writing again, or use a different USB drive."
+        fail "Verification FAILED!"
     fi
 }
 
