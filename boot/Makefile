@@ -267,25 +267,41 @@ initramfs: dirs
 	# Ensure init script is executable
 	@chmod +x $(INITRAMFS_BUILD)/work/init
 
-	# Copy busybox (if available) for basic utilities
-	@if [ -f /bin/busybox ]; then \
-		echo "  Installing busybox..."; \
-		mkdir -p $(INITRAMFS_BUILD)/work/bin; \
-		cp /bin/busybox $(INITRAMFS_BUILD)/work/bin/busybox; \
-		(cd $(INITRAMFS_BUILD)/work/bin && \
-			for cmd in sh ls cat mount umount ip ifconfig ps grep sleep; do \
-				ln -sf busybox $$cmd 2>/dev/null || true; \
-			done); \
-	fi
+	# Find and copy busybox (REQUIRED - check multiple locations)
+	@echo "  Installing busybox..."
+	@mkdir -p $(INITRAMFS_BUILD)/work/bin
+	@BUSYBOX=""; \
+	for path in /bin/busybox /usr/bin/busybox /bin/busybox-static /usr/bin/busybox-static; do \
+		if [ -f "$$path" ]; then BUSYBOX="$$path"; break; fi; \
+	done; \
+	if [ -z "$$BUSYBOX" ]; then \
+		echo "$(COLOR_RED)  ERROR: busybox not found!$(COLOR_RESET)"; \
+		echo "  Install with: sudo apt install busybox-static"; \
+		exit 1; \
+	fi; \
+	echo "  Found busybox at: $$BUSYBOX"; \
+	cp "$$BUSYBOX" $(INITRAMFS_BUILD)/work/bin/busybox; \
+	chmod +x $(INITRAMFS_BUILD)/work/bin/busybox; \
+	cd $(INITRAMFS_BUILD)/work/bin && \
+		for cmd in sh ash ls cat cp mv rm mkdir mount umount ip ifconfig \
+			ps grep sed awk sleep echo printf test expr head tail \
+			ln chmod chown mknod switch_root udhcpc dmesg; do \
+			ln -sf busybox $$cmd 2>/dev/null || true; \
+		done
 
-	# Install essential utilities if available
-	@echo "  Installing essential utilities..."
-	@for util in /sbin/ip /bin/mount /bin/umount /sbin/udhcpc; do \
-		if [ -f $$util ]; then \
-			mkdir -p $(INITRAMFS_BUILD)/work/$$(dirname $$util); \
-			cp $$util $(INITRAMFS_BUILD)/work/$$util 2>/dev/null || true; \
-		fi \
-	done
+	# Build and copy Phase binaries (if source available)
+	@echo "  Building Phase binaries..."
+	@if [ -f "../daemon/Cargo.toml" ]; then \
+		echo "  Compiling phase-discover, phase-verify, phase-fetch..."; \
+		(cd ../daemon && cargo build --release --bin phase-discover --bin phase-verify --bin phase-fetch 2>/dev/null) && \
+		cp ../daemon/target/release/phase-discover $(INITRAMFS_BUILD)/work/bin/ 2>/dev/null && \
+		cp ../daemon/target/release/phase-verify $(INITRAMFS_BUILD)/work/bin/ 2>/dev/null && \
+		cp ../daemon/target/release/phase-fetch $(INITRAMFS_BUILD)/work/bin/ 2>/dev/null && \
+		echo "  $(COLOR_GREEN)✓ Phase binaries installed$(COLOR_RESET)" || \
+		echo "  $(COLOR_YELLOW)Warning: Phase binaries build failed (continuing without them)$(COLOR_RESET)"; \
+	else \
+		echo "  $(COLOR_YELLOW)Warning: daemon/Cargo.toml not found, skipping Phase binaries$(COLOR_RESET)"; \
+	fi
 
 	# Create device nodes
 	@echo "  Creating device nodes..."
@@ -294,7 +310,15 @@ initramfs: dirs
 		(mknod -m 600 console c 5 1 2>/dev/null || true) && \
 		(mknod -m 666 null c 1 3 2>/dev/null || true) && \
 		(mknod -m 666 zero c 1 5 2>/dev/null || true) && \
+		(mknod -m 666 tty c 5 0 2>/dev/null || true) && \
 		true
+
+	# Create other required directories
+	@mkdir -p $(INITRAMFS_BUILD)/work/proc
+	@mkdir -p $(INITRAMFS_BUILD)/work/sys
+	@mkdir -p $(INITRAMFS_BUILD)/work/tmp
+	@mkdir -p $(INITRAMFS_BUILD)/work/mnt
+	@mkdir -p $(INITRAMFS_BUILD)/work/newroot
 
 	# Build initramfs archive
 	@echo "  Creating initramfs archive..."
@@ -307,6 +331,8 @@ initramfs: dirs
 
 	@echo "$(COLOR_GREEN)✓ Initramfs built: $(INITRAMFS_BUILD)/initramfs-$(ARCH).img$(COLOR_RESET)"
 	@ls -lh $(INITRAMFS_BUILD)/initramfs-$(ARCH).img
+	@echo "  Contents:"
+	@cd $(INITRAMFS_BUILD)/work/bin && ls -la | head -20
 
 #------------------------------------------------------------------------------
 # Rootfs Build (Seed SquashFS)
