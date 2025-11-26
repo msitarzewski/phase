@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "phase-discover"
 path = "src/bin/phase_discover.rs"
 
+[[bin]]
+name = "phase-verify"
+path = "src/bin/phase_verify.rs"
+
 [dependencies]
 # WASM Runtime (using wasmtime for better compatibility)
 wasmtime = "27"

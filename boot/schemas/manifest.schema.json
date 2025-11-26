@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phase.dev/schemas/boot/manifest.json",
+  "title": "Phase Boot Manifest",
+  "description": "Signed manifest for Phase Boot artifacts (kernel, initramfs, rootfs)",
+  "type": "object",
+  "required": ["version", "manifest_version", "channel", "arch", "artifacts", "signatures", "signed"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "examples": ["0.1"]
+    },
+    "manifest_version": {
+      "type": "integer",
+      "description": "Monotonic version counter for rollback protection",
+      "minimum": 1
+    },
+    "channel": {
+      "type": "string",
+      "description": "Release channel",
+      "enum": ["stable", "testing", "nightly"]
+    },
+    "arch": {
+      "type": "string",
+      "description": "Target architecture",
+      "enum": ["x86_64", "arm64", "aarch64"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Manifest creation timestamp (ISO 8601)"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Manifest expiration timestamp (ISO 8601)"
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "Boot artifacts with hashes and URLs",
+      "required": ["kernel", "initramfs"],
+      "properties": {
+        "kernel": {
+          "$ref": "#/$defs/artifact"
+        },
+        "initramfs": {
+          "$ref": "#/$defs/artifact"
+        },
+        "rootfs": {
+          "$ref": "#/$defs/artifact"
+        },
+        "dtbs": {
+          "type": "object",
+          "description": "Device Tree Blobs (ARM64)",
+          "additionalProperties": {
+            "$ref": "#/$defs/artifact"
+          }
+        }
+      }
+    },
+    "cmdline": {
+      "type": "string",
+      "description": "Additional kernel command line parameters"
+    },
+    "signatures": {
+      "type": "array",
+      "description": "Ed25519 signatures from targets key(s)",
+      "items": {
+        "$ref": "#/$defs/signature"
+      },
+      "minItems": 1
+    },
+    "signed": {
+      "type": "object",
+      "description": "Canonical representation of signed data",
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "string",
+          "description": "Base64-encoded canonical JSON of manifest (minus signatures)"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["hash", "size", "urls"],
+      "properties": {
+        "hash": {
+          "type": "string",
+          "description": "SHA256 hash (hex-encoded)",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "description": "File size in bytes",
+          "minimum": 0
+        },
+        "urls": {
+          "type": "array",
+          "description": "Download URLs (tried in order)",
+          "items": {
+            "type": "string",
+            "format": "uri"
+          },
+          "minItems": 1
+        },
+        "ipfs": {
+          "type": "string",
+          "description": "IPFS CID (optional, used as fallback)",
+          "pattern": "^(Qm|bafy)[a-zA-Z0-9]+"
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "required": ["keyid", "sig"],
+      "properties": {
+        "keyid": {
+          "type": "string",
+          "description": "Key identifier (matches key in trust store)"
+        },
+        "sig": {
+          "type": "string",
+          "description": "Base64-encoded Ed25519 signature"
+        }
+      }
+    }
+  }
+}
