@@ -1,0 +1,147 @@
+release: phase-netboot
+version: "0.1.0"
+status: planned
+owner: Michael S.
+
+description: |
+  Extend plasmd to serve boot artifacts (kernel, initramfs, rootfs) alongside
+  WASM job execution. Enable DHT-based internet booting where any plasmd node
+  can be a provider. Self-hosting loop: boot from network, become a provider.
+
+platforms:
+  - macos-arm64
+  - linux-x86_64
+  - linux-arm64
+
+architectures:
+  - arm64
+  - x86_64
+
+channels:
+  - stable
+  - testing
+
+dependencies:
+  - phase-boot  # Consumer side (phase-discover, phase-fetch, phase-verify)
+  - plasmd      # Core daemon with libp2p networking
+
+milestones:
+  - id: M1
+    name: HTTP Artifact Server
+    description: Add embedded HTTP server to plasmd for serving boot artifacts
+    status: planned
+    tasks_dir: tasks/M1
+    deliverables:
+      - Hyper/Axum HTTP server in plasmd
+      - Artifact serving endpoints (/kernel, /initramfs, /rootfs)
+      - Range request support for large files
+      - Health check endpoint
+
+  - id: M2
+    name: Manifest Generation & Signing
+    description: Generate and sign boot manifests using Ed25519
+    status: planned
+    tasks_dir: tasks/M2
+    deliverables:
+      - Manifest generator from artifact directory
+      - Ed25519 signing using existing plasmd keys
+      - Schema validation
+      - Version and channel tagging
+
+  - id: M3
+    name: DHT/mDNS Advertisement
+    description: Advertise boot artifacts in DHT and via mDNS for LAN
+    status: planned
+    tasks_dir: tasks/M3
+    deliverables:
+      - DHT record publishing (/phase/{channel}/{arch}/manifest)
+      - mDNS service advertisement (_phase-image._tcp)
+      - Integration with existing discovery module
+      - Multi-channel advertisement
+
+  - id: M4
+    name: CLI & Configuration
+    description: Provider management commands and configuration files
+    status: planned
+    tasks_dir: tasks/M4
+    deliverables:
+      - "plasmd serve" command
+      - Provider configuration file (provider.toml)
+      - Status and monitoring commands
+      - Multi-channel configuration
+
+  - id: M5
+    name: Cross-Platform & Integration
+    description: Testing on macOS and Linux, end-to-end with Phase Boot
+    status: planned
+    tasks_dir: tasks/M5
+    deliverables:
+      - macOS ARM64 provider testing
+      - Linux x86_64 provider testing
+      - Phase Boot VM integration tests
+      - Multi-provider scenarios
+      - Self-hosting loop validation
+
+  - id: M6
+    name: Documentation
+    description: Setup guides, architecture docs, and troubleshooting
+    status: planned
+    tasks_dir: tasks/M6
+    deliverables:
+      - Provider setup guide (macOS, Linux)
+      - Network topology documentation
+      - Troubleshooting guide
+      - Architecture diagrams
+      - Security considerations
+
+acceptance_criteria:
+  - macOS ARM64 plasmd serves boot artifacts, discoverable via DHT
+  - Linux x86_64 plasmd serves boot artifacts, discoverable via DHT
+  - Phase Boot VM discovers provider, fetches artifacts, kexecs successfully
+  - Booted system can immediately become a provider (self-hosting)
+  - Multiple providers on network, clients select best match
+  - All manifests Ed25519 signed, verification enforced
+  - Complete setup guides for provider operation
+
+dht_keys:
+  boot_manifest: "/phase/{channel}/{arch}/manifest"
+  wasm_capability: "/phase/capability/{arch}/{runtime}"
+
+http_endpoints:
+  - path: /
+    method: GET
+    description: Provider status and info
+  - path: /manifest.json
+    method: GET
+    description: Signed boot manifest
+  - path: /kernel
+    method: GET
+    description: Kernel image (vmlinuz)
+  - path: /initramfs
+    method: GET
+    description: Initramfs image
+  - path: /rootfs
+    method: GET
+    description: Root filesystem (squashfs)
+  - path: /health
+    method: GET
+    description: Health check endpoint
+
+cli_commands:
+  - name: plasmd serve
+    description: Start provider mode
+    flags:
+      - --artifacts <PATH>
+      - --channel <CHANNEL>
+      - --arch <ARCH>
+      - --port <PORT>
+  - name: plasmd provider status
+    description: Check provider status
+  - name: plasmd provider list
+    description: List advertised artifacts
+  - name: plasmd manifest generate
+    description: Generate manifest without serving
+    flags:
+      - --artifacts <PATH>
+      - --output <PATH>
+      - --sign

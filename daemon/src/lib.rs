@@ -8,6 +8,7 @@
 //! - `config`: Daemon configuration and execution limits
 //! - `wasm`: WASM runtime, manifests, and receipts
 //! - `network`: Peer discovery, protocols, and job execution
+//! - `provider`: Boot manifest generation and validation
 //!
 //! ## Example
 //!
@@ -26,6 +27,7 @@
 pub mod config;
 pub mod wasm;
 pub mod network;
+pub mod provider;
 
 // Re-export commonly used types
 pub use config::{Config, ExecutionLimits};
@@ -41,4 +43,9 @@ pub use network::{
     PeerCapabilities,
     ExecutionHandler,
     protocol::{JobOffer, JobResponse, JobRequirements, RejectionReason, JobRequest, JobResult},
+};
+pub use provider::{
+    manifest::{BootManifest, ArtifactInfo, Signature, ProviderInfo, ManifestBuilder},
+    ProviderConfig,
+    ProviderServer,
 };

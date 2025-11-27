@@ -52,6 +52,7 @@ base64 = "0.22"
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # CLI
@@ -60,6 +61,7 @@ clap = { version = "4.0", features = ["derive"] }
 # Utilities
 uuid = { version = "1.0", features = ["v4"] }
 dirs = "5.0"  # Platform-independent paths
+chrono = { version = "0.4", features = ["serde"] }
 
 # Networking (libp2p) - Updated to latest
 libp2p = { version = "0.54", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify", "mdns"] }
@@ -67,8 +69,13 @@ futures = "0.3"
 num_cpus = "1.0"
 rand = "0.8"
 
-# HTTP client (for phase-fetch)
-reqwest = { version = "0.12", features = ["blocking"] }
+# HTTP client (for phase-fetch and provider CLI)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# HTTP server (for provider/boot server)
+axum = { version = "0.7", features = ["tokio", "http1", "http2"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 
 [dev-dependencies]
 tempfile = "3.0"

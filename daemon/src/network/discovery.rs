@@ -210,6 +210,28 @@ impl Discovery {
         Ok(())
     }
 
+    /// Publish boot manifest record to DHT
+    pub fn publish_manifest_record(&mut self, record: crate::provider::ManifestRecord) -> Result<()> {
+        use libp2p::kad::{Record, Quorum};
+
+        let key = record.key();
+        let value = record.to_bytes()?;
+
+        tracing::info!(
+            channel = %record.channel,
+            arch = %record.arch,
+            "Publishing manifest record to DHT"
+        );
+
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(Record::new(key, value), Quorum::One)
+            .map_err(|e| anyhow::anyhow!("Failed to publish record: {:?}", e))?;
+
+        Ok(())
+    }
+
     /// Handle incoming job offer
     pub fn handle_job_offer(&self, offer: JobOffer) -> JobResponse {
         use std::time::{SystemTime, UNIX_EPOCH};

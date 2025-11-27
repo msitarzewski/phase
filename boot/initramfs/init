@@ -14,12 +14,13 @@
 # Configuration & Defaults
 #------------------------------------------------------------------------------
 
-PHASE_VERSION="0.1.0-M2"
+PHASE_VERSION="0.1.0-M3"
 SCRIPTS_DIR="/scripts"
 PHASE_MODE="internet"
-PHASE_CHANNEL=""
+PHASE_CHANNEL="stable"
 PHASE_CACHE="true"
 PHASE_NOWRITE="false"
+PHASE_PROVIDER=""  # Direct provider URL (e.g., http://192.168.2.1:8080)
 
 #------------------------------------------------------------------------------
 # Mount Essential Filesystems
@@ -79,6 +80,9 @@ parse_cmdline() {
                 phase.nowrite=*)
                     PHASE_NOWRITE="${param#phase.nowrite=}"
                     ;;
+                phase.provider=*)
+                    PHASE_PROVIDER="${param#phase.provider=}"
+                    ;;
             esac
         done
     fi
@@ -95,6 +99,7 @@ parse_cmdline() {
 
     echo "Mode: $PHASE_MODE"
     [ -n "$PHASE_CHANNEL" ] && echo "Channel: $PHASE_CHANNEL"
+    [ -n "$PHASE_PROVIDER" ] && echo "Provider: $PHASE_PROVIDER"
 }
 
 #------------------------------------------------------------------------------
@@ -259,6 +264,176 @@ run_discovery() {
 }
 
 #------------------------------------------------------------------------------
+# Fetch from Provider and kexec
+#------------------------------------------------------------------------------
+
+fetch_and_boot() {
+    PROVIDER_URL="$1"
+    echo ""
+    echo "=========================================="
+    echo "  PHASE BOOT - Fetching from Provider"
+    echo "=========================================="
+    echo ""
+    echo "Provider: $PROVIDER_URL"
+    echo ""
+
+    # Create download directory
+    mkdir -p /tmp/phase-boot
+
+    # Step 1: Fetch manifest
+    echo "[1/4] Fetching manifest..."
+    MANIFEST_URL="${PROVIDER_URL}/manifest.json"
+    if ! wget -q -O /tmp/phase-boot/manifest.json "$MANIFEST_URL" 2>/dev/null; then
+        echo "  FAILED: Could not fetch manifest from $MANIFEST_URL"
+        return 1
+    fi
+    echo "  OK: Manifest downloaded"
+
+    # Parse manifest for artifact URLs (simple parsing with grep/sed)
+    # Look for kernel and initramfs download URLs
+    KERNEL_PATH=$(grep -o '"download_url":"[^"]*kernel[^"]*"' /tmp/phase-boot/manifest.json | head -1 | sed 's/.*:"\([^"]*\)".*/\1/')
+    INITRAMFS_PATH=$(grep -o '"download_url":"[^"]*initramfs[^"]*"' /tmp/phase-boot/manifest.json | head -1 | sed 's/.*:"\([^"]*\)".*/\1/')
+
+    if [ -z "$KERNEL_PATH" ] || [ -z "$INITRAMFS_PATH" ]; then
+        echo "  FAILED: Could not parse artifact URLs from manifest"
+        cat /tmp/phase-boot/manifest.json
+        return 1
+    fi
+
+    # Build full URLs
+    KERNEL_URL="${PROVIDER_URL}${KERNEL_PATH}"
+    INITRAMFS_URL="${PROVIDER_URL}${INITRAMFS_PATH}"
+
+    echo "  Kernel URL: $KERNEL_URL"
+    echo "  Initramfs URL: $INITRAMFS_URL"
+    echo ""
+
+    # Step 2: Download kernel
+    echo "[2/4] Downloading kernel..."
+    if ! wget -O /tmp/phase-boot/kernel "$KERNEL_URL" 2>&1; then
+        echo "  FAILED: Could not download kernel"
+        return 1
+    fi
+    KERNEL_SIZE=$(ls -lh /tmp/phase-boot/kernel | awk '{print $5}')
+    echo "  OK: Kernel downloaded ($KERNEL_SIZE)"
+    echo ""
+
+    # Step 3: Download initramfs
+    echo "[3/4] Downloading initramfs..."
+    if ! wget -O /tmp/phase-boot/initramfs "$INITRAMFS_URL" 2>&1; then
+        echo "  FAILED: Could not download initramfs"
+        return 1
+    fi
+    INITRAMFS_SIZE=$(ls -lh /tmp/phase-boot/initramfs | awk '{print $5}')
+    echo "  OK: Initramfs downloaded ($INITRAMFS_SIZE)"
+    echo ""
+
+    # Step 4: Verify downloads
+    echo "[4/4] Verifying downloads..."
+    if [ ! -s /tmp/phase-boot/kernel ] || [ ! -s /tmp/phase-boot/initramfs ]; then
+        echo "  FAILED: Downloaded files are empty"
+        return 1
+    fi
+    echo "  OK: Files verified"
+    echo ""
+
+    # Show what we downloaded
+    echo "=========================================="
+    echo "  Download Complete!"
+    echo "=========================================="
+    ls -lh /tmp/phase-boot/
+    echo ""
+
+    # Check for kexec
+    if command -v kexec >/dev/null 2>&1; then
+        echo "kexec available - preparing to boot into downloaded kernel..."
+        echo ""
+
+        # ARM64 requires the Device Tree Blob (DTB)
+        # Copy FDT to a regular file and zero out kaslr-seed for kexec
+        DTB_ARGS=""
+        if [ -f /sys/firmware/fdt ]; then
+            echo "Copying DTB from /sys/firmware/fdt..."
+            cp /sys/firmware/fdt /tmp/phase-boot/device.dtb
+            chmod 644 /tmp/phase-boot/device.dtb
+
+            # Zero out kaslr-seed (kexec refuses non-zero kaslr-seed)
+            if command -v fdtput >/dev/null 2>&1; then
+                echo "Zeroing kaslr-seed in DTB (required for kexec)..."
+                fdtput -t x /tmp/phase-boot/device.dtb /chosen kaslr-seed 0 0 2>/dev/null || \
+                    echo "  Warning: Could not zero kaslr-seed"
+            else
+                echo "  Warning: fdtput not available, kaslr-seed not zeroed"
+            fi
+
+            DTB_ARGS="--dtb=/tmp/phase-boot/device.dtb"
+            echo "  DTB size: $(ls -lh /tmp/phase-boot/device.dtb | awk '{print $5}')"
+        fi
+
+        # Try kexec -s (file-based syscall, preferred on modern ARM64)
+        echo ""
+        echo "Attempting kexec -s (file-based)..."
+        if kexec -s -l /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
+            echo "Kernel loaded successfully with kexec -s!"
+            echo ""
+            echo "=========================================="
+            echo "  EXECUTING KEXEC - Booting new kernel!"
+            echo "=========================================="
+            sleep 2
+            kexec -e
+            # Should not reach here
+            echo "ERROR: kexec -e failed!"
+        else
+            echo "kexec -s failed, trying kexec -l (legacy)..."
+            if kexec -l /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
+                echo "Kernel loaded with kexec -l!"
+                echo ""
+                echo "=========================================="
+                echo "  EXECUTING KEXEC - Booting new kernel!"
+                echo "=========================================="
+                sleep 2
+                kexec -e
+                echo "ERROR: kexec -e failed!"
+            else
+                echo ""
+                echo "=========================================="
+                echo "  KEXEC FAILED - Manual debugging"
+                echo "=========================================="
+                echo ""
+                echo "Both kexec methods failed. Debug info:"
+                echo "  Kernel: $(ls -lh /tmp/phase-boot/kernel)"
+                echo "  Initramfs: $(ls -lh /tmp/phase-boot/initramfs)"
+                [ -f /tmp/phase-boot/device.dtb ] && echo "  DTB: $(ls -lh /tmp/phase-boot/device.dtb)"
+                echo ""
+                echo "Try manually:"
+                echo "  kexec -d -l /tmp/phase-boot/kernel \\"
+                echo "    --initrd=/tmp/phase-boot/initramfs \\"
+                [ -n "$DTB_ARGS" ] && echo "    $DTB_ARGS \\"
+                echo "    --append=\"console=ttyAMA0\""
+                echo ""
+                return 1
+            fi
+        fi
+    else
+        echo "=========================================="
+        echo "  SUCCESS - Ready for kexec"
+        echo "=========================================="
+        echo ""
+        echo "kexec not available in this initramfs."
+        echo "Downloaded artifacts are ready at /tmp/phase-boot/"
+        echo ""
+        echo "To complete the boot (if kexec were available):"
+        echo "  kexec -l /tmp/phase-boot/kernel \\"
+        echo "    --initrd=/tmp/phase-boot/initramfs \\"
+        echo "    --append=\"console=ttyAMA0 phase.mode=internet\""
+        echo "  kexec -e"
+        echo ""
+        echo "For now, dropping to shell for inspection..."
+        return 0
+    fi
+}
+
+#------------------------------------------------------------------------------
 # Print Boot Banner
 #------------------------------------------------------------------------------
 
@@ -327,7 +502,24 @@ main() {
     setup_network
     echo ""
 
-    # Attempt Phase discovery (M2+)
+    # Check for direct provider URL first (phase.provider=URL)
+    if [ -n "$PHASE_PROVIDER" ]; then
+        echo "Direct provider specified: $PHASE_PROVIDER"
+        echo ""
+        if fetch_and_boot "$PHASE_PROVIDER"; then
+            echo ""
+            echo "Fetch completed successfully."
+        else
+            echo ""
+            echo "Fetch failed - dropping to shell for debugging."
+        fi
+        print_banner
+        echo "Starting interactive shell..."
+        echo ""
+        exec /bin/sh
+    fi
+
+    # Attempt Phase discovery (M2+) if no direct provider
     DISCOVERY_SUCCESS=false
     if [ "$NETWORK_STATUS" != "DOWN" ] && [ "$NETWORK_STATUS" != "FAILED" ]; then
         echo "Network available, attempting discovery..."
@@ -335,7 +527,18 @@ main() {
             DISCOVERY_SUCCESS=true
             echo ""
             echo "Discovery successful!"
-            # M3+ will continue to fetch and verify manifest here
+            # Fetch from discovered provider
+            if [ -n "$MANIFEST_URL" ]; then
+                # Extract base URL from manifest URL
+                DISCOVERED_PROVIDER=$(echo "$MANIFEST_URL" | sed 's|/manifest.json$||')
+                if fetch_and_boot "$DISCOVERED_PROVIDER"; then
+                    echo ""
+                    echo "Fetch completed successfully."
+                else
+                    echo ""
+                    echo "Fetch failed - dropping to shell."
+                fi
+            fi
         else
             echo ""
             echo "Discovery not available or failed."
@@ -346,13 +549,6 @@ main() {
     echo ""
 
     print_banner
-
-    # If discovery succeeded and we have kexec, M4+ will proceed to kexec
-    # For now (M2), drop to shell for manual testing
-    if [ "$DISCOVERY_SUCCESS" = true ] && [ -n "$MANIFEST_URL" ]; then
-        echo "Manifest URL: $MANIFEST_URL"
-        echo "M3/M4 features not yet implemented - dropping to shell"
-    fi
 
     echo "Starting interactive shell..."
     echo ""

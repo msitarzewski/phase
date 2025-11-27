@@ -1,14 +1,19 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2025-11-26
-**Sprint**: Phase Boot Implementation (Nov 2025)
-**Status**: Phase Open MVP Complete, Phase Boot M1-M7 Implemented
+**Last Updated**: 2025-11-27
+**Sprint**: Netboot Provider Implementation (Nov 2025)
+**Status**: Phase Open MVP Complete, Phase Boot Complete, Netboot Provider Complete
 
 ---
 
 ## Current Focus
 
-Phase Boot - bootable USB/VM image for Phase network discovery and WASM execution. All 7 milestones implemented.
+**COMPLETED**: Netboot Provider - HTTP-based boot artifact server with DHT/mDNS advertisement.
+
+The self-hosting loop is now possible:
+```
+Boot from DHT → Run plasmd serve → Advertise to DHT → Serve others
+```
 
 ### Milestone 1: Local WASM Execution ✅ COMPLETE
 
@@ -82,6 +87,48 @@ See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_rem
 | Local | LAN-only, mDNS discovery, uses cache |
 | Private | No writes, optional Tor, ephemeral identity |
 
+### Netboot Provider: All Milestones ✅ COMPLETE
+
+**Completed**: 2025-11-27
+
+**Achievements**:
+1. ✅ **M1 - HTTP Server**: axum-based server with artifact endpoints, range requests, health/status
+2. ✅ **M2 - Manifest Generation**: BootManifest schema, SHA256 hashing, Ed25519 signing
+3. ✅ **M3 - DHT/mDNS**: ManifestRecord for DHT publishing, mDNS service config
+4. ✅ **M4 - CLI**: `plasmd serve`, `provider status`, `provider list` commands
+5. ✅ **M5 - Testing**: Integration tests, arch aliasing (arm64↔aarch64), bug fixes
+6. ✅ **M6 - Documentation**: Quickstart, architecture, API reference, troubleshooting, security
+
+**Provider Module** (`daemon/src/provider/`):
+| File | Lines | Purpose |
+|------|-------|---------|
+| server.rs | 504 | HTTP server with axum |
+| manifest.rs | 549 | Boot manifest schema |
+| artifacts.rs | 286 | Artifact storage, arch aliasing |
+| signing.rs | 243 | Ed25519 signing |
+| generator.rs | 221 | Manifest generation |
+| dht.rs | 142 | DHT record types |
+| mdns.rs | 222 | mDNS service config |
+| metrics.rs | 113 | Request metrics |
+| config.rs | 176 | Provider configuration |
+
+**New CLI Commands**:
+```bash
+plasmd serve [OPTIONS]          # Start boot artifact provider
+plasmd provider status          # Query provider status
+plasmd provider list            # List available artifacts
+```
+
+**HTTP Endpoints**:
+| Endpoint | Description |
+|----------|-------------|
+| GET / | Provider info (name, version, uptime) |
+| GET /health | Health check (200/503) |
+| GET /status | Detailed status with metrics |
+| GET /manifest.json | Boot manifest for default channel/arch |
+| GET /:channel/:arch/manifest.json | Channel-specific manifest |
+| GET /:channel/:arch/:artifact | Download artifact (Range supported) |
+
 **Current Blocker**: None
 
 ---
@@ -116,13 +163,20 @@ See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_rem
 - Milestone 4: Packaging & Demo
 
 ### Phase Boot ✅ IMPLEMENTED (Nov 2025)
-**Goal**: Bootable USB/VM for Phase network
+**Goal**: Bootable USB/VM for Phase network (consumer side)
 - M1-M7: All milestones implemented
 - 54 files, 14,395 lines of code
 - x86_64 and ARM64 support
 - Three boot modes: Internet, Local, Private
 
-### Post-Boot Enhancements (Future)
+### Netboot Provider ✅ COMPLETE (Nov 2025)
+**Goal**: HTTP boot artifact server with DHT/mDNS (provider side)
+- M1-M6: All milestones implemented
+- 2,510 lines Rust, 3,000 lines documentation
+- HTTP server with axum, manifest signing, DHT advertising
+- Self-hosting loop: boot → serve → others boot from you
+
+### Future Enhancements
 **Goal**: Production-ready improvements
 
 **Potential Work**:
@@ -130,6 +184,8 @@ See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_rem
 - Production key management
 - Hardware testing on various platforms
 - Performance optimization
+- Full mDNS service advertisement (mdns-sd crate)
+- Multi-provider load balancing
 - Zero-knowledge proofs for private execution
 - Hardware security module (TPM/SGX) integration
 
@@ -184,6 +240,38 @@ None
 
 ## Recent Achievements
 
+### 2025-11-27: KEXEC WORKING - Fedora Kernel Success
+- ✅ **Fedora kernel boots**: 6.11.6-200.fc40.aarch64 (18MB) works in QEMU ARM64
+- ✅ **Virtio modules load**: failover → net_failover → virtio_net (212KB total)
+- ✅ **Network works**: DHCP via vmnet-shared (192.168.2.x)
+- ✅ **kexec enabled**: `kexec_load_disabled=0` in Fedora kernel
+- ✅ **kexec WORKS**: Successfully rebooted via kexec, fresh boot confirmed via dmesg
+- ✅ **Self-hosting loop PROVEN**: Boot → Download kernel → kexec → Fresh boot
+- ✅ **Memory requirement**: 1GB RAM needed for kexec load (512MB causes OOM)
+- ✅ **Fedora initramfs**: boot/build/fedora-initramfs.img (1.8MB with modules)
+- See: [271127_fedora_kexec_success.md](tasks/2025-11/271127_fedora_kexec_success.md)
+
+### 2025-11-27: Phase Boot Auto-Fetch Pipeline Complete
+- ✅ **phase.provider=URL**: Direct provider specification via kernel cmdline
+- ✅ **Auto-fetch**: VM automatically downloads manifest, kernel (11.4MB), initramfs (1.8MB)
+- ✅ **DTB handling**: Extracts /sys/firmware/fdt, zeros kaslr-seed for kexec
+- ✅ **kexec prep**: All segments loaded correctly
+- ⚠️ **kexec blocked**: Alpine kernel has `kexec_load_disabled=1` (kernel policy, not Phase Boot issue)
+- ✅ **New tools in initramfs**: kexec (199KB), fdtput (67KB), libfdt, musl libc
+- ✅ **Initramfs size**: 1.8MB (was 1.1MB)
+- ✅ **End-to-end tested**: VM → DHCP → Provider → Download → Ready for kexec
+- See: [271127_phase_boot_auto_fetch.md](tasks/2025-11/271127_phase_boot_auto_fetch.md)
+
+### 2025-11-27: Netboot Provider Complete (M1-M6)
+- ✅ **M1 - HTTP Server**: axum-based server, artifact endpoints, range requests, health/status
+- ✅ **M2 - Manifest Generation**: BootManifest schema, SHA256 hashing, Ed25519 signing
+- ✅ **M3 - DHT/mDNS**: ManifestRecord for DHT, mDNS service config, discovery integration
+- ✅ **M4 - CLI**: `plasmd serve`, `provider status`, `provider list` commands
+- ✅ **M5 - Testing**: Integration tests, arch aliasing (arm64↔aarch64), CLI bug fixes
+- ✅ **M6 - Documentation**: Quickstart, architecture, API reference, troubleshooting, security
+- ✅ **Stats**: 2,510 lines Rust, 3,000 lines docs, 80 tests passing
+- ✅ **Self-hosting loop now possible**: Boot → Serve → Others boot from you
+
 ### 2025-11-26: ARM64 Development Environment + VM-to-Host WASM Fetch
 - ✅ **QEMU ARM64 with HVF**: Boot in ~2-3 seconds on Apple Silicon
 - ✅ **vmnet-shared networking**: VM gets real LAN IP (192.168.2.x)
@@ -215,24 +303,33 @@ None
 
 1. ~~**Fix udhcpc DHCP**~~: ✅ Done - Added default.script to initramfs
 2. ~~**Test WASM fetch**~~: ✅ Done - VM fetched 84KB hello.wasm from Mac
-3. **Build phase-discover ARM64**: Cross-compile for initramfs
-4. **Integrate Plasmd**: Add WASM runtime to initramfs for job execution
-5. **Test USB image creation**: Build and test on real hardware
-6. **CI/CD setup**: Automate Phase Boot image builds
+3. ~~**Implement auto-fetch**~~: ✅ Done - VM auto-fetches from plasmd provider
+4. ~~**Find kexec-enabled kernel**~~: ✅ Done - Fedora 6.11.6 works with kexec!
+5. **Automate kexec in init**: Update init script to auto-kexec with Fedora kernel
+6. **Build phase-discover ARM64**: Cross-compile for initramfs
+7. **Test USB image creation**: Build and test on real hardware
+8. **CI/CD setup**: Automate Phase Boot image builds
 
 ### Quick Boot Commands (ARM64 on Mac)
 ```bash
-# User networking (isolated, no sudo)
-cd boot && qemu-system-aarch64 -M virt -cpu host -accel hvf -m 1024 \
-  -kernel build/kernel/vmlinuz-arm64 -initrd build/initramfs/initramfs-arm64.img \
-  -append "console=ttyAMA0 phase.mode=internet" \
-  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -nographic
+# Start provider on Mac (Terminal 1)
+cd daemon && ./target/debug/plasmd serve -a /tmp/boot-artifacts -p 8080
 
-# Shared networking (VM can reach host, requires sudo)
-sudo qemu-system-aarch64 -M virt -cpu host -accel hvf -m 512 \
-  -kernel build/kernel/vmlinuz-arm64 -initrd build/initramfs/initramfs-arm64.img \
+# Boot Fedora kernel directly (Terminal 2, requires sudo for vmnet-shared)
+cd boot && sudo qemu-system-aarch64 -M virt -cpu host -accel hvf -m 1024 \
+  -kernel /tmp/boot-artifacts/stable/arm64/kernel \
+  -initrd build/fedora-initramfs.img \
   -append "console=ttyAMA0 phase.mode=internet" \
   -netdev vmnet-shared,id=net0 -device virtio-net-pci,netdev=net0 -nographic
+
+# Manual kexec test (in VM shell)
+wget http://192.168.2.1:8080/stable/aarch64/kernel -O /tmp/k
+wget http://192.168.2.1:8080/stable/aarch64/initramfs -O /tmp/i
+cp /sys/firmware/fdt /tmp/d && fdtput -t x /tmp/d /chosen kaslr-seed 0 0
+kexec -l /tmp/k --initrd=/tmp/i --dtb=/tmp/d --append="console=ttyAMA0"
+kexec -e
+
+# Exit QEMU: Ctrl+A X
 ```
 
 ---

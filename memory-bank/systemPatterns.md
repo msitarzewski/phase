@@ -704,6 +704,236 @@ make test-qemu-arm  # ARM64 QEMU test
 
 ---
 
+## Netboot Provider Patterns
+
+### HTTP Artifact Server Pattern
+
+**Pattern**: axum-based HTTP server for boot artifact serving
+
+```rust
+// daemon/src/provider/server.rs
+use axum::{Router, routing::get, extract::State};
+use std::sync::Arc;
+
+struct AppState {
+    config: ProviderConfig,
+    artifacts: Arc<ArtifactStore>,
+    metrics: Arc<ProviderMetrics>,
+    start_time: Instant,
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(info_handler))
+        .route("/health", get(health_handler))
+        .route("/status", get(status_handler))
+        .route("/manifest.json", get(manifest_handler))
+        .route("/:channel/:arch/manifest.json", get(channel_manifest_handler))
+        .route("/:channel/:arch/:artifact", get(artifact_handler))
+        .with_state(state)
+        .layer(TraceLayer::new_for_http())
+}
+```
+
+**Key Principles**:
+- Shared state via `Arc<AppState>`
+- Health endpoint returns 200/503 for load balancers
+- Artifact endpoints support HTTP Range requests
+- Metrics tracking (requests, bytes served)
+
+### Boot Manifest Schema Pattern
+
+**Pattern**: Signed manifest describing boot artifacts
+
+```rust
+// daemon/src/provider/manifest.rs
+#[derive(Serialize, Deserialize)]
+pub struct BootManifest {
+    pub manifest_version: u32,        // Always 1
+    pub version: String,              // e.g., "0.1.0"
+    pub channel: String,              // "stable", "testing"
+    pub arch: String,                 // "aarch64", "x86_64"
+    pub created_at: String,           // ISO 8601
+    pub expires_at: String,           // ISO 8601
+    pub artifacts: HashMap<String, ArtifactInfo>,
+    pub signatures: Vec<Signature>,
+    pub provider: Option<ProviderInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub hash: String,                 // "sha256:hexdigest"
+    pub download_url: Option<String>, // Relative path
+}
+```
+
+**Key Principles**:
+- Manifest version for forward compatibility
+- Expiration for cache control
+- Artifacts keyed by name (kernel, initramfs, rootfs)
+- Ed25519 signatures for authenticity
+
+### Manifest Signing Pattern
+
+**Pattern**: Ed25519 signatures over manifest content
+
+```rust
+// daemon/src/provider/signing.rs
+use ed25519_dalek::{SigningKey, Signer};
+use sha2::{Sha256, Digest};
+
+pub fn sign_manifest(manifest: &mut BootManifest, key: &SigningKey) -> Result<()> {
+    // 1. Hash manifest without signatures
+    let mut manifest_for_hash = manifest.clone();
+    manifest_for_hash.signatures.clear();
+    let json = serde_json::to_string(&manifest_for_hash)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(json.as_bytes());
+    let hash = hasher.finalize();
+
+    // 2. Sign the hash
+    let signature = key.sign(&hash);
+
+    // 3. Add signature to manifest
+    manifest.signatures.push(Signature {
+        algorithm: "ed25519".to_string(),
+        key_id: hex::encode(key.verifying_key().as_bytes()),
+        signature: hex::encode(signature.to_bytes()),
+        signed_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    Ok(())
+}
+```
+
+**Key Principles**:
+- Sign hash of manifest JSON (excluding signatures field)
+- Include key_id for multi-key support
+- Timestamp for audit trail
+- Compatible with phase-verify binary
+
+### DHT Advertisement Pattern
+
+**Pattern**: Publish boot manifest location to Kademlia DHT
+
+```rust
+// daemon/src/provider/dht.rs
+use libp2p::kad::RecordKey;
+
+#[derive(Serialize, Deserialize)]
+pub struct ManifestRecord {
+    pub channel: String,
+    pub arch: String,
+    pub manifest_url: String,      // Full URL to manifest
+    pub http_addr: String,         // Provider HTTP address
+    pub manifest_version: String,
+    pub created_at: String,
+    pub ttl_secs: u64,             // Default: 3600 (1 hour)
+}
+
+impl ManifestRecord {
+    /// DHT key format: /phase/{channel}/{arch}/manifest
+    pub fn dht_key(channel: &str, arch: &str) -> RecordKey {
+        let key_str = format!("/phase/{}/{}/manifest", channel, arch);
+        RecordKey::new(&key_str.into_bytes())
+    }
+}
+
+// In Discovery::publish_manifest_record()
+let key = record.key();
+let value = record.to_bytes()?;
+swarm.behaviour_mut().kademlia.put_record(
+    Record::new(key, value),
+    Quorum::One,
+)?;
+```
+
+**Key Principles**:
+- DHT key includes channel and arch for targeted discovery
+- Record contains HTTP URL, not full manifest
+- TTL for automatic expiration
+- Refresh at half-TTL interval
+
+### Architecture Aliasing Pattern
+
+**Pattern**: Handle arm64/aarch64 and amd64/x86_64 naming variants
+
+```rust
+// daemon/src/provider/artifacts.rs
+impl ArtifactStore {
+    fn arch_aliases(arch: &str) -> Vec<&str> {
+        match arch {
+            "aarch64" => vec!["aarch64", "arm64"],
+            "arm64" => vec!["arm64", "aarch64"],
+            "x86_64" => vec!["x86_64", "amd64"],
+            "amd64" => vec!["amd64", "x86_64"],
+            other => vec![other],
+        }
+    }
+
+    pub fn get_artifact_path(&self, channel: &str, arch: &str, name: &str) -> Option<PathBuf> {
+        for arch_variant in Self::arch_aliases(arch) {
+            let path = self.base_dir.join(channel).join(arch_variant).join(name);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+}
+```
+
+**Key Principles**:
+- Server auto-detects as "aarch64" or "x86_64" (Rust convention)
+- Artifacts may be stored as "arm64" or "amd64" (Linux convention)
+- Try all aliases transparently
+- No user configuration required
+
+### HTTP Range Request Pattern
+
+**Pattern**: Support partial content downloads for large artifacts
+
+```rust
+// daemon/src/provider/server.rs
+async fn artifact_handler(
+    headers: HeaderMap,
+    // ...
+) -> impl IntoResponse {
+    if let Some(range_header) = headers.get(header::RANGE) {
+        // Parse "bytes=start-end" or "bytes=start-"
+        if let Some((start, end)) = parse_range(range_header, file_size) {
+            // Seek and read partial content
+            let mut file = File::open(&path).await?;
+            file.seek(SeekFrom::Start(start)).await?;
+            let content = file.take(end - start + 1);
+
+            return (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size)),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_LENGTH, (end - start + 1).to_string()),
+                ],
+                body
+            ).into_response();
+        }
+        // Invalid range: 416 Range Not Satisfiable
+    }
+    // No range: 200 OK with full content
+}
+```
+
+**Key Principles**:
+- Enables resumable downloads
+- Required for large boot artifacts (kernels, rootfs)
+- Standard HTTP/1.1 Range semantics (RFC 7233)
+- Always include `Accept-Ranges: bytes` header
+
+---
+
 ## Anti-Patterns (Avoid These)
 
 ### ❌ Centralized Discovery

@@ -1,242 +1,364 @@
 # Phase – Open, Verifiable Compute
 
-**Phase** is an open protocol for distributed computation: workloads are discovered, executed, and verified across a global network of independent nodes.  
-**Plasm** is the local runtime engine that turns any computer into a node in the network.  
-**PhaseBased** (commercial layer) will provide orchestration, SLAs, and billing later—**this repository focuses on the open protocol and free infrastructure.**
+**Phase** is an open protocol for distributed computation: workloads are discovered, executed, and verified across a global network of independent nodes.
+**Plasm** is the local runtime engine that turns any computer into a node in the network.
+**Phase Boot** enables any machine to boot from the network and join the compute mesh.
 
 ---
 
-## Vision
+## What's Working Today
 
-The internet began as a network for sharing information.  
-Phase is the next evolution—a network for sharing **computation**.
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         PHASE ECOSYSTEM                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ┌─────────────┐      DHT/mDNS       ┌─────────────┐                   │
+│   │ Phase Boot  │ ◄──────────────────► │  Provider   │                   │
+│   │  (Client)   │     Discovery        │  (plasmd)   │                   │
+│   └──────┬──────┘                      └──────┬──────┘                   │
+│          │                                    │                          │
+│          │  Fetch kernel, initramfs           │  Serve boot artifacts    │
+│          │  Verify signatures                 │  Sign manifests          │
+│          │  kexec into target                 │  Advertise to DHT        │
+│          ▼                                    ▼                          │
+│   ┌─────────────┐                      ┌─────────────┐                   │
+│   │   Running   │ ◄──────────────────► │    WASM     │                   │
+│   │   System    │     Job Execution    │   Runtime   │                   │
+│   └─────────────┘                      └─────────────┘                   │
+│                                                                          │
+│   Self-Hosting Loop: Boot → Serve → Others boot from you                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-- **Decentralized:** no data centers, no single owner.  
-- **Verifiable:** every result includes a signed receipt of work done.  
-- **Private:** jobs execute in sandboxed WebAssembly environments.  
-- **Resilient:** discovery and routing are handled peer‑to‑peer using DHT protocols.  
+### Releases Complete
 
-With Phase, you can run a job anywhere—across your LAN, a research cluster, or the public internet—and receive a provable result from an anonymous node.
+| Release | Status | Description |
+|---------|--------|-------------|
+| **Phase Open MVP** | ✅ Complete | WASM execution, peer discovery, signed receipts |
+| **Phase Boot** | ✅ Complete | Bootable USB/VM, DHT discovery, kexec handoff |
+| **Netboot Provider** | ✅ Complete | HTTP artifact server, manifest signing, DHT advertisement |
+
+---
+
+## Quick Start
+
+### Run a Boot Artifact Provider
+
+```bash
+# Build plasmd
+cd daemon
+cargo build --release
+
+# Create artifacts directory
+mkdir -p ~/boot-artifacts/stable/arm64
+cp /path/to/kernel ~/boot-artifacts/stable/arm64/
+cp /path/to/initramfs ~/boot-artifacts/stable/arm64/
+
+# Start provider
+./target/release/plasmd serve --artifacts ~/boot-artifacts
+
+# Output:
+# ╔══════════════════════════════════════════════╗
+# ║           Phase Boot Provider                ║
+# ╠══════════════════════════════════════════════╣
+# ║ HTTP:     http://0.0.0.0:8080                ║
+# ║ Channel:  stable                             ║
+# ║ Arch:     arm64                              ║
+# ║ DHT:      enabled                            ║
+# ║ mDNS:     enabled                            ║
+# ╚══════════════════════════════════════════════╝
+```
+
+### Check Provider Status
+
+```bash
+# View provider status
+./target/release/plasmd provider status
+
+# List available artifacts
+./target/release/plasmd provider list
+
+# Fetch manifest
+curl http://localhost:8080/manifest.json | jq
+```
+
+### Execute a WASM Job
+
+```bash
+# Run a WASM workload locally
+./target/release/plasmd run examples/hello.wasm
+
+# Execute with signed receipt
+./target/release/plasmd execute-job --wasm examples/hello.wasm
+```
 
 ---
 
 ## Architecture
 
-| Layer | Name | Description |
-|-------|------|-------------|
-| **Protocol** | **Phase** | Defines job manifests, receipts, peer discovery, and encrypted transport. |
-| **Runtime** | **Plasm** | Lightweight daemon that runs on any OS and executes WASM workloads. |
-| **Client SDKs** | PHP, Swift, C++, React, etc. | Submit jobs, track progress, retrieve results. |
-| **(Future)** | **PhaseBased** | Commercial orchestration and guarantees built on top of this open core. |
+```
+┌─────────────────────────────────────────┐
+│         Client SDKs (PHP, etc.)         │
+├─────────────────────────────────────────┤
+│       Phase Protocol (Manifests)        │
+├─────────────────────────────────────────┤
+│      libp2p (DHT, QUIC, Noise)          │
+├─────────────────────────────────────────┤
+│      Plasm Runtime (Rust Daemon)        │
+├─────────────────────────────────────────┤
+│       WASM Runtime (wasmtime)           │
+└─────────────────────────────────────────┘
+```
 
----
-
-## MVP Scope
-
-Demonstrate end‑to‑end remote execution using anonymous discovery:
-
-1. **Anonymous peer discovery** using a modern DHT (libp2p / Kademlia).  
-2. **Job submission** from a PHP client on macOS ARM.  
-3. **Remote execution** on a Plasm node (.deb for Ubuntu x86_64).  
-4. **Result and receipt return** through encrypted channels.  
-
-**Goal:** a simple PHP script submits a WASM job that runs remotely and returns output + signed proof of execution.
+| Layer | Component | Description |
+|-------|-----------|-------------|
+| **Protocol** | Phase | Job manifests, receipts, peer discovery, encrypted transport |
+| **Runtime** | Plasm | Rust daemon executing WASM workloads with resource limits |
+| **Discovery** | libp2p | Kademlia DHT for internet-wide discovery, mDNS for LAN |
+| **Security** | Ed25519 | Signed manifests and receipts, SHA256 artifact verification |
+| **Boot** | Phase Boot | Network boot with kexec, overlayfs, mode-based behavior |
 
 ---
 
 ## Components
 
-### Plasm Daemon
-- Written in **Rust** for safety and portability.
-- Embeds a lightweight **WASM runtime** (`wasm3` initially; `wasmtime` next).
-- Handles DHT participation, job queueing, encrypted transport, and receipt signing.
-- Packaged as `.deb` for Intel/AMD Ubuntu systems.
+### Plasm Daemon (`daemon/`)
 
-### PHP Client SDK
-- Library to discover peers, submit jobs, track progress, and retrieve results.
-- Simple API:
-  ```php
-  $plasm = new Plasm\Client();
-  $jobId = $plasm->submit('hello.wasm', ['cpu'=>1]);
-  echo $plasm->result($jobId);
-  ```
+The core runtime engine:
 
-### Manifests & Receipts
-- **Manifest** – declares resources, timeouts, and capabilities.
-- **Receipt** – signed proof including module hash, wall time, CPU seconds.
+- **WASM Execution**: Wasmtime runtime with memory/CPU limits
+- **Peer Discovery**: Kademlia DHT + mDNS for node discovery
+- **Job Protocol**: Offer/Accept handshake, signed receipts
+- **Boot Provider**: HTTP server for boot artifacts
 
----
+```bash
+# CLI Commands
+plasmd start              # Start P2P daemon
+plasmd run <wasm>         # Execute WASM locally
+plasmd serve              # Start boot artifact provider
+plasmd provider status    # Query provider status
+plasmd provider list      # List artifacts
+```
 
-## Phases of Development
+### Phase Boot (`boot/`)
 
-1. **MVP** – Single‑job remote execution (this repo).  
-2. **Networking Expansion** – Multi‑node coordination, redundancy, result recombination.  
-3. **Security & Verification** – Deterministic receipts, reputation; explore zk‑proofs.  
-4. **Ecosystem SDKs** – Swift, TypeScript, C++, PHP, Python libraries.  
-5. **Federation Layer** – Self‑governing clusters, persistent identity, optional payments.  
-6. **Commercial Layer** *(PhaseBased)* – SLAs, billing, and guaranteed performance tiers.
+Network boot system:
+
+- **Boot Stub**: Minimal initramfs with discovery tools
+- **Discovery**: `phase-discover` binary for DHT/mDNS
+- **Verification**: `phase-verify` for Ed25519 signatures
+- **Fetch**: `phase-fetch` for content-addressed downloads
+- **kexec**: Fast kernel switch without firmware
+
+```bash
+# Boot modes (via kernel cmdline)
+phase.mode=internet    # Full network, DHT discovery
+phase.mode=local       # LAN only, mDNS discovery
+phase.mode=private     # Ephemeral identity, no writes
+```
+
+### Provider Module (`daemon/src/provider/`)
+
+HTTP-based boot artifact serving:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Provider info |
+| `GET /health` | Health check (200/503) |
+| `GET /status` | Detailed status with metrics |
+| `GET /manifest.json` | Signed boot manifest |
+| `GET /:channel/:arch/:artifact` | Download artifact (Range supported) |
+
+### PHP Client SDK (`php-sdk/`)
+
+```php
+$plasm = new Plasm\Client();
+$jobId = $plasm->submit('hello.wasm', ['cpu' => 1]);
+$result = $plasm->result($jobId);
+echo $result->output;  // "dlroW ,olleH"
+```
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-**Ubuntu/Debian Server (x86_64):**
-- Ubuntu 22.04 LTS or newer
-- systemd (for service management)
-- 1GB+ RAM, 1GB+ disk space
-
-**macOS/Linux Client (any architecture):**
-- PHP 8.1 or newer
-- Composer (PHP package manager)
-- `php-sodium` extension (for Ed25519 signature verification)
-
-### Building from Source
+### From Source (Recommended)
 
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/phasebased/phase.git
 cd phase
 
-# Install Rust toolchain (if not already installed)
+# Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install cargo-deb for packaging
+# Build daemon
+cd daemon
+cargo build --release
+
+# Binary at: target/release/plasmd
+```
+
+### Debian Package
+
+```bash
+# Install cargo-deb
 cargo install cargo-deb
 
-# Build the Debian package
+# Build package
 cd daemon
 cargo deb
 
-# Package will be created at: target/debian/plasm_0.1.0_amd64.deb
-```
-
-**For detailed build instructions, troubleshooting, and verification steps**, see the comprehensive build guide: **[docs/building-on-ubuntu.md](docs/building-on-ubuntu.md)**
-
-### Installing on Ubuntu/Debian
-
-```bash
-# Install the package
+# Install
 sudo dpkg -i target/debian/plasm_0.1.0_amd64.deb
 
-# Start the service
+# Start service
 sudo systemctl start plasmd
-
-# Enable to start on boot (optional)
 sudo systemctl enable plasmd
-
-# Check service status
-sudo systemctl status plasmd
-
-# View logs
-sudo journalctl -u plasmd -f
 ```
 
-### Installing PHP Client SDK
+### PHP SDK
 
 ```bash
-# Navigate to php-sdk directory
 cd php-sdk
-
-# Install dependencies
 composer install
-
-# The SDK is now ready to use in examples/
-```
-
-### Troubleshooting
-
-**Service won't start:**
-```bash
-# Check detailed logs
-sudo journalctl -u plasmd -n 50 --no-pager
-
-# Verify binary is executable
-ls -l /usr/bin/plasmd
-
-# Test manual execution
-/usr/bin/plasmd --version
-```
-
-**PHP client can't find daemon:**
-- Ensure plasmd is running: `sudo systemctl status plasmd`
-- Check network connectivity
-- Verify firewall allows required ports
-
-**Signature verification fails:**
-- Ensure `php-sodium` extension is installed: `php -m | grep sodium`
-- Install if missing: `sudo apt install php-sodium` (Ubuntu) or `brew install php` (macOS)
-
-## Quick Start
-
-### Local Execution Test
-
-```bash
-# From repository root
-cd examples
-php local_test.php
-```
-
-Expected output:
-```
-Submitting job: hello.wasm
-Job ID: <uuid>
-Waiting for result...
-Output: dlroW ,olleH
-Exit code: 0
-Receipt verified ✓
-```
-
-### Remote Execution Test
-
-```bash
-# Ensure plasmd is running on a remote node
-# From repository root
-cd examples
-php remote_test.php
-```
-
-Expected output:
-```
-Phase Remote Execution Test
-===========================
-
-Discovering nodes...
-✓ Node discovered: <peer-id>
-  Architecture: x86_64
-  Runtime: wasmtime-27
-
-Submitting job: hello.wasm
-✓ Job submitted: <job-id>
-
-Waiting for execution...
-✓ Execution complete
-
-Result:
-  Output: dlroW ,olleH
-  Exit code: 0
-  Wall time: 235ms
-
-Receipt Verification:
-✓ Signature valid
-✓ Module hash matches
-✓ Receipt verified
-
-Test complete!
 ```
 
 ---
 
-## Roadmap Preview
+## Configuration
 
-- **Distributed Streams:** shard large jobs into parallel WASM streams and recombine results.  
-- **Node Discovery Map:** visualize global capacity and latency.  
-- **Receipts‑as‑Proof:** deterministic hashes for each compute unit.  
-- **Anonymous Volunteer Mesh:** open pool for research and civic compute.  
-- **PhaseBased Launch:** commercial orchestration and verified tiers (separate repo).
+### Provider Configuration
+
+```bash
+# Start with options
+plasmd serve \
+  --artifacts /var/lib/plasm/boot-artifacts \
+  --channel stable \
+  --arch arm64 \
+  --port 8080 \
+  --no-dht      # Disable DHT (LAN only)
+```
+
+### Artifact Directory Structure
+
+```
+/var/lib/plasm/boot-artifacts/
+├── stable/
+│   ├── arm64/
+│   │   ├── kernel
+│   │   ├── initramfs
+│   │   └── rootfs (optional)
+│   └── x86_64/
+│       └── ...
+└── testing/
+    └── ...
+```
+
+---
+
+## Security Model
+
+- **Signed Manifests**: Ed25519 signatures over boot manifests
+- **Content Verification**: SHA256 hashes for all artifacts
+- **Sandboxed Execution**: WASM with no host access by default
+- **Encrypted Transport**: Noise protocol over QUIC
+- **Signed Receipts**: Cryptographic proof of execution
+
+---
+
+## Documentation
+
+| Document | Location |
+|----------|----------|
+| Provider Quickstart | `daemon/docs/provider-quickstart.md` |
+| Architecture | `daemon/docs/architecture.md` |
+| API Reference | `daemon/docs/api-reference.md` |
+| Troubleshooting | `daemon/docs/troubleshooting.md` |
+| Security | `daemon/docs/security.md` |
+| Boot Architecture | `boot/docs/ARCHITECTURE.md` |
+| Boot Quickstart | `boot/docs/QUICKSTART-*.md` |
+
+---
+
+## Roadmap
+
+### Completed
+
+- [x] Local WASM execution with wasmtime
+- [x] Peer discovery via Kademlia DHT
+- [x] Remote execution with signed receipts
+- [x] Debian packaging
+- [x] Phase Boot (USB/VM boot system)
+- [x] Netboot Provider (HTTP artifact server)
+- [x] Self-hosting loop
+
+### In Progress
+
+- [ ] Full mDNS service advertisement
+- [ ] Multi-provider load balancing
+- [ ] Production key management
+
+### Future
+
+- [ ] Secure Boot signing chain
+- [ ] Distributed job streams
+- [ ] Zero-knowledge execution proofs
+- [ ] Swift/TypeScript/Python SDKs
+- [ ] PhaseBased commercial layer
+
+---
+
+## Project Structure
+
+```
+phase/
+├── daemon/                 # Plasm daemon (Rust)
+│   ├── src/
+│   │   ├── main.rs         # CLI entry point
+│   │   ├── lib.rs          # Library exports
+│   │   ├── provider/       # Boot provider module
+│   │   ├── network/        # P2P networking
+│   │   └── wasm/           # WASM runtime
+│   ├── docs/               # Provider documentation
+│   └── Cargo.toml
+├── boot/                   # Phase Boot system
+│   ├── Makefile            # Build orchestration
+│   ├── initramfs/          # Init scripts
+│   └── docs/               # Boot documentation
+├── php-sdk/                # PHP client SDK
+├── examples/               # Example WASM jobs
+├── memory-bank/            # Project documentation
+│   ├── releases/           # Release plans
+│   │   ├── boot/           # Phase Boot release
+│   │   └── netboot/        # Netboot Provider release
+│   └── tasks/              # Task documentation
+└── README.md
+```
+
+---
+
+## Contributing
+
+1. Read `memory-bank/systemPatterns.md` for architectural patterns
+2. Follow the library + binary pattern for Rust code
+3. Run `cargo test` before submitting changes
+4. Update documentation for new features
 
 ---
 
 ## License
-Apache 2.0 © 2025 PhaseBased
+
+Apache 2.0 - 2025 PhaseBased
+
+---
+
+## Stats
+
+- **Tests**: 80 passing
+- **Daemon Code**: ~5,000 lines Rust
+- **Boot Code**: ~15,000 lines (scripts, configs, docs)
+- **Provider Module**: 2,510 lines Rust
+- **Documentation**: 3,000+ lines

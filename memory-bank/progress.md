@@ -1,6 +1,6 @@
 # Progress: Phase Open MVP
 
-**Last Updated**: 2025-11-09
+**Last Updated**: 2025-11-27
 **Version**: 1.0
 **Phase**: MVP Complete - Production Ready
 
@@ -110,10 +110,54 @@
 
 ---
 
+### Netboot Provider: All Milestones ✅ COMPLETE
+**Goal**: HTTP-based boot artifact provider with DHT/mDNS advertisement
+
+**Status**: 6/6 milestones complete (100%)
+**Completed**: Nov 2025
+
+| Milestone | Status | Key Deliverables |
+|-----------|--------|------------------|
+| M1 - HTTP Server | ✅ DONE | axum server, artifact endpoints, range requests, health/status |
+| M2 - Manifest Gen | ✅ DONE | Schema, SHA256 hashing, Ed25519 signing, /manifest.json |
+| M3 - DHT/mDNS | ✅ DONE | DHT record publishing, mDNS config, ManifestRecord |
+| M4 - CLI | ✅ DONE | `serve`, `provider status`, `provider list` commands |
+| M5 - Testing | ✅ DONE | Integration tests, bug fixes, arch aliasing |
+| M6 - Documentation | ✅ DONE | Quickstart, architecture, API reference, security |
+
+**Stats**: 2,510 lines Rust (provider module), 3,000 lines documentation
+
+**Provider Module** (`daemon/src/provider/`):
+- `server.rs` (504 lines) - HTTP server with axum
+- `manifest.rs` (549 lines) - Boot manifest schema
+- `artifacts.rs` (286 lines) - Artifact storage with arch aliasing
+- `signing.rs` (243 lines) - Ed25519 manifest signing
+- `generator.rs` (221 lines) - Manifest generation
+- `dht.rs` (142 lines) - DHT record types
+- `mdns.rs` (222 lines) - mDNS service config
+- `metrics.rs` (113 lines) - Request metrics
+- `config.rs` (176 lines) - Provider configuration
+
+**New CLI Commands**:
+- `plasmd serve` - Start boot artifact provider
+- `plasmd provider status` - Query provider status
+- `plasmd provider list` - List available artifacts
+
+**HTTP Endpoints**:
+- `GET /` - Provider info
+- `GET /health` - Health check (200/503)
+- `GET /status` - Detailed status with metrics
+- `GET /manifest.json` - Boot manifest
+- `GET /:channel/:arch/manifest.json` - Channel-specific manifest
+- `GET /:channel/:arch/:artifact` - Download artifact (with Range support)
+
+---
+
 ## Overall Progress
 
 **Phase Open MVP**: 23/23 tasks (100%) ✅ **MVP COMPLETE**
 **Phase Boot**: 7/7 milestones (100%) ✅ **IMPLEMENTED**
+**Netboot Provider**: 6/6 milestones (100%) ✅ **COMPLETE**
 
 ```
 Phase Open MVP:
@@ -124,7 +168,7 @@ Milestone 4: ██████████  6/6  (100%) ✅
             ──────────────────
 Total:       ██████████  23/23 (100%) ✅ COMPLETE
 
-Phase Boot:
+Phase Boot (Consumer):
 M1 Boot Stub:  ██████████  (100%) ✅
 M2 Discovery:  ██████████  (100%) ✅
 M3 Verify:     ██████████  (100%) ✅
@@ -134,11 +178,59 @@ M6 Plasm:      ██████████  (100%) ✅
 M7 Docs:       ██████████  (100%) ✅
             ──────────────────
 Total:       ██████████  7/7 (100%) ✅ IMPLEMENTED
+
+Netboot Provider (Server):
+M1 HTTP Server:  ██████████  (100%) ✅
+M2 Manifest:     ██████████  (100%) ✅
+M3 DHT/mDNS:     ██████████  (100%) ✅
+M4 CLI:          ██████████  (100%) ✅
+M5 Testing:      ██████████  (100%) ✅
+M6 Docs:         ██████████  (100%) ✅
+            ──────────────────
+Total:       ██████████  6/6 (100%) ✅ COMPLETE
 ```
 
 ---
 
 ## Recent Completions
+
+### 2025-11-27: KEXEC WORKING - Full Self-Hosting Loop Proven!
+- ✅ **Fedora kernel works**: 6.11.6-200.fc40.aarch64 (18MB) boots in QEMU ARM64
+- ✅ **Virtio modules load**: failover → net_failover → virtio_net (212KB total)
+- ✅ **kexec_load_disabled=0**: Fedora kernel allows kexec syscall
+- ✅ **kexec SUCCESSFUL**: Fresh boot confirmed via `dmesg` timestamp [0.000000]
+- ✅ **Memory requirement**: 1GB RAM needed (512MB causes OOM during kexec load)
+- ✅ **Fedora initramfs**: boot/build/fedora-initramfs.img with multi-kernel module support
+
+**Complete Self-Hosting Loop Proven**:
+```
+Boot Fedora → Network up → wget kernel from plasmd → kexec -l → kexec -e → FRESH BOOT!
+```
+
+**The Dream is Real**: Boot from network → Run plasmd serve → Others boot from you → They serve others
+
+### 2025-11-27: Phase Boot Auto-Fetch Pipeline Complete
+- ✅ **phase.provider=URL**: Direct provider specification via kernel cmdline
+- ✅ **fetch_and_boot()**: Auto-downloads manifest, kernel (11.4MB), initramfs (1.8MB)
+- ✅ **DTB handling**: Extracts /sys/firmware/fdt, zeros kaslr-seed via fdtput
+- ✅ **kexec segments**: All 4 segments prepared correctly
+- ~~⚠️ **kexec syscall blocked**~~: ✅ FIXED with Fedora kernel!
+- ✅ **New initramfs tools**: kexec (199KB), fdtput (67KB), libfdt, musl libc
+- ✅ **Initramfs size**: 1.8MB (was 1.1MB, +700KB for kexec tooling)
+
+### 2025-11-27: Netboot Provider Complete (M1-M6)
+- ✅ **M1 - HTTP Server**: axum-based server, artifact endpoints, range requests, health/status
+- ✅ **M2 - Manifest Generation**: BootManifest schema, SHA256 hashing, Ed25519 signing
+- ✅ **M3 - DHT/mDNS**: ManifestRecord for DHT, mDNS service config, discovery integration
+- ✅ **M4 - CLI**: `plasmd serve`, `provider status`, `provider list` commands
+- ✅ **M5 - Testing**: Integration tests, arch aliasing (arm64↔aarch64), CLI bug fixes
+- ✅ **M6 - Documentation**: Quickstart, architecture, API reference, troubleshooting, security
+- ✅ **Stats**: 2,510 lines Rust, 3,000 lines docs, 80 tests passing
+
+**Self-Hosting Loop Now Possible**:
+```
+Boot from DHT → Run plasmd serve → Advertise to DHT → Serve others
+```
 
 ### 2025-11-26: Phase Boot Complete (M1-M7)
 - ✅ **M1 - Boot Stub**: Makefile (540 lines), ESP partition, init script (325 lines)
