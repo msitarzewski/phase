@@ -331,6 +331,32 @@ See detailed documentation: [091109_milestone1_local_wasm_execution.md](./091109
 
 **See**: [091109_library_binary_refactor.md](./091109_library_binary_refactor.md)
 
+### 2025-11-27: x86_64 USB Boot Image
+**Type**: Feature Implementation
+**Objective**: Create bootable USB image for x86_64 systems with Phase Boot
+
+**Completed**:
+- ✅ **Fedora x86_64 kernel**: Downloaded 6.11.6-200.fc40.x86_64 (16MB) from Koji
+- ✅ **Module extraction**: failover.ko (22KB), net_failover.ko (43KB), virtio_net.ko (250KB)
+- ✅ **x86_64 initramfs**: Built with Alpine busybox, kexec, and Fedora modules (644KB)
+- ✅ **Hybrid USB image**: 128MB BIOS (syslinux) + UEFI (GRUB) boot
+- ✅ **Boot menu**: Internet Mode, Local Mode, Private Mode options
+- ✅ **Provider artifacts**: Kernel and initramfs ready for plasmd serving
+
+**Files Created**:
+- `boot/build/phase-boot-x86_64.img` (128MB) - Hybrid USB boot image
+- `boot/build/fedora-initramfs-x86_64.img` (644KB) - x86_64 initramfs
+- `/tmp/boot-artifacts/stable/x86_64/kernel` - Provider artifact
+- `/tmp/boot-artifacts/stable/x86_64/initramfs` - Provider artifact
+
+**Commands**:
+- Write to USB: `sudo dd if=boot/build/phase-boot-x86_64.img of=/dev/sdX bs=4M`
+- Test QEMU: `qemu-system-x86_64 -m 1024 -kernel ... -initrd ... -nographic`
+
+**Impact**: x86_64 hardware now bootable via USB stick
+
+**See**: [271127_fedora_kexec_success.md](./271127_fedora_kexec_success.md)
+
 ### 2025-11-26: Phase Boot Implementation (M1-M7)
 **Type**: Major Feature Implementation
 **Objective**: Implement complete bootable USB/VM system for Phase network

@@ -8,6 +8,9 @@
 /php-sdk/vendor/
 composer.lock
 
+# Build artifacts
+/build/
+
 # Binaries
 *.wasm
 

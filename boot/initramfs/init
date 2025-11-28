@@ -370,11 +370,11 @@ fetch_and_boot() {
             echo "  DTB size: $(ls -lh /tmp/phase-boot/device.dtb | awk '{print $5}')"
         fi
 
-        # Try kexec -s (file-based syscall, preferred on modern ARM64)
+        # Try kexec -l (legacy syscall, proven to work on ARM64 Fedora)
         echo ""
-        echo "Attempting kexec -s (file-based)..."
-        if kexec -s -l /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
-            echo "Kernel loaded successfully with kexec -s!"
+        echo "Attempting kexec -l (legacy load)..."
+        if kexec -l /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
+            echo "Kernel loaded successfully with kexec -l!"
             echo ""
             echo "=========================================="
             echo "  EXECUTING KEXEC - Booting new kernel!"
@@ -384,9 +384,9 @@ fetch_and_boot() {
             # Should not reach here
             echo "ERROR: kexec -e failed!"
         else
-            echo "kexec -s failed, trying kexec -l (legacy)..."
-            if kexec -l /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
-                echo "Kernel loaded with kexec -l!"
+            echo "kexec -l failed, trying kexec -s (file-based syscall)..."
+            if kexec -s /tmp/phase-boot/kernel --initrd=/tmp/phase-boot/initramfs $DTB_ARGS --append="console=ttyAMA0 phase.mode=$PHASE_MODE" 2>&1; then
+                echo "Kernel loaded with kexec -s!"
                 echo ""
                 echo "=========================================="
                 echo "  EXECUTING KEXEC - Booting new kernel!"

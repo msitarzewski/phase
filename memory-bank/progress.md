@@ -194,6 +194,30 @@ Total:       ██████████  6/6 (100%) ✅ COMPLETE
 
 ## Recent Completions
 
+### 2025-11-27: x86_64 USB Boot Image Complete!
+- ✅ **Fedora x86_64 kernel**: 6.11.6-200.fc40.x86_64 (16MB) with kexec support
+- ✅ **Hybrid USB image**: 128MB BIOS (syslinux) + UEFI (GRUB) boot
+- ✅ **x86_64 initramfs**: 644KB with virtio modules (failover, net_failover, virtio_net)
+- ✅ **Provider artifacts**: `/tmp/boot-artifacts/stable/x86_64/` ready
+- ✅ **Boot modes**: Internet, Local, Private in boot menu
+
+**Files Created**:
+- `boot/build/phase-boot-x86_64.img` - 128MB hybrid USB image
+- `boot/build/fedora-initramfs-x86_64.img` - 644KB x86_64 initramfs
+
+**Write to USB**: `sudo dd if=boot/build/phase-boot-x86_64.img of=/dev/sdX bs=4M`
+
+### 2025-11-27: AUTO-KEXEC PIPELINE COMPLETE!
+- ✅ **Bug fix**: Fixed `kexec -s -l` to `kexec -l` (legacy syscall works on ARM64)
+- ✅ **Auto-kexec working**: Boot with `phase.provider=URL` triggers automatic fetch and kexec
+- ✅ **No manual intervention**: Full pipeline runs unattended
+- ✅ **Fresh boot confirmed**: `dmesg` shows `[0.000000]` after auto-kexec
+
+**Fully Automated Flow**:
+```
+Boot → Modules load → DHCP → Fetch manifest/kernel/initramfs → kexec -l → kexec -e → FRESH BOOT!
+```
+
 ### 2025-11-27: KEXEC WORKING - Full Self-Hosting Loop Proven!
 - ✅ **Fedora kernel works**: 6.11.6-200.fc40.aarch64 (18MB) boots in QEMU ARM64
 - ✅ **Virtio modules load**: failover → net_failover → virtio_net (212KB total)
