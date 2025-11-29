@@ -194,6 +194,11 @@ Total:       ██████████  6/6 (100%) ✅ COMPLETE
 
 ## Recent Completions
 
+### 2025-11-29: Console Logging Hardening + x86_64 QEMU Verification
+- ✅ Added aggressive console/earlyprintk params and init-time logging to `/run/phase-init.log` with periodic sync to ESP; retries mounting PHASEBOOT up to 5x `boot/initramfs/init:150-183,561-600`.
+- ✅ Confirmed Phase Boot boots cleanly in QEMU x86_64 with Alpine 6.12.59-lts kernel using `initramfs-x86_64.img`; shell reachable over serial (`-serial mon:stdio`) with logs present.
+- 🔄 MacBook hardware still halts pre-log on-screen; next step is to test updated initramfs on USB and inspect `/phase-init.log` or try `init=/bin/sh nomodeset` on that hardware.
+
 ### 2025-11-28: Real Hardware Boot - Extensive Testing
 - ✅ **Target**: 2009 MacBook (MacBook5,2) with 32-bit EFI / 64-bit CPU
 - ✅ **Kernel boots**: Fedora 6.11.6-200.fc40.x86_64 loads and runs

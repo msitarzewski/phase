@@ -422,12 +422,37 @@ diskutil eject /Volumes/PHASEBOOT
 
 ---
 
+## Phase 5: Logging Hardening + QEMU Verification (2025-11-29)
+
+**Changes**
+- Added explicit console/earlyprintk/loglevel/fbcon params in boot entries and preserved through kexec `boot/esp/EFI/BOOT/grub.cfg`, `boot/esp/loader/entries/*.conf`, `boot/initramfs/scripts/kexec-boot.sh`.
+- Init now logs immediately to `/run/phase-init.log`, retries mounting PHASEBOOT up to 5 times, copies a snapshot to `/boot/phase-init.log` when mounted, and keeps a background sync loop `boot/initramfs/init:150-183,561-600`.
+- Standardized usage around `initramfs-x86_64.img` (also copying to `initramfs.img` on the USB to avoid drift).
+
+**QEMU x86_64 Verification**
+- Kernel: `boot/build/kernel/vmlinuz-x86_64` (Alpine 6.12.59-lts via download-kernel script).
+- Initramfs: `boot/build/initramfs/initramfs-x86_64.img` (works when copied as `initramfs-x86_64.img`).
+- Command:
+```bash
+qemu-system-x86_64 -m 1024 \
+  -kernel boot/build/kernel/vmlinuz-x86_64 \
+  -initrd boot/build/initramfs/initramfs-x86_64.img \
+  -append "console=ttyS0,115200 phase.mode=internet" \
+  -serial mon:stdio -nographic
+```
+- Result: Boots cleanly to Phase Boot shell; `/run/phase-init.log` available.
+
+**MacBook Status**
+- Still halts around the manufacturer line; no `/phase-init.log` recovered yet, indicating hang likely before `/init` mounts ESP.
+
+---
+
 ### Next Steps for Real Hardware
 
-1. **Try different console device**: `/dev/tty0` or `/dev/tty1` instead of `/dev/console`
-2. **Add kernel framebuffer params**: `video=efifb` or `nomodeset`
-3. **Test on newer x86_64 hardware**: Modern UEFI machine with standard console
-4. **Serial console**: If available, use `console=ttyS0,115200`
+1. **Reflash USB with updated initramfs**: Copy `boot/build/fedora-initramfs-x86_64.img` to both `initramfs-x86_64.img` and `initramfs.img` on PHASEBOOT to avoid naming drift.
+2. **MacBook boot + log check**: Boot and inspect PHASEBOOT for `/phase-init.log`. If absent, GRUB-edit once with `init=/bin/sh nomodeset console=tty0 console=ttyS0,115200 earlyprintk=efi,keep loglevel=8 ignore_loglevel`.
+3. **Test on newer x86_64 hardware**: Confirm ESP logging path on a modern UEFI machine.
+4. **If still failing**: Swap framebuffer flag (`video=efifb:force` ↔ `nomodeset`) and/or drop to minimal marker-only /init to confirm PID1 runs on the MacBook.
 
 ---
 
