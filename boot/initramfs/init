@@ -109,13 +109,78 @@ parse_cmdline() {
 setup_console() {
     echo "Setting up console..."
 
-    # Ensure stdin, stdout, stderr are properly connected
-    exec 0</dev/console
-    exec 1>/dev/console
-    exec 2>/dev/console
+    CONSOLE_DEV=""
+    for dev in /dev/console /dev/tty0 /dev/ttyS0; do
+        if [ -c "$dev" ]; then
+            CONSOLE_DEV="$dev"
+            break
+        fi
+    done
+
+    # Bind stdin to a real console if available
+    if [ -n "$CONSOLE_DEV" ]; then
+        exec 0<"$CONSOLE_DEV"
+    fi
+
+    # Always append to log; mirror to console if present
+    if [ -n "$CONSOLE_DEV" ]; then
+        tail -f "$LOG_FILE" > "$CONSOLE_DEV" 2>/dev/null &
+    fi
+    exec >>"$LOG_FILE" 2>&1
+
+    # Fallback stdin if no console was found
+    if [ -z "$CONSOLE_DEV" ]; then
+        exec 0</dev/null
+    fi
 
     # Set up job control for the shell
     setsid sh -c 'exec sh </dev/console >/dev/console 2>&1' || true
+}
+
+#------------------------------------------------------------------------------
+# Persist Logs to Boot Partition (best-effort)
+#------------------------------------------------------------------------------
+
+mount_boot_partition() {
+    BOOT_MOUNT="/boot"
+    mkdir -p "$BOOT_MOUNT"
+
+    # Try multiple times in case the device appears late
+    for attempt in 1 2 3 4 5; do
+        # Preferred: by-label
+        if [ -e /dev/disk/by-label/PHASEBOOT ]; then
+            if mount -t vfat -o rw /dev/disk/by-label/PHASEBOOT "$BOOT_MOUNT" 2>/dev/null; then
+                echo "Boot partition mounted at /dev/disk/by-label/PHASEBOOT (attempt $attempt)"
+                return 0
+            fi
+        fi
+
+        # Fallback scan of common USB devices
+        for dev in /dev/sd[a-d][1-3]; do
+            [ -e "$dev" ] || continue
+            if mount -t vfat -o rw "$dev" "$BOOT_MOUNT" 2>/dev/null; then
+                echo "Boot partition mounted at $dev (attempt $attempt)"
+                return 0
+            fi
+        done
+
+        sleep 1
+    done
+
+    echo "Boot partition not mounted (optional)."
+    return 1
+}
+
+persist_logs_if_possible() {
+    if grep -q " /boot " /proc/mounts 2>/dev/null; then
+        echo "Persisting init log to /boot/phase-init.log"
+        (
+            while true; do
+                cp /run/phase-init.log /boot/phase-init.log 2>/dev/null && sync
+                sleep 2
+            done
+        ) &
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -493,11 +558,46 @@ main() {
     mount_essential
     echo ""
 
+    # Initialize logging immediately (before modules/console)
+    LOG_FILE="/run/phase-init.log"
+    touch "$LOG_FILE" 2>/dev/null || true
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+    echo "[init] phase-init starting..." >> "$LOG_FILE"
+    sync
+
+    # Try to mount boot early so we can copy a first log snapshot even if we hang later
+    mount_boot_partition
+    if grep -q " /boot " /proc/mounts 2>/dev/null; then
+        cp "$LOG_FILE" /boot/phase-init.log 2>/dev/null || true
+        sync || true
+    fi
+
     parse_cmdline
     echo ""
 
     load_modules
     echo ""
+
+    setup_console
+    echo ""
+
+    # If boot is mounted, start periodic persistence after console attach
+    persist_logs_if_possible
+    echo ""
+
+    # Background retry to mount boot (if not already) and start persistence
+    (
+        for i in 1 2 3 4 5; do
+            if grep -q " /boot " /proc/mounts 2>/dev/null; then
+                break
+            fi
+            mount_boot_partition
+            sleep 1
+        done
+        if grep -q " /boot " /proc/mounts 2>/dev/null; then
+            persist_logs_if_possible
+        fi
+    ) &
 
     setup_network
     echo ""

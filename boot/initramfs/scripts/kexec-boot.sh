@@ -142,7 +142,7 @@ get_current_cmdline_params() {
             phase.mode=*|phase.channel=*|phase.cache=*|phase.nowrite=*)
                 params="$params $param"
                 ;;
-            console=*|root=*)
+            console=*|root=*|earlyprintk=*|video=*)
                 params="$params $param"
                 ;;
         esac
