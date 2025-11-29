@@ -1,6 +1,6 @@
 # Progress: Phase Open MVP
 
-**Last Updated**: 2025-11-27
+**Last Updated**: 2025-11-28
 **Version**: 1.0
 **Phase**: MVP Complete - Production Ready
 
@@ -193,6 +193,30 @@ Total:       ██████████  6/6 (100%) ✅ COMPLETE
 ---
 
 ## Recent Completions
+
+### 2025-11-28: Real Hardware Boot - Extensive Testing
+- ✅ **Target**: 2009 MacBook (MacBook5,2) with 32-bit EFI / 64-bit CPU
+- ✅ **Kernel boots**: Fedora 6.11.6-200.fc40.x86_64 loads and runs
+- ✅ **Hardware detected**: USB, Bluetooth, Keyboard, Trackpad, IR Receiver, iSight
+- ✅ **32-bit EFI**: Added `BOOTIA32.EFI` for older Macs (2006-2009)
+- ✅ **GRUB fix**: Added `search --set=root --file /vmlinuz` for partition discovery
+- ✅ **Static busybox**: Rebuilt initramfs with busybox-static
+- ✅ **Cross-compile fix**: Docker `--platform linux/amd64` for x86_64 binaries
+- ✅ **macOS USB workflow**: Fast copy/sync/eject commands documented
+- 🔄 **Console output**: Kernel runs, init executes, but no visible output (framebuffer issue)
+
+**Technical Discoveries**:
+1. Docker on Apple Silicon defaults to ARM64 - must use `--platform linux/amd64`
+2. Error -8 (ENOEXEC) = wrong architecture binary
+3. Error 0x00007f00 = exit code 127 (command not found)
+4. busybox-static lacks `cttyhack` applet
+5. System is alive (responds to USB events) even without console output
+
+**macOS USB Quick-Update Command**:
+```bash
+# One-liner: wait for USB, copy, sync, eject
+for i in 1 2 3 4 5; do [ -d /Volumes/PHASEBOOT ] && cp build/fedora-initramfs-x86_64.img /Volumes/PHASEBOOT/initramfs.img && sync && diskutil eject disk21 && break; sleep 2; done
+```
 
 ### 2025-11-27: x86_64 USB Boot Image Complete!
 - ✅ **Fedora x86_64 kernel**: 6.11.6-200.fc40.x86_64 (16MB) with kexec support

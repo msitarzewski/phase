@@ -106,6 +106,31 @@ November 2025 was exceptionally productive - **completed ALL FOUR MVP milestones
 
 ## Tasks Completed (This Month)
 
+### 2025-11-28: Real x86_64 Hardware Boot Testing
+**Type**: Hardware Testing & Debugging
+**Objective**: Boot Phase Boot on real x86_64 hardware (2009 MacBook)
+
+**Completed**:
+- ✅ Kernel boots successfully on 2009 MacBook (MacBook5,2)
+- ✅ Solved 32-bit EFI on 64-bit CPU challenge (BOOTIA32.EFI)
+- ✅ Fixed GRUB root partition discovery (`search --set=root --file /vmlinuz`)
+- ✅ Discovered Docker cross-compilation issue (ARM64 vs x86_64)
+- ✅ Documented macOS USB quick-update workflow
+- ✅ Multiple init debugging attempts with various console approaches
+
+**Technical Discoveries**:
+- Docker on Apple Silicon defaults to ARM64: use `--platform linux/amd64`
+- Exit code -8 (ENOEXEC) = wrong architecture binary
+- Exit code 0x00007f00 = 127 (command not found)
+- busybox-static lacks `cttyhack` applet for TTY setup
+- 2006-2009 Intel Macs have 32-bit EFI despite 64-bit CPU
+
+**Status**: Kernel runs, hardware detected, init executes but no visible console output (framebuffer issue)
+
+**See**: [271127_fedora_kexec_success.md](./271127_fedora_kexec_success.md#phase-4-real-x86_64-hardware-test-2025-11-28)
+
+---
+
 ### 2025-11-09: Milestone 1 Complete - Local WASM Execution
 **Type**: Implementation & Testing
 **Objective**: Complete Milestone 1 - Enable plasmd daemon to execute WASM modules locally
@@ -330,6 +355,34 @@ See detailed documentation: [091109_milestone1_local_wasm_execution.md](./091109
 **Impact**: Clean architecture, reusable library, zero warnings, zero tech debt
 
 **See**: [091109_library_binary_refactor.md](./091109_library_binary_refactor.md)
+
+### 2025-11-28: Real x86_64 Hardware Boot Test
+**Type**: Hardware Validation
+**Objective**: Boot Phase Boot on real x86_64 hardware (2009 MacBook)
+
+**Completed**:
+- ✅ **Target hardware**: 2009 MacBook (MacBook5,2) with 32-bit EFI / 64-bit CPU
+- ✅ **32-bit EFI support**: Added `BOOTIA32.EFI` (2.6MB) for older Macs
+- ✅ **GRUB root search**: Added `search --set=root --file /vmlinuz` for partition discovery
+- ✅ **Static initramfs**: Rebuilt with busybox-static + musl library for kexec
+- ✅ **Kernel boots**: Fedora 6.11.6-200.fc40.x86_64 starts successfully
+- ✅ **Hardware detected**: USB hub, Bluetooth, IR Receiver, Internal Keyboard/Trackpad
+- 🔄 **In progress**: Debugging init console output
+
+**Key Learnings**:
+- 2006-2009 Intel Macs have 32-bit EFI despite 64-bit CPU
+- GRUB needs explicit search to find USB root partition
+- Static linking essential for minimal initramfs (no libc available)
+- PID 1 needs explicit console redirect on real hardware
+
+**Files Modified**:
+- `boot/build/fedora-initramfs-x86_64.img` - Rebuilt with static busybox
+- USB `/EFI/BOOT/BOOTIA32.EFI` - Added 32-bit EFI loader
+- USB `/EFI/BOOT/BOOTX64.EFI` - Updated with root search
+
+**Impact**: First successful kernel boot on real hardware - major milestone!
+
+**See**: [271127_fedora_kexec_success.md](./271127_fedora_kexec_success.md)
 
 ### 2025-11-27: x86_64 USB Boot Image
 **Type**: Feature Implementation
