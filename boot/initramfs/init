@@ -27,8 +27,6 @@ PHASE_PROVIDER=""  # Direct provider URL (e.g., http://192.168.2.1:8080)
 #------------------------------------------------------------------------------
 
 mount_essential() {
-    echo "Mounting essential filesystems..."
-
     # Create mount points if they don't exist
     [ -d /proc ] || mkdir -p /proc
     [ -d /sys ]  || mkdir -p /sys
@@ -51,7 +49,13 @@ mount_essential() {
     # /tmp - Temporary files
     mount -t tmpfs -o nosuid,nodev tmpfs /tmp
 
-    echo "Essential filesystems mounted."
+    # Use kernel log for visible output (shows on console like kernel messages)
+    echo "<6>PHASE_BOOT: mount_essential complete" > /dev/kmsg 2>/dev/null || true
+}
+
+# Log to kernel ring buffer - WILL show on console
+klog() {
+    echo "<6>PHASE_BOOT: $1" > /dev/kmsg 2>/dev/null || true
 }
 
 #------------------------------------------------------------------------------
@@ -103,38 +107,13 @@ parse_cmdline() {
 }
 
 #------------------------------------------------------------------------------
-# Set Up Console
+# Set Up Console - DISABLED for 2009 MacBook compatibility
 #------------------------------------------------------------------------------
 
 setup_console() {
-    echo "Setting up console..."
-
-    CONSOLE_DEV=""
-    for dev in /dev/console /dev/tty0 /dev/ttyS0; do
-        if [ -c "$dev" ]; then
-            CONSOLE_DEV="$dev"
-            break
-        fi
-    done
-
-    # Bind stdin to a real console if available
-    if [ -n "$CONSOLE_DEV" ]; then
-        exec 0<"$CONSOLE_DEV"
-    fi
-
-    # Always append to log; mirror to console if present
-    if [ -n "$CONSOLE_DEV" ]; then
-        tail -f "$LOG_FILE" > "$CONSOLE_DEV" 2>/dev/null &
-    fi
-    exec >>"$LOG_FILE" 2>&1
-
-    # Fallback stdin if no console was found
-    if [ -z "$CONSOLE_DEV" ]; then
-        exec 0</dev/null
-    fi
-
-    # Set up job control for the shell
-    setsid sh -c 'exec sh </dev/console >/dev/console 2>&1' || true
+    # No-op: Any exec redirects cause hangs on vintage Mac hardware
+    # The kernel already routes stdout/stderr to the console
+    :
 }
 
 #------------------------------------------------------------------------------
@@ -145,18 +124,25 @@ mount_boot_partition() {
     BOOT_MOUNT="/boot"
     mkdir -p "$BOOT_MOUNT"
 
-    # Try multiple times in case the device appears late
-    for attempt in 1 2 3 4 5; do
-        # Preferred: by-label
-        if [ -e /dev/disk/by-label/PHASEBOOT ]; then
-            if mount -t vfat -o rw /dev/disk/by-label/PHASEBOOT "$BOOT_MOUNT" 2>/dev/null; then
-                echo "Boot partition mounted at /dev/disk/by-label/PHASEBOOT (attempt $attempt)"
-                return 0
-            fi
-        fi
+    # Log available block devices for debugging
+    echo "Available block devices:"
+    ls -la /dev/sd* /dev/hd* /dev/vd* /dev/nvme* /dev/mmcblk* 2>/dev/null || echo "  (none found with standard names)"
+    cat /proc/partitions 2>/dev/null | head -20
 
-        # Fallback scan of common USB devices
-        for dev in /dev/sd[a-d][1-3]; do
+    # Try multiple times in case the device appears late
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        # Try ALL possible device patterns (expanded for old Macs)
+        for dev in \
+            /dev/sda1 /dev/sda2 /dev/sda \
+            /dev/sdb1 /dev/sdb2 /dev/sdb \
+            /dev/sdc1 /dev/sdc2 /dev/sdc \
+            /dev/sdd1 /dev/sdd2 /dev/sdd \
+            /dev/hda1 /dev/hda2 /dev/hda \
+            /dev/hdb1 /dev/hdb2 /dev/hdb \
+            /dev/vda1 /dev/vda2 \
+            /dev/nvme0n1p1 /dev/nvme0n1p2 \
+            /dev/mmcblk0p1 /dev/mmcblk0p2
+        do
             [ -e "$dev" ] || continue
             if mount -t vfat -o rw "$dev" "$BOOT_MOUNT" 2>/dev/null; then
                 echo "Boot partition mounted at $dev (attempt $attempt)"
@@ -167,7 +153,7 @@ mount_boot_partition() {
         sleep 1
     done
 
-    echo "Boot partition not mounted (optional)."
+    echo "Boot partition not mounted after 10 attempts."
     return 1
 }
 
@@ -548,59 +534,49 @@ EOF
 #------------------------------------------------------------------------------
 
 main() {
-    # Clear screen for clean boot
-    clear 2>/dev/null || true
-
-    echo "Phase Boot initializing..."
-    echo ""
+    klog "=== PHASE BOOT STARTING ==="
 
     # Execute initialization steps
     mount_essential
-    echo ""
+    klog "1-filesystems mounted"
 
-    # Initialize logging immediately (before modules/console)
-    LOG_FILE="/run/phase-init.log"
-    touch "$LOG_FILE" 2>/dev/null || true
-    chmod 600 "$LOG_FILE" 2>/dev/null || true
-    echo "[init] phase-init starting..." >> "$LOG_FILE"
-    sync
-
-    # Try to mount boot early so we can copy a first log snapshot even if we hang later
+    # Try to mount boot partition for marker files
     mount_boot_partition
     if grep -q " /boot " /proc/mounts 2>/dev/null; then
-        cp "$LOG_FILE" /boot/phase-init.log 2>/dev/null || true
-        sync || true
+        klog "2-boot partition mounted OK"
+    else
+        klog "2-boot partition FAILED to mount"
     fi
 
+    # Helper to write markers (silent, best-effort)
+    marker() {
+        if grep -q " /boot " /proc/mounts 2>/dev/null; then
+            echo "$1: $(date 2>/dev/null || echo 'ok')" >> /boot/MARKERS.txt
+            sync 2>/dev/null || true
+        fi
+    }
+
+    marker "1-MOUNT_ESSENTIAL_DONE"
+
     parse_cmdline
-    echo ""
+    klog "3-cmdline parsed mode=$PHASE_MODE"
+    marker "3-CMDLINE_PARSED"
 
     load_modules
-    echo ""
+    klog "4-modules loaded"
+    marker "4-MODULES_LOADED"
 
     setup_console
-    echo ""
+    klog "5-console setup"
+    marker "5-CONSOLE_SETUP"
 
-    # If boot is mounted, start periodic persistence after console attach
     persist_logs_if_possible
-    echo ""
-
-    # Background retry to mount boot (if not already) and start persistence
-    (
-        for i in 1 2 3 4 5; do
-            if grep -q " /boot " /proc/mounts 2>/dev/null; then
-                break
-            fi
-            mount_boot_partition
-            sleep 1
-        done
-        if grep -q " /boot " /proc/mounts 2>/dev/null; then
-            persist_logs_if_possible
-        fi
-    ) &
+    klog "6-persist started"
+    marker "6-PERSIST_STARTED"
 
     setup_network
-    echo ""
+    klog "7-network setup"
+    marker "7-NETWORK_SETUP"
 
     # Check for direct provider URL first (phase.provider=URL)
     if [ -n "$PHASE_PROVIDER" ]; then
@@ -649,12 +625,94 @@ main() {
     echo ""
 
     print_banner
+    klog "8-ready for shell"
+    marker "8-READY_FOR_SHELL"
 
-    echo "Starting interactive shell..."
-    echo ""
+    klog "=== RUNNING DIAGNOSTICS ==="
 
-    # Execute shell as PID 1
-    exec /bin/sh
+    # Load modules in dependency order for USB storage
+    klog "Loading storage modules..."
+
+    # SCSI core first (required by sd_mod, usb-storage)
+    for mod in scsi_mod; do
+        modprobe $mod 2>/dev/null && klog "Loaded: $mod"
+    done
+
+    # USB host controllers (OHCI for 2009 Mac)
+    for mod in ohci_hcd ohci_pci ehci_hcd ehci_pci uhci_hcd; do
+        modprobe $mod 2>/dev/null && klog "Loaded: $mod"
+    done
+
+    # USB storage
+    for mod in usb_storage uas; do
+        modprobe $mod 2>/dev/null && klog "Loaded: $mod"
+    done
+
+    # SCSI disk
+    for mod in sd_mod; do
+        modprobe $mod 2>/dev/null && klog "Loaded: $mod"
+    done
+
+    # SATA (for internal drive)
+    for mod in libata ahci; do
+        modprobe $mod 2>/dev/null && klog "Loaded: $mod"
+    done
+
+    # Wait for USB to settle
+    klog "Waiting 5s for USB devices..."
+    sleep 5
+
+    # Show partition info
+    klog "--- /proc/partitions ---"
+    cat /proc/partitions | while read line; do
+        klog "PART: $line"
+    done
+
+    # Show block devices
+    klog "--- block devices in /dev ---"
+    ls /dev/sd* /dev/hd* /dev/vd* 2>/dev/null | while read dev; do
+        klog "DEV: $dev"
+    done
+
+    # Try to find and mount USB (not sda which is internal)
+    klog "--- trying to mount non-sda devices ---"
+    for dev in /dev/sdb1 /dev/sdb /dev/sdc1 /dev/sdc; do
+        if [ -e "$dev" ]; then
+            klog "Found: $dev - trying mount"
+            if mount -t vfat "$dev" /boot 2>/dev/null; then
+                klog "SUCCESS: mounted $dev at /boot"
+                echo "BOOT_SUCCESS $(date)" > /boot/MARKERS.txt
+                sync
+                break
+            fi
+        fi
+    done
+
+    # Check if boot mounted
+    if grep -q " /boot " /proc/mounts; then
+        klog "Boot partition: MOUNTED"
+    else
+        klog "Boot partition: NOT MOUNTED"
+    fi
+
+    klog "=== DIAGNOSTICS COMPLETE ==="
+
+    # Try to start shell with proper tty - if it fails, keep init alive
+    if [ -c /dev/tty0 ]; then
+        klog "Trying shell on /dev/tty0"
+        setsid sh -c 'exec sh </dev/tty0 >/dev/tty0 2>&1' &
+    elif [ -c /dev/console ]; then
+        klog "Trying shell on /dev/console"
+        setsid sh -c 'exec sh </dev/console >/dev/console 2>&1' &
+    else
+        klog "No tty available for shell"
+    fi
+
+    # Keep init alive (PID 1 must not exit)
+    klog "Init staying alive - system ready"
+    while true; do
+        sleep 60
+    done
 }
 
 #------------------------------------------------------------------------------

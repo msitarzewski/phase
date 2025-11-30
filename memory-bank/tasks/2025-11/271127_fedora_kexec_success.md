@@ -476,3 +476,126 @@ qemu-system-x86_64 -m 1024 \
 4. Documented macOS USB workflow for rapid iteration
 
 This is the foundation for the Phase distributed compute network.
+
+---
+
+## Phase 6: Console Output Breakthrough (2025-11-29)
+
+### The Problem
+Init was running but producing no visible output on 2009 MacBook. The kernel console worked (boot messages visible), but init's stdout/stderr weren't reaching the display.
+
+### Discovery: klog() via /dev/kmsg
+Writing to `/dev/kmsg` injects messages into the kernel ring buffer, which DOES show on the console:
+
+```bash
+klog() {
+    echo "<6>PHASE_BOOT: $1" > /dev/kmsg 2>/dev/null || true
+}
+```
+
+This gave us visibility into init execution for the first time on real hardware.
+
+### Attempts That Failed
+
+| Attempt | Approach | Result |
+|---------|----------|--------|
+| 1 | `exec >/dev/console 2>&1` at script start | System freeze (devtmpfs not mounted yet) |
+| 2 | `exec >/dev/console` after devtmpfs mount | System freeze |
+| 3 | Complex log file + tail mirroring | No output visible |
+| 4 | Redirect to /dev/tty0 | No output visible |
+
+### Solution: No exec redirects at all
+The kernel already routes init's output somewhere - any `exec >` redirect breaks it on this hardware. Let the kernel handle console routing.
+
+### Shell Crash → Kernel Panic
+When init reached `exec /bin/sh`, the shell started but immediately crashed, killing PID 1 and causing kernel panic.
+
+**Fix**: Spawn shell in background, keep init alive:
+```bash
+setsid sh -c 'exec sh </dev/tty0 >/dev/tty0 2>&1' &
+while true; do sleep 60; done
+```
+
+### Kernel/Module Version Mismatch
+
+**Problem**: USB drive not appearing as block device after boot.
+
+| Kernel | Modules | Result |
+|--------|---------|--------|
+| Fedora 6.11.6 | Alpine 6.12.59 | Modules won't load (version mismatch) |
+| Alpine 6.12.59 | Alpine 6.12.59 | Modules load but USB still missing |
+
+**Root cause**: Alpine kernel is minimal - USB storage requires modules that weren't included.
+
+### Module Dependencies for USB Storage
+
+For USB mass storage to work on 2009 MacBook, need these modules in dependency order:
+
+```
+1. scsi_mod          (SCSI core - required by sd_mod, usb_storage)
+2. ohci_hcd          (USB 1.1 host controller)
+3. ohci_pci          (OHCI PCI driver - 2009 Mac uses this!)
+4. ehci_hcd          (USB 2.0 host controller)
+5. ehci_pci          (EHCI PCI driver)
+6. usb_storage       (USB mass storage)
+7. uas               (USB Attached SCSI)
+8. sd_mod            (SCSI disk driver)
+```
+
+**Why USB disappears after EFI boot**:
+1. EFI firmware loads GRUB from USB
+2. GRUB loads kernel + initramfs into RAM
+3. Kernel runs entirely from RAM
+4. USB is "released" - kernel needs modules to see it again!
+
+### Current Initramfs Modules (20 total)
+
+```
+af_packet, scsi_mod, sd_mod, usb_storage, uas,
+ehci_hcd, ehci_pci, ohci_hcd, ohci_pci, uhci_hcd,
+libata, ahci, virtio, virtio_ring, virtio_pci,
+virtio_pci_modern_dev, virtio_pci_legacy_dev,
+virtio_net, failover, net_failover
+```
+
+### Boot Progress Achieved
+
+```
+[  0.89] Run /init as init process
+[  0.90] PHASE_BOOT: mount_essential complete
+[  0.90] PHASE_BOOT: 1-filesystems mounted
+[ 10.92] PHASE_BOOT: 2-boot partition FAILED to mount
+[ 10.93] PHASE_BOOT: 3-cmdline parsed mode=internet
+[ 12.99] PHASE_BOOT: 4-modules loaded
+[ 13.00] PHASE_BOOT: 5-console setup
+[ 13.00] PHASE_BOOT: 6-persist started
+[ 13.00] PHASE_BOOT: 7-network setup
+[ 13.01] PHASE_BOOT: 8-ready for shell
+[ 13.01] PHASE_BOOT: === RUNNING DIAGNOSTICS ===
+...
+BusyBox v1.30.1 built-in shell (ash)
+/ # _
+```
+
+**All 8 init stages complete!** Shell running (though no keyboard input yet).
+
+### Key Technical Wins
+
+1. **klog() for visibility**: `/dev/kmsg` works when stdout doesn't
+2. **Shell spawn pattern**: Background shell + init sleep loop prevents panic
+3. **Module dependencies**: Full USB stack requires scsi_mod → ohci/ehci → usb_storage → sd_mod
+4. **Kernel matching**: Must use kernel that matches module versions
+5. **EFI boot quirk**: USB "disappears" after boot, needs modules to reappear
+
+### Remaining Issues
+
+1. **USB mount**: Modules loading but USB still not appearing (may need more modules or timing)
+2. **Keyboard input**: Shell runs but no input (tty not connected to keyboard)
+3. **Internal HDD**: Also not appearing (same module issue)
+
+### Files Modified
+
+- `boot/initramfs/init` - Added klog(), fixed shell spawn, module loading order
+- `boot/build/initramfs/initramfs-x86_64.img` - Now 1.9MB with 20 modules
+
+---

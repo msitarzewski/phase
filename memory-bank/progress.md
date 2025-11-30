@@ -1,6 +1,6 @@
 # Progress: Phase Open MVP
 
-**Last Updated**: 2025-11-28
+**Last Updated**: 2025-11-29
 **Version**: 1.0
 **Phase**: MVP Complete - Production Ready
 
@@ -194,10 +194,30 @@ Total:       ██████████  6/6 (100%) ✅ COMPLETE
 
 ## Recent Completions
 
+### 2025-11-29: Console Output Breakthrough - Real Hardware Boot Success!
+- ✅ **klog() discovery**: Writing to `/dev/kmsg` shows output on console when stdout fails
+- ✅ **All 8 init stages complete**: Mount → Parse → Modules → Console → Network → Shell
+- ✅ **Shell running**: BusyBox prompt visible on 2009 MacBook hardware!
+- ✅ **Shell crash fix**: `exec /bin/sh` caused kernel panic; fixed with background spawn + init loop
+- ✅ **Kernel/module mismatch solved**: Must use matching kernel+modules (Alpine 6.12.59)
+- ✅ **USB storage modules added**: scsi_mod, ohci_hcd, ehci_hcd, usb_storage, uas, sd_mod (20 modules total)
+- 🔄 **USB mount pending**: Modules load but USB not appearing yet (may need more dependencies)
+- 🔄 **Keyboard input pending**: Shell runs but tty not connected to keyboard
+
+**Key Technical Discoveries**:
+1. `exec >/dev/console` freezes system - let kernel handle routing
+2. EFI boot loads kernel to RAM, USB "disappears" - needs modules to reappear
+3. 2009 Mac uses OHCI (USB 1.1) controller - needs ohci_hcd + ohci_pci
+4. Module load order matters: scsi_mod → USB HCD → usb_storage → sd_mod
+
+**klog() Pattern** (shows in kernel log):
+```bash
+klog() { echo "<6>PHASE_BOOT: $1" > /dev/kmsg 2>/dev/null || true; }
+```
+
 ### 2025-11-29: Console Logging Hardening + x86_64 QEMU Verification
 - ✅ Added aggressive console/earlyprintk params and init-time logging to `/run/phase-init.log` with periodic sync to ESP; retries mounting PHASEBOOT up to 5x `boot/initramfs/init:150-183,561-600`.
 - ✅ Confirmed Phase Boot boots cleanly in QEMU x86_64 with Alpine 6.12.59-lts kernel using `initramfs-x86_64.img`; shell reachable over serial (`-serial mon:stdio`) with logs present.
-- 🔄 MacBook hardware still halts pre-log on-screen; next step is to test updated initramfs on USB and inspect `/phase-init.log` or try `init=/bin/sh nomodeset` on that hardware.
 
 ### 2025-11-28: Real Hardware Boot - Extensive Testing
 - ✅ **Target**: 2009 MacBook (MacBook5,2) with 32-bit EFI / 64-bit CPU
