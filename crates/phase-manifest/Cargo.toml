@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "phase-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Signed manifests generic over payload type — SignedManifest<T> for any Phase job specification or artifact descriptor."
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[dependencies]
+# Reuses the Ed25519 signing primitives from phase-identity so the workspace
+# stays on a single ed25519-dalek version.
+phase-identity = { path = "../phase-identity", version = "0.1.0" }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+
+# Wire format. SignedManifest payloads are JSON; signing message uses a
+# canonicalised representation (sorted keys, no whitespace).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Timestamps (created_at / expires_at). Match daemon's chrono usage so a
+# manifest produced by phase-manifest is interchangeable with the legacy
+# daemon manifests.
+chrono = { version = "0.4", features = ["serde"] }
+
+# Stable manifest hash for use as a JobId / content address.
+sha2 = "0.10"
+
+# Stable error type without forcing anyhow on consumers.
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "phase-artifact-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Content-addressed HTTP server for distributing any signed blob across the Phase network."
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[dependencies]
+# Sibling Phase library crates. phase-manifest supplies the generic
+# SignedManifest<T> wrapper that consumers wrap their own payload types in
+# before publishing them through this server. phase-net supplies the
+# libp2p::kad::RecordKey used by the DHT advertisement helper.
+phase-manifest = { path = "../phase-manifest", version = "0.1.0" }
+phase-net = { path = "../phase-net", version = "0.1.0" }
+
+# Networking — libp2p only used by the dht module for RecordKey construction;
+# request/response and swarm machinery lives in phase-net so we don't drag
+# the full libp2p feature set into here.
+libp2p = { version = "0.56", features = ["kad"] }
+
+# HTTP server stack. axum 0.7 matches the daemon's pre-extraction version so
+# the wire format and Range / 206 / Content-Range header layout stay
+# byte-identical to the pre-M6 server.
+axum = { version = "0.7", features = ["tokio", "http1", "http2"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+
+# Async runtime + streaming reader for Range responses.
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Serialization. JSON responses + DHT record bytes.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Hashing — SHA-256 of blob contents drives the blob_id content-address layout.
+sha2 = "0.10"
+hex = "0.4"
+
+# Timestamps — DHT records carry ISO 8601 created_at + ttl_secs.
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling.
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging.
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.0"
+reqwest = { version = "0.12", features = ["blocking", "json"] }

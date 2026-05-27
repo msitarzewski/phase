@@ -1,0 +1,204 @@
+release: lucid
+version: "0.1.0"
+status: software-complete
+released_on: "2026-05-27"
+owner: Michael S.
+license: AGPL-3.0-or-later
+tagline: Open inference, on the public's hardware, that can't be turned off.
+
+status_detail: |
+  Software complete: M1, M2, M5, M6, M7 fully shipped; M4 demo-sufficient
+  (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/version`);
+  M3 (`MlxWorker`) deferred to v0.1.1; M8 (live two-node demo) is software-ready
+  but hardware-blocked. 210 tests passing workspace-wide; clippy clean with
+  `-D warnings`.
+
+description: |
+  New Phase node implementation focused on open GPU inference. Exposes
+  Ollama-compatible API on :11434, runs llama.cpp / MLX backends locally,
+  routes overflow requests across the Phase DHT to peers with the requested
+  model loaded. Existing AI tooling (Open WebUI, Continue, Cursor, LangChain,
+  opencode, raw curl) works unmodified — LUCID presents as a local Ollama
+  instance.
+
+platforms:
+  - macos-arm64           # MLX backend
+  - linux-x86_64-cuda     # NVIDIA via llama.cpp
+  - linux-x86_64-rocm     # AMD via llama.cpp
+  - linux-arm64           # CPU fallback + future Mali/Adreno
+  - windows-cuda          # WSL2 or native
+
+backends:
+  v0_1:
+    - LlamaCppWorker      # Cross-vendor GPU via llama-server subprocess
+    - MlxWorker           # Apple Silicon native (subprocess to mlx-lm in v0.1)
+  v0_2:
+    - ExoProxyWorker      # Multi-node sharded inference for big MoE models
+
+api_surfaces:
+  v0_1:
+    - ollama              # :11434, drop-in Ollama API compatibility
+  later:
+    - openai              # :8000, OpenAI-compatible
+    - llama_server        # llama.cpp's native server API
+
+dependencies:
+  required_releases:
+    - phase-core          # M1-M8 must complete first
+  upstream_tools:
+    - llama.cpp (llama-server binary, built with platform GPU support)
+    - mlx-lm (Python, v0.1 subprocess mode for MLX backend)
+  phase_crates:
+    - phase-net
+    - phase-identity
+    - phase-manifest
+    - phase-receipt
+    - phase-protocol
+    - phase-artifact-server
+
+milestones:
+  - id: M1
+    name: Workspace Scaffold
+    description: crates/lucidd/ inside Phase monorepo; depends on phase-* crates via path
+    status: complete
+    tasks_dir: tasks/M1
+    deliverables:
+      - crates/lucidd/Cargo.toml with AGPL-3.0 license declaration
+      - Empty Worker trait wiring against phase-protocol
+      - cargo build -p lucidd succeeds (no functional code yet)
+      - SPDX headers per file
+
+  - id: M2
+    name: LlamaCppWorker
+    description: Shell out to llama-server, sign receipts, serve over Phase protocol
+    status: complete
+    tasks_dir: tasks/M2
+    deliverables:
+      - LlamaCppWorker struct managing llama-server subprocess
+      - impl Worker for LlamaCppWorker, supports JobSpec::Inference
+      - SignedReceipt generation per inference response
+      - Auto-restart on subprocess crash
+      - Tests against a stub local llama-server
+
+  - id: M3
+    name: MlxWorker
+    description: Native Apple Silicon inference via MLX
+    status: deferred-v0_1_1
+    tasks_dir: tasks/M3
+    deliverables:
+      - MlxWorker struct with mlx-lm subprocess management (v0.1)
+      - impl Worker for MlxWorker, supports JobSpec::Inference
+      - Platform detection (only available on macOS ARM64)
+      - Tests on Apple Silicon hardware (will require local test rig)
+
+  - id: M4
+    name: Ollama API Surface
+    description: :11434 HTTP server with Ollama-compatible endpoints
+    status: demo-sufficient
+    notes_v0_1: "/api/chat, /api/generate, /api/tags, /api/show, /api/version implemented. /api/embeddings + /api/pull deferred to v0.1.1."
+    tasks_dir: tasks/M4
+    deliverables:
+      - axum server bound to :11434 (configurable)
+      - GET /api/tags - list available models
+      - POST /api/chat - chat completion (streaming via SSE)
+      - POST /api/generate - text completion (streaming via SSE)
+      - POST /api/embeddings - embedding generation
+      - POST /api/pull - model pull (subscribes to DHT entry; doesn't download by default)
+      - GET /api/show - model info
+      - Drop-in tested against at least one existing client (Open WebUI or Continue)
+
+  - id: M5
+    name: Local-or-DHT Router
+    description: Per-request decision - local if fits, else DHT lookup
+    status: complete
+    notes_v0_1: "Peer relay via /phase/job-relay/1.0.0 (libp2p request_response, CBOR). Batch-shaped (full Vec<JobEvent> in one response); token streaming across the relay is a v0.2 target. Also added get_kad_record to phase-net + refactored publish_kad_record to &self."
+    tasks_dir: tasks/M5
+    deliverables:
+      - Router decides per-request: local worker vs peer route
+      - Local fits-in-VRAM check before dispatch
+      - DHT peer lookup via phase-net for non-local models
+      - Streaming relay from peer to client (token-by-token via SSE)
+      - Routing-decision header in response (X-Lucid-Routed-Via)
+      - Fallback chain: local → peer → error (or configured OpenAI key)
+
+  - id: M6
+    name: Model Registry
+    description: DHT advertisement of loaded models
+    status: complete
+    notes_v0_1: "SignedModelAdvertisement (bincode + Ed25519), key b\"phase/model/\" || model_cid, 15min TTL with 5min refresh. Cross-peer model_id->cid index NOT built; find_peers_by_model_id resolves names via local loaded set only — v0.2 target."
+    tasks_dir: tasks/M6
+    deliverables:
+      - DHT record schema (model_cid, peer_id) → ModelCapabilities
+      - ModelCapabilities: model_id, quantization, context_length, max_concurrent
+      - Advertise on model load, withdraw on unload
+      - TTL refresh while loaded
+      - Survives daemon restart (uses persistent identity from phase-identity)
+
+  - id: M7
+    name: Policy + Auto-Pause (replaces "Privacy Surface" framing)
+    description: Declarative lucid-policy.toml + auto-pause on battery/thermal/time/manual; X-Lucid-Local-Only + X-Lucid-Routed-Via headers; zero telemetry
+    status: complete
+    notes_v0_1: "PolicyEngine refuses self-traffic when on battery by default (operator sovereignty); v0.1.1 may add 'self-traffic always allowed' knob. Privacy headers landed in M5 (router) since they sit on the request path."
+    tasks_dir: tasks/M7
+    deliverables:
+      - X-Lucid-Local-Only request header honored (refuses to route)
+      - X-Lucid-Routed-Via response header (local | peer-id)
+      - --help and README clearly state per-request privacy posture
+      - Audit: zero outbound calls beyond Phase DHT and configured llama-server/mlx subprocess
+      - Logging configurable; prompts not logged by default on peer side
+
+  - id: M8
+    name: End-to-End Demo
+    description: Two-node demo with model loaded on one, request from the other
+    status: blocked-hardware
+    notes_v0_1: "Software ready. Needs Machine A (Linux + 24GB+ NVIDIA GPU + real llama-server + GGUF model) and Machine B (any second Linux machine), Tailscale-bridged or real WAN. Demo recipe in memory-bank/tasks/2026-05/README.md#lucid-m8."
+    tasks_dir: tasks/M8
+    deliverables:
+      - Two machines on different networks (test via Tailscale or two real internet hops)
+      - Machine A loads a model (e.g., Qwen3-Next 80B)
+      - Machine B has lucidd running but no model loaded
+      - curl http://localhost:11434/api/chat on B returns A's output
+      - Response includes A's SignedReceipt
+      - Receipt verifies independently against A's published Ed25519 public key
+      - Demo screencast / asciinema for the eventual launch announcement
+
+acceptance_criteria:
+  - curl http://localhost:11434/api/chat works with Ollama's JSON contract
+  - Local inference byte-identical to direct llama-server
+  - DHT-routed inference returns signed receipts linking request → peer → model_cid → output hash
+  - Two-node demo passes end-to-end
+  - Local-only mode honored — requests flagged private never leave the local machine
+  - At least one existing client (Open WebUI / Continue / Cursor / Zed) works unmodified
+  - No telemetry — audit confirms zero outbound calls outside Phase DHT and configured inference subprocess
+  - AGPL-3.0 declared in crates/lucidd/Cargo.toml
+
+out_of_scope_v0_1:
+  - Multi-node sharding for big MoE models (v0.2)
+  - Onion-routing / split-prompt privacy (v0.3, committed)
+  - Payment rails, KYC, marketplace (never — see MISSION.md)
+  - OpenAI / llama-server API surfaces (later releases)
+  - Fine-tuning, image generation, embeddings beyond Ollama API exposure
+
+trust_model_summary: |
+  Today, routed requests are visible to the peer serving them. LUCID is for
+  workloads you would be okay running on a friend's GPU. Sensitive work runs
+  local-only. v0.3 commits to cryptographic privacy (split-prompt /
+  onion-routing) so the "friend's GPU" assumption becomes unnecessary. We
+  ship the honest version first.
+
+risks:
+  - id: latency-wan
+    description: First-token latency over WAN routing kills UX
+    mitigation: Stream tokens via peer; document expectations; local-only fast path
+  - id: privacy-perception
+    description: Per-request prompt privacy concerns kill adoption
+    mitigation: Honest disclosure from v0.1; local-only toggle prominent; no telemetry
+  - id: abuse-launch
+    description: Network weaponized for abuse on launch
+    mitigation: Soft launch with peer allowlist; community moderation before public DHT bootstrap
+  - id: model-spoofing
+    description: Model CID collisions or fake-model attacks
+    mitigation: Ed25519 signatures over weights at advertise time; hash verification at request time
+  - id: ollama-drift
+    description: Ollama API surface moves faster than LUCID can track
+    mitigation: Pin to specific API version; document drift; refactor when forced

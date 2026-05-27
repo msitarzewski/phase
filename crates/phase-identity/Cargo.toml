@@ -1,0 +1,20 @@
+[package]
+name = "phase-identity"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Ed25519 keypair management with persistent on-disk storage for stable Phase node identity across restarts."
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[dependencies]
+# Match the version pinned by daemon/ to avoid two ed25519-dalek versions in
+# the dep tree once daemon depends on this crate.
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["std"] }
+dirs = "5.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.0"

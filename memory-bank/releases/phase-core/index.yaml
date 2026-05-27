@@ -1,0 +1,143 @@
+release: phase-core
+version: "0.2.0"
+status: released
+released_on: "2026-05-27"
+owner: Michael S.
+
+description: |
+  In-place refactor of the existing daemon/ source tree into properly-structured
+  library crates plus a generic Worker trait. No new functional code: every line
+  either moves or generalizes. Outcome is a Cargo workspace of publishable
+  library crates (phase-net, phase-identity, phase-manifest, phase-receipt,
+  phase-protocol, phase-artifact-server) and a repositioned plasm reference
+  WASM node at crates/plasm/. Unblocks the LUCID flagship and any future
+  Phase node implementation.
+
+platforms:
+  - macos-arm64
+  - linux-x86_64
+  - linux-arm64
+
+license:
+  phase_crates: Apache-2.0
+  plasm: Apache-2.0
+  lucid_crates_future: AGPL-3.0
+
+dependencies:
+  upstream: []  # pure refactor, no new upstream deps
+  downstream:
+    - lucid  # the next release depends on the crates produced here
+
+milestones:
+  - id: M1
+    name: Workspace Scaffold
+    description: Cargo workspace at repo root; empty crate skeletons with per-crate Cargo.toml; SPDX headers
+    status: complete
+    tasks_dir: tasks/M1
+    deliverables:
+      - Workspace Cargo.toml at repo root listing all crates
+      - crates/phase-net/, phase-identity/, phase-manifest/, phase-receipt/, phase-protocol/, phase-artifact-server/, plasm/ skeletons
+      - SPDX license headers per file
+      - cargo build --workspace succeeds (empty crates)
+
+  - id: M2
+    name: Extract phase-net
+    description: libp2p, Kademlia DHT, mDNS, Noise+QUIC — move from daemon/src/network/
+    status: complete
+    tasks_dir: tasks/M2
+    deliverables:
+      - Move src/network/{discovery,peer,mod}.rs into crates/phase-net/src/
+      - Generalize peer capability types (decouple from WASM-specific fields)
+      - libp2p upgrade to current stable
+      - All discovery tests pass against new crate location
+
+  - id: M3
+    name: Extract phase-identity
+    description: Ed25519 keypair management with persistent on-disk storage
+    status: complete
+    tasks_dir: tasks/M3
+    deliverables:
+      - Ed25519 keypair generation and load/save
+      - Platform-aware key location via dirs crate
+      - Migration path for existing in-memory keys (one-time generation on first run)
+      - Fix the known ephemeral-key bug from progress.md
+
+  - id: M4
+    name: Define phase-protocol
+    description: NEW crate defining JobSpec enum and Worker trait
+    status: complete
+    tasks_dir: tasks/M4
+    deliverables:
+      - JobSpec enum with Wasm and Inference variants
+      - JobSpecKind enum for dispatch
+      - Worker trait (async, returns SignedReceipt)
+      - Validation stub WasmJobSpec / InferenceJobSpec types
+      - Checkpoint review of trait shape against LUCID requirements before M5 begins
+
+  - id: M5
+    name: Extract phase-manifest and phase-receipt
+    description: Unify and generalize as SignedManifest<T> / SignedReceipt<T>
+    status: complete
+    tasks_dir: tasks/M5
+    deliverables:
+      - Consolidate src/wasm/manifest.rs and src/provider/manifest.rs into phase-manifest
+      - SignedManifest<T> generic over payload type
+      - Ed25519 signing/verification reused from phase-identity
+      - SignedReceipt<T> generic over JobResult type
+      - All existing manifest/receipt tests pass
+
+  - id: M6
+    name: Extract phase-artifact-server
+    description: Content-addressed HTTP server, generalized from boot-specific to any-blob
+    status: complete
+    tasks_dir: tasks/M6
+    deliverables:
+      - Move src/provider/{server,artifacts,metrics}.rs into crates/phase-artifact-server/
+      - Generalize artifact directory layout (was channel/arch-specific, now blob-id keyed)
+      - Range request support preserved
+      - Manifest-signing integration via phase-manifest
+
+  - id: M7
+    name: Reposition Plasm
+    description: Move existing wasmtime daemon into crates/plasm/ as a reference Phase node
+    status: complete
+    tasks_dir: tasks/M7
+    deliverables:
+      - Move src/wasm/runtime.rs and friends into crates/plasm/src/
+      - WasmtimeWorker impl Worker for JobSpec::Wasm
+      - plasmd binary produces byte-identical hello.wasm output to pre-refactor
+      - All 22 milestone-3 WASM tests pass
+
+  - id: M8
+    name: Verification & Docs
+    description: All tests pass, libp2p upgraded, README reflects new structure
+    status: complete
+    tasks_dir: tasks/M8
+    deliverables:
+      - cargo test --workspace 80+/80+ passing
+      - cargo clippy --workspace zero warnings
+      - cargo publish --dry-run succeeds for all phase-* crates
+      - Top-level README rewritten for new architecture
+      - Old daemon/ directory removed (history preserved in git)
+      - Memory Bank docs (activeContext, progress, decisions) updated
+
+acceptance_criteria:
+  - cargo build --workspace succeeds clean
+  - All 80+ existing tests pass (regressions = blockers)
+  - crates/plasm produces a plasmd binary functionally identical to pre-refactor
+  - phase-protocol supports both WasmJobSpec and InferenceJobSpec
+  - Persistent Ed25519 keypair survives daemon restart
+  - Per-crate license declarations correct (Apache-2.0 for phase-* and plasm)
+  - libp2p upgraded to current stable
+  - README and Memory Bank reflect new structure
+  - Old daemon/ directory removed from working tree
+
+crate_dependency_graph:
+  # No upward references. Build order is top to bottom.
+  - phase-identity:   []                                          # leaf
+  - phase-net:        [phase-identity]
+  - phase-manifest:   [phase-identity]
+  - phase-receipt:    [phase-identity]
+  - phase-protocol:   [phase-manifest, phase-receipt]
+  - phase-artifact-server: [phase-manifest, phase-net]
+  - plasm:            [phase-net, phase-identity, phase-manifest, phase-receipt, phase-protocol]

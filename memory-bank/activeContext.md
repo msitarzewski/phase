@@ -1,407 +1,165 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2025-11-27
-**Sprint**: Netboot Provider Implementation (Nov 2025)
-**Status**: Phase Open MVP Complete, Phase Boot Complete, Netboot Provider Complete
+**Last Updated**: 2026-05-27
+**Sprint**: LUCID inference flagship — software complete, demo hardware-blocked
+**Status**: Phase Core M1-M8 complete; LUCID M1, M2, M4 (demo-sufficient), M5, M6, M7 complete; M8 hardware-blocked.
 
 ---
 
 ## Current Focus
 
-**COMPLETED**: Netboot Provider - HTTP-based boot artifact server with DHT/mDNS advertisement.
+Phase Core and the LUCID software stack have both shipped in a single sprint. Eight crates build clean; 210 tests pass workspace-wide; zero clippy warnings on `cargo clippy --workspace --all-targets -- -D warnings`. The 0→1 live two-node demo (LUCID M8) is the only outstanding work, gated entirely on hardware acquisition (a Linux box with a 24GB+ NVIDIA card plus a second networked machine).
 
-The self-hosting loop is now possible:
 ```
-Boot from DHT → Run plasmd serve → Advertise to DHT → Serve others
+crates/
+├── phase-identity/         # Ed25519 persistent identity (substrate)
+├── phase-net/              # libp2p / Kademlia / mDNS / Noise+QUIC (substrate)
+├── phase-manifest/         # SignedManifest<T> (substrate)
+├── phase-receipt/          # SignedReceipt<T> (substrate)
+├── phase-protocol/         # Worker trait + JobSpec / JobStream (substrate)
+├── phase-artifact-server/  # Content-addressed HTTP server (substrate)
+├── plasm/                  # WasmtimeWorker — reference WASM Phase node
+└── lucidd/                 # LUCID daemon — inference Phase node (in progress)
 ```
-
-### Milestone 1: Local WASM Execution ✅ COMPLETE
-
-**Completed**: 2025-11-09
-
-**Achievements**:
-1. ✅ Rust workspace with daemon/, php-sdk/, examples/, wasm-examples/
-2. ✅ Wasmtime 15.0 runtime with resource limits and WASI support
-3. ✅ JSON schemas (manifest.schema.json, receipt.schema.json)
-4. ✅ hello.wasm example (string reversal, 84KB binary)
-5. ✅ PHP client SDK with LocalTransport + working demo
-
-**Metrics**: 10/10 tests passing, ~35ms WASM execution, ~68ms total
-
-See: [091109_milestone1_local_wasm_execution.md](tasks/2025-11/091109_milestone1_local_wasm_execution.md)
-
-### Milestone 2: Peer Discovery ✅ COMPLETE
-
-**Completed**: 2025-11-09
-
-**Achievements**:
-1. ✅ Integrated rust-libp2p 0.54 with Kademlia DHT
-2. ✅ Capability-based peer discovery (arch, CPU, memory, runtime)
-3. ✅ Job handshake protocol (JobOffer/JobResponse)
-4. ✅ Noise + QUIC encrypted transport
-5. ✅ NAT traversal awareness with QUIC assist
-6. ✅ Structured logging of peer events
-
-**Metrics**: 15 tests passing (3 new protocol tests)
-
-See: [251109_milestone2_peer_discovery.md](tasks/2025-11/251109_milestone2_peer_discovery.md)
-
-### Milestone 3: Remote Execution ✅ COMPLETE
-
-**Completed**: 2025-11-09
-
-**Achievements**:
-1. ✅ Real Ed25519 signing with ed25519-dalek (replaced mock signatures)
-2. ✅ Job protocol (JobRequest/JobResult with base64 serialization)
-3. ✅ ExecutionHandler with module hash verification and signing
-4. ✅ Async WASM runtime using tokio::spawn_blocking
-5. ✅ PHP Crypto class with sodium Ed25519 verification
-6. ✅ WASI preview1 support for WASM stdio
-
-**Metrics**: 22 tests passing, ~235ms execution, real cryptographic signatures
-
-See: [091109_milestone3_remote_execution.md](tasks/2025-11/091109_milestone3_remote_execution.md)
-
-### Phase Boot: All Milestones ✅ IMPLEMENTED
-
-**Completed**: 2025-11-26
-
-**Achievements**:
-1. ✅ **M1 - Boot Stub & Media Layout**: Makefile, ESP partition, init script, bootloader configs
-2. ✅ **M2 - Network & Discovery**: phase-discover binary, mDNS/DHT, network scripts
-3. ✅ **M3 - Verification & Fetch**: phase-verify binary, Ed25519 signatures, manifest schema
-4. ✅ **M4 - kexec Handoff & Modes**: kexec-boot.sh, overlayfs-setup.sh, mode handlers
-5. ✅ **M5 - Packaging & VM Images**: USB image builder, QCOW2 builder, release scripts
-6. ✅ **M6 - Phase/Plasma Integration**: plasmd.service, plasm-init.sh, hello-job.sh example
-7. ✅ **M7 - Documentation**: ARCHITECTURE.md, COMPONENTS.md, QUICKSTART guides, THREAT-MODEL.md, TROUBLESHOOTING.md
-
-**New Binaries**:
-- `phase-discover` - Kademlia DHT peer discovery
-- `phase-verify` - Ed25519 manifest signature verification
-- `phase-fetch` - Content-addressable artifact fetching
-
-**Boot Modes**:
-| Mode | Description |
-|------|-------------|
-| Internet | Full network, DHT discovery, downloads from web |
-| Local | LAN-only, mDNS discovery, uses cache |
-| Private | No writes, optional Tor, ephemeral identity |
-
-### Netboot Provider: All Milestones ✅ COMPLETE
-
-**Completed**: 2025-11-27
-
-**Achievements**:
-1. ✅ **M1 - HTTP Server**: axum-based server with artifact endpoints, range requests, health/status
-2. ✅ **M2 - Manifest Generation**: BootManifest schema, SHA256 hashing, Ed25519 signing
-3. ✅ **M3 - DHT/mDNS**: ManifestRecord for DHT publishing, mDNS service config
-4. ✅ **M4 - CLI**: `plasmd serve`, `provider status`, `provider list` commands
-5. ✅ **M5 - Testing**: Integration tests, arch aliasing (arm64↔aarch64), bug fixes
-6. ✅ **M6 - Documentation**: Quickstart, architecture, API reference, troubleshooting, security
-
-**Provider Module** (`daemon/src/provider/`):
-| File | Lines | Purpose |
-|------|-------|---------|
-| server.rs | 504 | HTTP server with axum |
-| manifest.rs | 549 | Boot manifest schema |
-| artifacts.rs | 286 | Artifact storage, arch aliasing |
-| signing.rs | 243 | Ed25519 signing |
-| generator.rs | 221 | Manifest generation |
-| dht.rs | 142 | DHT record types |
-| mdns.rs | 222 | mDNS service config |
-| metrics.rs | 113 | Request metrics |
-| config.rs | 176 | Provider configuration |
-
-**New CLI Commands**:
-```bash
-plasmd serve [OPTIONS]          # Start boot artifact provider
-plasmd provider status          # Query provider status
-plasmd provider list            # List available artifacts
-```
-
-**HTTP Endpoints**:
-| Endpoint | Description |
-|----------|-------------|
-| GET / | Provider info (name, version, uptime) |
-| GET /health | Health check (200/503) |
-| GET /status | Detailed status with metrics |
-| GET /manifest.json | Boot manifest for default channel/arch |
-| GET /:channel/:arch/manifest.json | Channel-specific manifest |
-| GET /:channel/:arch/:artifact | Download artifact (Range supported) |
-
-**Current Blocker**: None
 
 ---
 
-## Current Sprint Backlog
+## Phase Core COMPLETE (May 2026)
 
-### Completed (Phase Boot)
-- [x] M1: Boot stub, Makefile, ESP partition, init script
-- [x] M2: Network bring-up, mDNS discovery, DHT integration
-- [x] M3: Manifest schema, Ed25519 verification, phase-verify binary
-- [x] M4: kexec orchestration, overlayfs setup, mode handlers
-- [x] M5: USB image builder, QCOW2 builder, release scripts
-- [x] M6: Plasm daemon integration, systemd service, hello-job example
-- [x] M7: Architecture docs, quickstart guides, threat model, troubleshooting
-
-### Next Steps (Post Phase Boot)
-- [ ] Test USB boot on real hardware (x86_64, ARM64)
-- [ ] Test QEMU/KVM VM boot
-- [ ] CI/CD pipeline for Phase Boot images
-- [ ] Secure Boot investigation and implementation
-- [ ] Production key management for signing
+- [x] **M1**: Workspace scaffold — root Cargo.toml, eight crate skeletons, SPDX headers, empty `cargo build --workspace` green.
+- [x] **M2**: Extract `phase-net` — libp2p 0.54 → 0.57 upgrade, Kademlia + mDNS + Noise+QUIC, generic peer capabilities decoupled from WASM-specific fields.
+- [x] **M3**: Extract `phase-identity` — persistent Ed25519 keypair on disk via `dirs` crate, fixes the ephemeral-key bug carried over from the November MVP.
+- [x] **M4**: `phase-protocol` — `JobSpec` enum with `Wasm` and `Inference` variants, streaming `Worker` trait with `JobHandle` + `JobStream`, `DynWorker` object-safe shim.
+- [x] **M5**: Extract `phase-manifest` + `phase-receipt` — generic `SignedManifest<T>` / `SignedReceipt<T>` envelopes, Ed25519 signing reused from `phase-identity`, commitment-accumulator chunk hashing for streamed results.
+- [x] **M6**: Extract `phase-artifact-server` — blob-id keyed layout, range request preserved, signed manifest integration.
+- [x] **M7**: Reposition Plasm — `daemon/` deleted via `git mv`, `WasmtimeWorker` impls `phase_protocol::Worker`, PHP SDK migrated to dual-format signing (legacy + `phase-receipt:v1:`), hello.wasm output byte-identical.
+- [x] **M8**: Verification, docs, daemon removal — `cargo build --workspace` clean, 152 tests pass, zero clippy warnings across phase-* and plasm, `cargo publish --dry-run -p phase-identity` packages cleanly, README rewritten for post-M7 layout, Memory Bank updated.
 
 ---
 
-## Completed Releases
+## LUCID Software COMPLETE (May 2026)
 
-### Phase Open MVP ✅ COMPLETE (Nov 2025)
-**Goal**: Core WASM execution and networking
-- Milestone 1: Local WASM Execution
-- Milestone 2: Peer Discovery
-- Milestone 3: Remote Execution
-- Milestone 4: Packaging & Demo
+- [x] **LUCID M1**: `crates/lucidd/` scaffold with AGPL-3.0 license. Echo worker spike validated the streaming Worker trait against real Ollama clients (`ollama` CLI v0.24 streamed `dlrow olleh` against EchoWorker via `/api/chat`).
+- [x] **LUCID M2**: `LlamaCppWorker` — `llama-server` subprocess management, supervisor task with 3-crash/60s circuit-break, hang detection (30s no-progress timeout), per-request idle timeout, fake-llama-server stub binary for tests so CI doesn't need a real GGUF model. CLI flag `--worker echo|llama-cpp`.
+- [ ] **LUCID M3**: `MlxWorker` — deferred to v0.1.1. Apple Silicon native via mlx-lm subprocess. *Requires Apple Silicon test rig for full validation.*
+- [x] **LUCID M4** (demo-sufficient): Ollama API surface on `:11434` covers `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/version`. NDJSON streaming format, `x_phase_commitment` carried in terminal frame. **`/api/embeddings` and `/api/pull` deferred to v0.1.1** — not on the demo critical path.
+- [x] **LUCID M5**: Local-or-DHT router — per-request decision (local-only flag → policy → local-loaded → DHT lookup → refused), `X-Lucid-Local-Only` request header parsed, `X-Lucid-Routed-Via` response header set, 503 + reason on refused. Peer relay via libp2p `/phase/job-relay/1.0.0` (CBOR codec, 5min timeout). **Peer-relay is batch (not token-streaming) in v0.1; streaming-via-peer is v0.2.**
+- [x] **LUCID M6**: Model registry on DHT — signed `ModelAdvertisement` (bincode + Ed25519), key `b"phase/model/" || model_cid`, 5-minute TTL refresh task, persistent identity carry-through so advertisements survive daemon restart with the same peer_id.
+- [x] **LUCID M7**: Policy + auto-pause — declarative `lucid-policy.toml` (default at `~/.config/lucidd/policy.toml`), `PauseReason::{Manual, OnBattery, ThermalLimit, OutsideTimeWindow, ConcurrencyLimit, ModelNotInAllowlist, SystemPaused}`. Battery via the `battery` crate (macOS IOKit / Linux sysfs), thermals via `sysinfo`. Config reload via `notify` filesystem watch + SIGHUP. 24 policy tests cover every decision branch.
+- [ ] **LUCID M8**: Two-node end-to-end demo — *Hardware-blocked.* Software is ready. Requires Machine A (Linux + 24GB+ NVIDIA GPU + real llama-server binary + a GGUF model) and Machine B (any Linux), Tailscale-bridged or real WAN.
 
-### Phase Boot ✅ IMPLEMENTED (Nov 2025)
-**Goal**: Bootable USB/VM for Phase network (consumer side)
-- M1-M7: All milestones implemented
-- 54 files, 14,395 lines of code
-- x86_64 and ARM64 support
-- Three boot modes: Internet, Local, Private
+## Honest v0.1 Limitations (all v0.2 work, none demo-blocking)
 
-### Netboot Provider ✅ COMPLETE (Nov 2025)
-**Goal**: HTTP boot artifact server with DHT/mDNS (provider side)
-- M1-M6: All milestones implemented
-- 2,510 lines Rust, 3,000 lines documentation
-- HTTP server with axum, manifest signing, DHT advertising
-- Self-hosting loop: boot → serve → others boot from you
+- Peer-relay is batch-shaped; token streaming across the relay is v0.2
+- No multi-peer retry on first-peer failure
+- `find_peers_by_model_id` resolves names via the local loaded set only — cross-peer name→CID registry is v0.2
+- Peer-served full `SignedReceipt<JobResult>` doesn't propagate back through the relay (only the output commitment rides in the events)
+- `/api/embeddings` and `/api/pull` not implemented
+- `PolicyEngine::should_serve` refuses self-traffic when on battery by default — needs a "self-traffic always allowed" config option for laptop UX
 
-### Future Enhancements
-**Goal**: Production-ready improvements
+## Stack snapshot (post-LUCID M5)
 
-**Potential Work**:
-- Secure Boot signing chain
-- Production key management
-- Hardware testing on various platforms
-- Performance optimization
-- Full mDNS service advertisement (mdns-sd crate)
-- Multi-provider load balancing
-- Zero-knowledge proofs for private execution
-- Hardware security module (TPM/SGX) integration
+```
+crates/
+├── phase-identity/         # Ed25519 persistent identity         Apache-2.0
+├── phase-net/              # libp2p / Kademlia / mDNS / Noise     Apache-2.0
+├── phase-manifest/         # SignedManifest<T>                    Apache-2.0
+├── phase-receipt/          # SignedReceipt<T> + commitment chain  Apache-2.0
+├── phase-protocol/         # Worker trait + JobSpec + JobStream   Apache-2.0
+├── phase-artifact-server/  # Content-addressed HTTP server        Apache-2.0
+├── plasm/                  # WasmtimeWorker reference node        Apache-2.0
+└── lucidd/                 # LUCID inference daemon               AGPL-3.0-or-later
+```
+
+Workspace: 210 tests passing, ~20K LOC of Rust, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ---
 
-## Key Decisions This Week
+## Hardware-Blocked Items
 
-### Decided
-- **WASM Runtime**: Wasmtime (production-ready, excellent WASI support)
-- **Networking**: rust-libp2p with Kademlia DHT, Noise + QUIC
-- **Serialization**: JSON for manifests/receipts (human-readable)
-- **Cryptography**: Ed25519 with SHA-256 pre-hash
-- **Client SDK**: PHP first, Swift/TypeScript later
-- **Packaging**: cargo-deb for Debian/Ubuntu targets
-
-### Pending
-- Remote transport implementation strategy (M4 vs post-MVP)
-- Key persistence mechanism (filesystem vs. keyring)
-- Bootstrap node strategy (public nodes vs. configurable)
-- Configuration file format (TOML vs. YAML)
+- **LUCID M8 (Two-node demo)** — software is ready; needs Machine A (Linux + 24GB+ NVIDIA GPU + llama-server + GGUF model) and Machine B (any second machine), Tailscale-bridged or real WAN. This is the *only* remaining blocker for the 0→1 demo.
+- **LUCID M3 (MlxWorker)** — deferred to v0.1.1. Apple Silicon test rig needed for MLX path.
+- **Phase Boot hardware boot loop** — pre-existing November 2025 work; carry-forward from `tasks/2025-11/`. Real-hardware kexec on 2009 MacBook x86_64 was demonstrated; broader hardware matrix remains aspirational.
 
 ---
 
 ## Blockers & Risks
 
 ### Current Blockers
-None
+None for LUCID M2 work; pure-software path on commodity Linux + llama.cpp.
 
 ### Risks
-- **Cross-architecture testing**: Limited access to ARM/x86_64 machines
-  - **Mitigation**: Use GitHub Actions runners for CI or test locally if available
-- **Debian packaging complexity**: First time using cargo-deb
-  - **Mitigation**: Start with minimal package, iterate
-- **Remote transport scope**: Network implementation may be complex
-  - **Mitigation**: Consider deferring to post-MVP if needed
-
----
-
-## Active Experiments
-
-### Phase Boot Hardware Testing
-**Status**: Ready for testing
-**Goal**: Validate USB boot on real x86_64 and ARM64 hardware
-**Success Criteria**: System boots, discovers network, executes hello job
-
-### Secure Boot Investigation
-**Status**: Documented in M7
-**Goal**: Investigate Secure Boot signing requirements
-**Success Criteria**: Document signing chain requirements
+- **First-token latency over WAN**: DHT-routed inference may have unacceptable TTFT. Mitigation: stream tokens, local-only fast path.
+- **Privacy perception**: Per-request prompts visible to serving peer in v0.1. Mitigation: honest disclosure, local-only toggle, v0.3 cryptographic privacy committed.
+- **Ollama API drift**: Upstream API moves faster than LUCID can track. Mitigation: pin to a specific API version, document drift.
 
 ---
 
 ## Recent Achievements
 
-### 2025-11-27: KEXEC WORKING - Fedora Kernel Success
-- ✅ **Fedora kernel boots**: 6.11.6-200.fc40.aarch64 (18MB) works in QEMU ARM64
-- ✅ **Virtio modules load**: failover → net_failover → virtio_net (212KB total)
-- ✅ **Network works**: DHCP via vmnet-shared (192.168.2.x)
-- ✅ **kexec enabled**: `kexec_load_disabled=0` in Fedora kernel
-- ✅ **kexec WORKS**: Successfully rebooted via kexec, fresh boot confirmed via dmesg
-- ✅ **Self-hosting loop PROVEN**: Boot → Download kernel → kexec → Fresh boot
-- ✅ **Memory requirement**: 1GB RAM needed for kexec load (512MB causes OOM)
-- ✅ **Fedora initramfs**: boot/build/fedora-initramfs.img (1.8MB with modules)
-- See: [271127_fedora_kexec_success.md](tasks/2025-11/271127_fedora_kexec_success.md)
+### 2026-05-27: Phase Core M8 — verification and docs
 
-### 2025-11-27: Phase Boot Auto-Fetch Pipeline Complete
-- ✅ **phase.provider=URL**: Direct provider specification via kernel cmdline
-- ✅ **Auto-fetch**: VM automatically downloads manifest, kernel (11.4MB), initramfs (1.8MB)
-- ✅ **DTB handling**: Extracts /sys/firmware/fdt, zeros kaslr-seed for kexec
-- ✅ **kexec prep**: All segments loaded correctly
-- ⚠️ **kexec blocked**: Alpine kernel has `kexec_load_disabled=1` (kernel policy, not Phase Boot issue)
-- ✅ **New tools in initramfs**: kexec (199KB), fdtput (67KB), libfdt, musl libc
-- ✅ **Initramfs size**: 1.8MB (was 1.1MB)
-- ✅ **End-to-end tested**: VM → DHCP → Provider → Download → Ready for kexec
-- See: [271127_phase_boot_auto_fetch.md](tasks/2025-11/271127_phase_boot_auto_fetch.md)
+- Clippy clean across all seven phase-* crates and plasm. Ten warnings carried over in `crates/plasm/src/bin/` from the legacy daemon (unused imports, `is_multiple_of` idiom, collapsible-match in the discovery event loop) all resolved.
+- README rewritten to reflect the post-M7 layout: eight crates, dep graph, quick-start with `plasmd` and `hello.wasm`.
+- `cargo publish --dry-run -p phase-identity` succeeds. Other phase-* crates have path deps pinned with `version = "0.1.0"` ready for sequential crates.io publication.
+- Memory Bank updated: activeContext, progress, decisions, May 2026 task summary.
 
-### 2025-11-27: Netboot Provider Complete (M1-M6)
-- ✅ **M1 - HTTP Server**: axum-based server, artifact endpoints, range requests, health/status
-- ✅ **M2 - Manifest Generation**: BootManifest schema, SHA256 hashing, Ed25519 signing
-- ✅ **M3 - DHT/mDNS**: ManifestRecord for DHT, mDNS service config, discovery integration
-- ✅ **M4 - CLI**: `plasmd serve`, `provider status`, `provider list` commands
-- ✅ **M5 - Testing**: Integration tests, arch aliasing (arm64↔aarch64), CLI bug fixes
-- ✅ **M6 - Documentation**: Quickstart, architecture, API reference, troubleshooting, security
-- ✅ **Stats**: 2,510 lines Rust, 3,000 lines docs, 80 tests passing
-- ✅ **Self-hosting loop now possible**: Boot → Serve → Others boot from you
+### 2026-05-26: Phase Core M7 — Plasm repositioned, daemon/ removed
 
-### 2025-11-26: ARM64 Development Environment + VM-to-Host WASM Fetch
-- ✅ **QEMU ARM64 with HVF**: Boot in ~2-3 seconds on Apple Silicon
-- ✅ **vmnet-shared networking**: VM gets real LAN IP (192.168.2.x)
-- ✅ **VM-to-Host POC**: Proven VM can wget from services on Mac
-- ✅ **Kernel modules**: af_packet, virtio stack loading correctly
-- ✅ **udhcpc DHCP fixed**: Added default.script for auto IP/gateway/DNS config
-- ✅ **WASM fetch tested**: VM successfully fetched 84KB hello.wasm from Mac
-- ✅ **Documentation**: memory-bank/releases/boot-arm/README.md updated
+- Top-level `daemon/` directory deleted via `git mv` (history preserved).
+- All daemon source moved to `crates/plasm/src/`; new `WasmtimeWorker` in `crates/plasm/src/worker.rs` impls `phase_protocol::Worker`.
+- PHP SDK dual-format migration: new canonical `phase-receipt:v1:` + canonical JSON of `{completed_at, job_id, result, schema_version}`, with legacy SHA-256 over `version|module_hash|exit_code|wall_time_ms|timestamp` still accepted.
+- Hello.wasm output `dlroW ,olleH` verified byte-identical.
 
-### 2025-11-26: Phase Boot Complete (M1-M7)
-- ✅ **M1 - Boot Stub**: Makefile, ESP partition, systemd-boot/GRUB configs, init script
-- ✅ **M2 - Discovery**: phase-discover binary, Kademlia DHT, mDNS, network scripts
-- ✅ **M3 - Verification**: phase-verify binary, Ed25519 signatures, manifest schema
-- ✅ **M4 - kexec**: kexec-boot.sh, overlayfs-setup.sh, mode-handler.sh
-- ✅ **M5 - Packaging**: build-usb-image.sh, build-qcow2.sh, release.sh
-- ✅ **M6 - Plasm Integration**: plasmd.service, plasm-init.sh, hello-job.sh
-- ✅ **M7 - Documentation**: ARCHITECTURE, COMPONENTS, QUICKSTARTS, THREAT-MODEL, TROUBLESHOOTING
-- ✅ **New Rust Binaries**: phase_discover, phase_verify, phase_fetch
-- ✅ **14 commits, 54 files, 14,395 lines added**
+### 2026-05 earlier: M1–M6 substrate extraction
 
-### 2025-11-09: Phase Open MVP Complete
-- ✅ Milestone 1-4 complete (Local WASM, Peer Discovery, Remote Execution, Packaging)
-- ✅ 22 tests passing, 0 warnings
-- ✅ Library + binary pattern refactor
+- M1 workspace scaffold (eight crate skeletons).
+- M2 phase-net with libp2p 0.57 upgrade.
+- M3 phase-identity with on-disk persistent Ed25519.
+- M4 phase-protocol Worker trait + JobSpec, validated against fake streaming worker and real Ollama client before extraction.
+- M5 phase-manifest and phase-receipt as generic `SignedManifest<T>` / `SignedReceipt<T>`.
+- M6 phase-artifact-server extraction.
+
+See [memory-bank/releases/phase-core/](releases/phase-core/) for the full release plan and [memory-bank/tasks/2026-05/](tasks/2026-05/) for per-milestone notes.
+
+---
+
+## Completed Releases
+
+### Phase Open MVP COMPLETE (Nov 2025)
+Local WASM execution, peer discovery via Kademlia DHT, remote execution with signed receipts, Debian packaging. 80 tests, 5,743 lines Rust. See [progress.md](progress.md#release-milestones).
+
+### Phase Boot IMPLEMENTED (Nov 2025)
+Bootable USB/VM netboot system. M1–M7 complete: boot stub, discovery, verification, kexec, packaging, plasm integration, documentation. Self-hosting loop proven on Fedora kernel in QEMU ARM64 + x86_64 and on 2009 MacBook hardware. See [progress.md](progress.md).
+
+### Netboot Provider COMPLETE (Nov 2025)
+HTTP boot artifact server with DHT/mDNS advertisement. M1–M6 complete, 2,510 lines Rust. Now lives in `crates/plasm/src/provider/`.
+
+### Phase Core COMPLETE (May 2026)
+Substrate extraction. Seven publishable Phase library crates (Apache-2.0) + Plasm reference WASM node. Documented in [memory-bank/releases/phase-core/](releases/phase-core/).
 
 ---
 
 ## Next Actions (Priority Order)
 
-1. ~~**Fix udhcpc DHCP**~~: ✅ Done - Added default.script to initramfs
-2. ~~**Test WASM fetch**~~: ✅ Done - VM fetched 84KB hello.wasm from Mac
-3. ~~**Implement auto-fetch**~~: ✅ Done - VM auto-fetches from plasmd provider
-4. ~~**Find kexec-enabled kernel**~~: ✅ Done - Fedora 6.11.6 works with kexec!
-5. **Automate kexec in init**: Update init script to auto-kexec with Fedora kernel
-6. **Build phase-discover ARM64**: Cross-compile for initramfs
-7. **Test USB image creation**: Build and test on real hardware
-8. **CI/CD setup**: Automate Phase Boot image builds
-
-### Quick Boot Commands (ARM64 on Mac)
-```bash
-# Start provider on Mac (Terminal 1)
-cd daemon && ./target/debug/plasmd serve -a /tmp/boot-artifacts -p 8080
-
-# Boot Fedora kernel directly (Terminal 2, requires sudo for vmnet-shared)
-cd boot && sudo qemu-system-aarch64 -M virt -cpu host -accel hvf -m 1024 \
-  -kernel /tmp/boot-artifacts/stable/arm64/kernel \
-  -initrd build/fedora-initramfs.img \
-  -append "console=ttyAMA0 phase.mode=internet" \
-  -netdev vmnet-shared,id=net0 -device virtio-net-pci,netdev=net0 -nographic
-
-# Manual kexec test (in VM shell)
-wget http://192.168.2.1:8080/stable/aarch64/kernel -O /tmp/k
-wget http://192.168.2.1:8080/stable/aarch64/initramfs -O /tmp/i
-cp /sys/firmware/fdt /tmp/d && fdtput -t x /tmp/d /chosen kaslr-seed 0 0
-kexec -l /tmp/k --initrd=/tmp/i --dtb=/tmp/d --append="console=ttyAMA0"
-kexec -e
-
-# Exit QEMU: Ctrl+A X
-```
+1. Open LUCID M2 — `LlamaCppWorker` subprocess management.
+2. Stand up CI for the workspace (currently local-only verification).
+3. Schedule LUCID M3 MLX work for next Apple Silicon dev session.
+4. Begin sequential crates.io publication of phase-identity → phase-* → plasm once a publication policy is decided.
 
 ---
 
-## Team Context (Solo Developer MVP)
+## Team Context
 
-**Role**: Full-stack developer (Rust + PHP)
-**Availability**: Part-time (evenings/weekends)
-**Timeline**: No hard deadlines, quality over speed
+**Role**: Solo developer (Rust + PHP).
+**Availability**: Part-time.
+**Timeline**: No hard deadlines; quality over speed.
 
-**Knowledge Gaps**:
-- libp2p internals (learning as we go)
-- WASM module introspection
-- systemd service hardening
-
-**Learning Resources**:
-- libp2p documentation: https://docs.libp2p.io
-- WASM spec: https://webassembly.github.io/spec/
-- systemd hardening: https://www.freedesktop.org/software/systemd/man/
+**Knowledge gaps under active development**:
+- llama.cpp `llama-server` subprocess lifecycle and signal handling.
+- Ollama API SSE stream semantics for `/api/chat`.
+- DHT TTL refresh patterns for model registry advertisements.
 
 ---
 
-## Communication & Updates
-
-**Weekly Updates**: Friday end-of-week summary
-**Decision Log**: Update decisions.md for architectural choices
-**Task Documentation**: Create tasks/YYYY-MM/DDMMDD_*.md after completion
-
----
-
-## Success Metrics
-
-### Milestone 1 (Complete) ✅
-- [x] `plasmd` binary compiles without errors
-- [x] `hello.wasm` executes and outputs "dlroW ,olleH"
-- [x] PHP client can submit job locally and retrieve result
-- [x] Receipt includes module hash, wall time, exit code
-- [x] Unit tests pass (>80% coverage) - 10/10 passing
-- [x] Documentation sufficient for third-party reproduction
-
-### Milestone 2 (Complete) ✅
-- [x] Two plasmd nodes discover each other via Kademlia DHT
-- [x] Nodes advertise capabilities (CPU, arch, memory)
-- [x] Job announcement/acceptance handshake works
-- [x] Communication encrypted with Noise + QUIC
-- [x] NAT traversal awareness implemented
-- [x] Discovery events logged with structured format
-
-### Milestone 3 (Complete) ✅
-- [x] Real Ed25519 signatures (not mocks)
-- [x] Job protocol with serialization
-- [x] Execution with hash verification
-- [x] Async WASM runtime
-- [x] PHP signature verification
-- [x] 22 tests passing, live execution test successful
-
-### Milestone 4 (Complete) ✅
-- [x] Debian package installs cleanly
-- [x] systemd service runs as daemon
-- [x] Installation instructions clear and complete
-- [x] End-to-end demo works (local execution with signed receipts)
-- [x] All documentation updated for MVP release
-
-### Phase Boot (Complete) ✅
-- [x] M1: Boot stub, Makefile, ESP partition, init script
-- [x] M2: Network bring-up, phase-discover binary, DHT integration
-- [x] M3: phase-verify binary, Ed25519 verification, manifest schema
-- [x] M4: kexec orchestration, overlayfs setup, mode handlers
-- [x] M5: USB image builder, QCOW2 builder, release scripts
-- [x] M6: Plasm integration, systemd service, hello-job example
-- [x] M7: Architecture docs, quickstart guides, threat model
-
----
-
-**This document is updated weekly. Last review: 2025-11-26**
+**This document is updated at milestone boundaries. Last review: 2026-05-27.**

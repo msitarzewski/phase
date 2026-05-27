@@ -1,7 +1,8 @@
-# Rust
-/daemon/target/
-/daemon/Cargo.lock
-/wasm-examples/*/target/
+# Rust workspace
+/target/
+**/target/
+
+# Per-crate locks (workspace Cargo.lock IS committed; only per-example locks ignored)
 /wasm-examples/*/Cargo.lock
 
 # PHP

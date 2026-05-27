@@ -1,8 +1,10 @@
 # System Patterns: Phase Architecture
 
-**Last Updated**: 2025-11-26
-**Version**: 1.1
-**Status**: MVP Complete + Phase Boot Implemented
+**Last Updated**: 2026-05-27
+**Version**: 1.2
+**Status**: MVP Complete + Phase Boot Implemented + Phase Core Released + LUCID Software Complete
+
+> **Note (2026-05-27):** The November 2025 patterns below were authored when the daemon was monolithic. The Phase Core release (May 2026) split the daemon into eight crates and added the streaming Worker trait. The pre-existing patterns are still accurate for their domains (WASM execution still works the same way, peer discovery semantics unchanged, etc.) but the crate location prefixes have changed: `daemon/src/network/*` is now `crates/phase-net/src/*`, `daemon/src/wasm/*` is now `crates/plasm/src/wasm/*`, and so on. See `memory-bank/releases/phase-core/` for the full mapping. New patterns introduced by the May 2026 sprint are documented at the bottom of this file under "Streaming Worker Pattern", "DhtTransport Seam Pattern", "Auto-Pause Policy Pattern", and "Peer-Relay Batch Pattern (v0.1)".
 
 ---
 
@@ -979,6 +981,63 @@ As the codebase grows, document new patterns here:
 
 **When to Use**: Specific scenarios
 ```
+
+---
+
+## Patterns Added 2026-05 (Phase Core + LUCID Sprint)
+
+### Streaming Worker Pattern
+
+**Where**: `crates/phase-protocol/src/worker.rs`, SPEC.md
+
+`Worker::execute` always returns `(JobHandle, JobStream)`. Batch jobs (WASM) emit a single `JobEvent::Final` and end. Streaming jobs (inference) emit zero or more `JobEvent::Output(OutputChunk)` then exactly one `JobEvent::Final`.
+
+The single shape collapses two code paths into one. Cancellation = dropping the `JobStream`. The worker observes via `JobHandleProducer::is_cancelled()` between chunks. Receipts are produced after the stream closes via the **commitment accumulator** — each `OutputChunk` is folded into a SHA-256 chain (domain-separated `phase-protocol:v1:commitment`), only the final commitment is Ed25519-signed. Per-chunk Ed25519 was rejected at design time as ruinously expensive (3000 sigs/s per peer at modest token rates).
+
+Verifiers replay on-wire chunks into the same accumulator and check against the signed commitment.
+
+### DhtTransport Seam Pattern
+
+**Where**: `crates/lucidd/src/registry.rs` (trait), `crates/lucidd/src/dht_transport.rs` (impl)
+
+When a higher layer needs DHT semantics but doesn't want to depend on libp2p directly (test ergonomics, future transport alternatives), define a narrow trait:
+
+```rust
+pub trait DhtTransport {
+    async fn put_record(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()>;
+    async fn get_record(&self, key: Vec<u8>) -> Result<Vec<Vec<u8>>>;
+}
+```
+
+The production impl wraps `Arc<phase_net::Discovery>`; tests use a `MockDhtTransport` that captures puts and synthesizes gets. Same trait, two implementations, no hidden libp2p dependency in test code.
+
+The seam also forced phase-net to refactor `publish_kad_record` from `&mut self` to `&self` (tokio mpsc Sender is cheaply cloneable + Send). Net win: clearer separation between the command-channel API (`&self`) and the swarm driver task (which owns `&mut self`).
+
+### Auto-Pause Policy Pattern
+
+**Where**: `crates/lucidd/src/policy.rs`
+
+When an operator-facing policy has multiple orthogonal axes (battery, thermals, time-of-day, manual, allowlists, concurrency), encode it as **first-match-wins** rather than weighted combinations:
+
+```
+Manual → OnBattery → ThermalLimit → OutsideTimeWindow → ConcurrencyLimit → ModelNotInAllowlist → Allow
+```
+
+Each variant carries enough data to explain *why* (e.g., `ThermalLimit { current_c, threshold_c }`). Refusal reasons flow through the API surface as human-readable strings (`X-Lucid-Routed-Via` omitted; 503 body carries reason). Decision is **pause-not-deprioritize** — the operator's node refuses to serve, peers route to someone else. This avoids Bittensor-shaped "gameable degraded status" attacks.
+
+Config is declarative TOML, reload via `notify` filesystem watch + SIGHUP, OS-standard config path via `dirs::config_dir()`.
+
+### Peer-Relay Batch Pattern (v0.1 only)
+
+**Where**: `crates/phase-net/src/protocol.rs` (`JobRelayRequest`/`JobRelayResponse`), `/phase/job-relay/1.0.0` protocol
+
+For v0.1 of any new peer-to-peer execution protocol that natively wants to stream (inference, image generation, anything with intermediate results), the simplest viable shape is **batch**: the serving peer drains its local stream to completion, then ships the whole `Vec<JobEvent>` as a single response. The requesting peer synthesizes a `JobStream` that yields the events in order.
+
+Pros: ships in one session, libp2p `request_response` covers it natively, receipts and commitments work identically to local execution.
+
+Cons: peer-routed inference has multi-second TTFT minimum (full generation + one round trip). Document expectation; users with TTFT-sensitive needs use `X-Lucid-Local-Only`.
+
+The wire format change to true streaming in v0.2 is a substream-pattern swap, not a protocol redesign — `JobEvent` framing stays identical, only the libp2p behaviour changes.
 
 ---
 

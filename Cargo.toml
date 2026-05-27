@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/phase-net",
+    "crates/phase-identity",
+    "crates/phase-manifest",
+    "crates/phase-receipt",
+    "crates/phase-protocol",
+    "crates/phase-artifact-server",
+    "crates/plasm",
+    "crates/lucidd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+
+[workspace.dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

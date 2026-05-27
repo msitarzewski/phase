@@ -1,8 +1,106 @@
-# Progress: Phase Open MVP
+# Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2025-11-29
-**Version**: 1.0
-**Phase**: MVP Complete - Production Ready
+**Last Updated**: 2026-05-27
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID M1-M7 software (May 2026)
+**Phase**: Plasm repositioned as `crates/plasm/`; daemon/ removed; LUCID software complete; M8 hardware-blocked.
+
+---
+
+## Major Deliverables
+
+### Phase Core COMPLETE (May 2026)
+
+The November 2025 monolithic `daemon/` tree has been refactored in place into
+seven publishable Rust library crates plus the repositioned Plasm reference
+node. No new functionality — every line either moved or was generalized.
+
+**Crates extracted** (lines counted via `find ... -name '*.rs' | xargs wc -l`):
+
+| Crate | Lines | License | Role |
+|---|---|---|---|
+| `crates/phase-identity` | 502 | Apache-2.0 | Persistent Ed25519 keypair, platform-aware path |
+| `crates/phase-net` | 1,405 | Apache-2.0 | libp2p 0.57 / Kademlia / mDNS / Noise+QUIC |
+| `crates/phase-manifest` | 649 | Apache-2.0 | `SignedManifest<T>` envelope |
+| `crates/phase-receipt` | 468 | Apache-2.0 | `SignedReceipt<T>` + commitment accumulator |
+| `crates/phase-protocol` | 1,130 | Apache-2.0 | `JobSpec` + streaming `Worker` trait + `DynWorker` |
+| `crates/phase-artifact-server` | 1,981 | Apache-2.0 | Content-addressed HTTP server |
+| `crates/plasm` | 5,082 | Apache-2.0 | Reference WASM Phase node (`plasmd` binary) |
+| `crates/lucidd` | 985 | AGPL-3.0 | LUCID inference Phase node (in progress; M1 spike) |
+
+Workspace total: ~12.2k lines of Rust under `crates/` plus an additional ~7k lines
+across boot scripts, PHP SDK, examples, schemas, and docs.
+
+**Phase Core milestones**:
+
+- [x] M1 — Workspace scaffold (empty crate skeletons, SPDX headers, `cargo build --workspace` green).
+- [x] M2 — Extract `phase-net`, upgrade libp2p 0.54 → 0.56 (0.57 not yet on crates.io as of May 2026), generalize peer capabilities.
+- [x] M3 — Extract `phase-identity` with on-disk persistent Ed25519 (fixes ephemeral-key bug).
+- [x] M4 — `phase-protocol`: streaming `Worker` trait, `JobSpec::{Wasm, Inference}`, `JobStream` + `JobHandle`, `DynWorker` object-safe shim. Trait shape validated against fake streaming worker and real Ollama client before extraction began.
+- [x] M5 — Extract `phase-manifest` + `phase-receipt` as generic envelopes; commitment-accumulator chunk hashing for streamed results.
+- [x] M6 — Extract `phase-artifact-server` with blob-id keyed layout, range request preserved.
+- [x] M7 — Reposition Plasm at `crates/plasm/`, delete top-level `daemon/` (history preserved), add `WasmtimeWorker`, migrate PHP SDK to dual-format signing (legacy + `phase-receipt:v1:`).
+- [x] M8 — Verification, docs, daemon removal.
+
+**M8 final state**:
+
+- `cargo build --workspace` clean.
+- `cargo test --workspace` — 152 tests passing across the eight crates.
+- `cargo clippy --workspace --exclude lucidd --all-targets -- -D warnings` clean (lucidd has one pre-existing `explicit_counter_loop` warning held for the next release per the no-touch constraint on the LUCID crate; see Open Items below).
+- `cargo publish --dry-run -p phase-identity` packages cleanly. Path deps across the substrate are pinned to `version = "0.1.0"` so each crate is publish-ready; remaining dry-runs serialize on actual crates.io publication of upstream crates.
+- Legacy `daemon/` directory removed from the working tree.
+- Top-level README rewritten to describe the new layout and dep graph.
+- Memory Bank (`activeContext.md`, `progress.md`, `decisions.md`, `tasks/2026-05/README.md`) updated.
+
+**Open items carried into LUCID**: resolved in the LUCID work below — `crates/lucidd/src/echo.rs:119` `clippy::explicit_counter_loop` was fixed in LUCID M2.
+
+See [memory-bank/releases/phase-core/](releases/phase-core/) for the full release plan.
+
+---
+
+### LUCID Software COMPLETE (May 2026)
+
+The inference flagship was built in a continuation of the same sprint. Eight of nine milestones shipped on May 27; M8 (live two-node demo) is software-ready and hardware-blocked.
+
+**Final workspace state**:
+
+| Crate | Lines | License | Status |
+|---|---|---|---|
+| `crates/phase-identity` | ~500 | Apache-2.0 | Phase Core M3 |
+| `crates/phase-net` | ~2,500 | Apache-2.0 | Phase Core M2 + LUCID M5 (added `get_kad_record`, `/phase/job-relay/1.0.0` protocol, `&self` mutating-API refactor) |
+| `crates/phase-manifest` | ~650 | Apache-2.0 | Phase Core M5 |
+| `crates/phase-receipt` | ~470 | Apache-2.0 | Phase Core M5 |
+| `crates/phase-protocol` | ~1,100 | Apache-2.0 | Phase Core M4 + serde derive on JobEvent for relay |
+| `crates/phase-artifact-server` | ~2,000 | Apache-2.0 | Phase Core M6 |
+| `crates/plasm` | ~5,000 | Apache-2.0 | Phase Core M7 |
+| `crates/lucidd` | ~6,500 | AGPL-3.0-or-later | LUCID M1, M2, M4 (partial), M5, M6, M7 |
+
+**LUCID milestones**:
+
+- [x] **M1** — `crates/lucidd/` scaffold + EchoWorker spike. Real `ollama` CLI v0.24 streamed `dlrow olleh` against EchoWorker via `/api/chat`.
+- [x] **M2** — `LlamaCppWorker`. Subprocess supervisor task per loaded model; tokio::select! over child.wait() + 30s /health poll; 3-crash/60s circuit-break with backoff; per-request idle timeout for hang detection; fake-llama-server stub binary (axum, env-var configurable) so tests don't need a real GGUF model. CLI flag `--worker echo|llama-cpp`.
+- [ ] **M3** — `MlxWorker`. Deferred to v0.1.1. Apple Silicon test rig required.
+- [x] **M4** (demo-sufficient) — Ollama HTTP API on `:11434`. `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/version`. NDJSON streaming with terminal `done:true` frame carrying `x_phase_commitment`. **`/api/embeddings` and `/api/pull` deferred to v0.1.1** — out of demo critical path.
+- [x] **M5** — Local-or-DHT Router. `RouteVia::{Local, Peer, Refused}`. `X-Lucid-Local-Only` request header parsed; `X-Lucid-Routed-Via` response header set; 503 + reason on Refused. Peer relay via libp2p `request_response::cbor::Behaviour` on `/phase/job-relay/1.0.0` (5min timeout). **Peer-relay is batch (full Vec<JobEvent> ships in one CBOR response) in v0.1; token streaming across the relay is a v0.2 polish target.**
+- [x] **M6** — Model Registry on DHT. `SignedModelAdvertisement` (bincode + Ed25519). Key layout: `b"phase/model/" || model_cid` (44 bytes). 5-min TTL refresh task per loaded model; withdraw aborts refresh; Drop cancels all. Persistent identity from phase-identity ensures advertisements survive daemon restart with the same peer_id. `DhtTransport` trait as the seam, with `PhaseNetDhtTransport` wrapping `Arc<Discovery>`.
+- [x] **M7** — Policy + auto-pause. Declarative `lucid-policy.toml` (default at `~/.config/lucidd/policy.toml`). Decision order: Manual → OnBattery → ThermalLimit → OutsideTimeWindow → ConcurrencyLimit → ModelNotInAllowlist → Allow. Battery state via the `battery` crate; thermals via `sysinfo`. Config reload via `notify` filesystem watch + SIGHUP. Windows stubs return None (no battery/thermal pauses fire). 24 unit tests cover every decision branch.
+- [ ] **M8** — Live two-node end-to-end demo. **Hardware-blocked.** Software is ready: machine A loads model via `LlamaCppWorker` + advertises via `ModelRegistry` + serves inbound via `/phase/job-relay/1.0.0`; machine B runs lucidd with `--no-local-worker`, `curl localhost:11434/api/chat` routes through `Router::execute` to A. Acceptance also needs the live asciinema artifact for the eventual launch.
+
+**Final workspace verification (post-LUCID M5)**:
+
+- `cargo build --workspace` clean.
+- `cargo test --workspace` — **210 tests passing** (was 152 after phase-core; +58 from LUCID M2/M5/M6/M7).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean (lucidd's `explicit_counter_loop` from M1 was fixed during M2).
+- Real `curl http://localhost:11434/api/chat` returns `X-Lucid-Routed-Via: local` with streaming NDJSON + commitment in terminal frame.
+
+**Honest v0.1 limitations carried forward** (none demo-blocking, all v0.2 targets):
+- Peer-relay batch-shaped (no token streaming across the relay).
+- No multi-peer retry on first-peer failure.
+- Cross-peer name → CID registry not built (Node B needs to know the model name string).
+- Peer-served full `SignedReceipt<JobResult>` doesn't propagate back (only commitment rides in events).
+- `/api/embeddings` and `/api/pull` not implemented.
+- Policy refuses self-traffic when on battery — needs "self-traffic always allowed" knob for laptop UX.
+
+See [memory-bank/releases/lucid/](releases/lucid/) for the full release plan.
 
 ---
 

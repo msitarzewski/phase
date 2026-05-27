@@ -1,0 +1,133 @@
+[package]
+name = "plasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["PhaseBased <hello@phasebased.com>", "Michael Sitarzewski"]
+description = "Reference WASM Phase node — Wasmtime-based Worker implementation."
+license = "Apache-2.0"
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[lib]
+name = "plasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plasmd"
+path = "src/main.rs"
+
+[[bin]]
+name = "phase-discover"
+path = "src/bin/phase_discover.rs"
+
+[[bin]]
+name = "phase-verify"
+path = "src/bin/phase_verify.rs"
+
+[[bin]]
+name = "phase-fetch"
+path = "src/bin/phase_fetch.rs"
+
+[dependencies]
+# Phase library crates — sibling crates in the workspace. Both `path` and
+# `version` are declared so `cargo publish --dry-run` works for the published
+# crates while local development still uses the path dep.
+phase-identity = { path = "../phase-identity", version = "0.1.0" }
+phase-manifest = { path = "../phase-manifest", version = "0.1.0" }
+phase-receipt = { path = "../phase-receipt", version = "0.1.0" }
+# Phase-core M2: libp2p / Kademlia / mDNS / Noise+QUIC machinery + the
+# JobOffer / JobResponse wire types live in phase-net. Plasm keeps a direct
+# libp2p dep too because phase_discover binary still constructs kad::RecordKey
+# / SwarmBuilder values directly.
+phase-net = { path = "../phase-net", version = "0.1.0" }
+phase-protocol = { path = "../phase-protocol", version = "0.1.0" }
+# Phase-core M6: the HTTP artifact server, content-addressed blob store, DHT
+# manifest advertisement, and mDNS service advertisement live in
+# phase-artifact-server. Plasm keeps its legacy BootManifest + ManifestGenerator
+# + signing in `provider/` — that is plasm-specific PHP-compat code, not part
+# of the Phase substrate.
+phase-artifact-server = { path = "../phase-artifact-server", version = "0.1.0" }
+
+# WASM Runtime (using wasmtime for better compatibility)
+wasmtime = "27"
+wasmtime-wasi = "27"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptography (Ed25519 signatures)
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+dirs = "5.0"  # Platform-independent paths
+chrono = { version = "0.4", features = ["serde"] }
+
+# Networking (libp2p) - Bumped from 0.54 to 0.56 (current crates.io stable as of 2026-05).
+# Research brief targeted 0.57 from the CHANGELOG, but crates.io still publishes 0.56.0 as
+# the latest release; 0.57 has not been cut to crates.io. The 0.55/0.56 breaking changes
+# the brief calls out (async-std removal, SwarmBuilder reshape, kad::Behaviour rename,
+# private kad::record module, identify::Config builder, OutboundQueryProgressed) all
+# already apply at 0.56, so this upgrade still isolates the "libp2p semantics changed"
+# axis from the upcoming phase-net extraction. Bump to 0.57 when it lands.
+libp2p = { version = "0.56", features = ["kad", "noise", "tcp", "quic", "yamux", "macros", "tokio", "relay", "dcutr", "autonat", "identify", "mdns"] }
+futures = "0.3"
+num_cpus = "1.0"
+rand = "0.8"
+
+# HTTP client (for phase-fetch and provider CLI)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# HTTP server (for provider/boot server)
+axum = { version = "0.7", features = ["tokio", "http1", "http2"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+
+# Worker trait support — streaming bytes, async stream macro.
+bytes = "1.7"
+futures-util = "0.3"
+async-stream = "0.3"
+
+[dev-dependencies]
+tempfile = "3.0"
+assert_matches = "1.5"
+
+[package.metadata.deb]
+maintainer = "PhaseBased <hello@phasebased.com>"
+copyright = "2025, PhaseBased <hello@phasebased.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Phase is an open protocol for distributed computation. \
+Plasm is the local runtime engine that turns any computer into a node in the network. \
+This package provides the plasmd daemon for executing WebAssembly workloads."""
+depends = "$auto, systemd"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/plasmd", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/plasm/", "644"],
+    ["systemd/plasmd.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "plasmd", enable = false }

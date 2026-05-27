@@ -1,0 +1,121 @@
+[package]
+name = "lucidd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
+description = "LUCID inference daemon — open GPU inference flagship built on the Phase substrate."
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "lucidd"
+path = "src/main.rs"
+
+# Tiny stand-in for `llama-server` used by `worker_llama`'s integration
+# tests. Stays in the regular bin set (not `cfg(test)`) so `cargo test` can
+# locate it via the standard `CARGO_BIN_EXE_*` envvar pattern. It's not in
+# the published surface — keep it small and document loudly that it's a
+# test fixture.
+[[bin]]
+name = "fake-llama-server"
+path = "tests/fixtures/fake_llama_server.rs"
+
+[dependencies]
+phase-protocol = { path = "../phase-protocol" }
+phase-identity = { path = "../phase-identity" }
+phase-manifest = { path = "../phase-manifest" }
+phase-receipt = { path = "../phase-receipt" }
+# LUCID M6 model registry. We pull phase-net for the libp2p `PeerId` type
+# so the registry's public API speaks in canonical Phase peer identifiers,
+# but we deliberately keep the DHT-IO surface behind a small in-crate
+# `DhtTransport` trait. That trait abstracts what `phase_net::Discovery`
+# already exposes (`publish_kad_record`) and what M5 will need to add
+# (a record-lookup primitive). Real wiring is M5's job.
+phase-net = { path = "../phase-net" }
+ed25519-dalek = "2.1"
+bincode = "1.3"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+
+# HTTP server. axum 0.7 sits cleanly on top of tokio + hyper 1, has a
+# first-class Body::from_stream for NDJSON, and is the de-facto choice in
+# the modern Rust stack. Matches the research brief's recommendation.
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.40", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = "1"
+
+# Stream plumbing for the NDJSON response body.
+futures = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+
+# Wire format for /api/chat.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Receipt commitment encoding.
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+# Tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI argument parsing for `--worker llama-cpp --model-dir ...`. `clap` is
+# already pulled in by transitive deps; using it directly keeps the bin
+# surface obvious and self-documenting.
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client for talking to llama-server. `rustls-tls` keeps the dependency
+# graph free of native OpenSSL; `stream` exposes `bytes_stream()` for SSE.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Concurrent map of (model_id → LoadedModel). DashMap is the obvious choice;
+# we want lock-free reads from many request handlers with rare writes (load
+# / unload). `Mutex<HashMap>` would serialise every inference call.
+dashmap = "6"
+
+# llama-server's native `/completion` endpoint streams Server-Sent Events
+# with `data: {json}\n\n` framing. We parse it inline (one frame fits in
+# memory comfortably) — no separate SSE crate needed; `bytes_stream()` plus
+# a small buffered split on `\n\n` is enough.
+
+# --- LUCID M7 policy surface ---
+# Operator-facing config (TOML), file-watch reload, system state probing.
+# `notify` v6 ships a tokio-friendly `RecommendedWatcher` and bridges via a
+# crossbeam channel — we re-pipe events onto a tokio mpsc in `policy.rs`.
+notify = "6"
+# Cross-platform battery state. `battery` 0.7 abstracts IOKit on macOS and
+# `/sys/class/power_supply` on Linux. Windows reports Unknown — handled.
+battery = "0.7"
+# Thermal sensors via the Components surface. sysinfo is the path of least
+# resistance for cross-platform temp readout; we'll re-use it in later
+# milestones for VRAM/CPU probing too.
+sysinfo = "0.32"
+# Operator-facing model_id allowlist patterns (`qwen3-*`, `*-q4`, …).
+glob = "0.3"
+# `~/.config/lucidd/` — standard XDG / macOS Application Support resolution.
+dirs = "5"
+# TOML parse + emit for the operator policy file.
+toml = "0.8"
+# Local-time evaluation for `time_of_day_window`. We need a tz-aware "now"
+# in the local zone; `chrono`'s `Local` is the standard answer.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+# Stub binary tests need a temp dir and a way to wait for child output.
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }
+# The stub `llama-server` for tests is a tiny axum app — easier than mocking
+# the subprocess by hand. See `tests/fixtures/fake_llama_server.rs`.
+axum = { version = "0.7", features = ["macros"] }
+hyper = { version = "1", features = ["server"] }

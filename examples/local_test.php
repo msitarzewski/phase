@@ -16,10 +16,16 @@ require_once __DIR__ . '/../php-sdk/src/Transport/LocalTransport.php';
 
 use Plasm\Client;
 
-// Create client in local mode
+// Create client in local mode. As of phase-core M7 the daemon binary lives
+// at `target/release/plasm` in the workspace target dir; we also try
+// `target/release/plasmd` for the explicit bin name.
+$plasmdBin = __DIR__ . '/../target/release/plasmd';
+if (!is_executable($plasmdBin)) {
+    $plasmdBin = __DIR__ . '/../target/release/plasm';
+}
 $client = new Client([
     'mode' => 'local',
-    'plasmd_path' => __DIR__ . '/../daemon/target/release/plasmd',
+    'plasmd_path' => $plasmdBin,
 ]);
 
 echo "Phase Local WASM Execution Demo\n";

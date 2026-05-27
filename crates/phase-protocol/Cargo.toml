@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "phase-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "The Worker trait and JobSpec enum — the abstraction every Phase node implementation impls."
+authors = ["Michael Sitarzewski"]
+repository = "https://github.com/msitarzewski/phase"
+readme = "README.md"
+
+[dependencies]
+# Sibling Phase library crates -- generic signed envelopes. With these
+# enabled, `SignedManifest<T>` / `SignedReceipt<T>` re-export the real
+# generic types instead of the placeholder stubs.
+phase-manifest = { path = "../phase-manifest", version = "0.1.0" }
+phase-receipt = { path = "../phase-receipt", version = "0.1.0" }
+
+# Async runtime primitives. We commit to tokio across the workspace
+# (libp2p 0.57 dropped async-std support; see research-brief §1).
+tokio = { version = "1.40", features = ["sync", "macros", "rt"] }
+# Stream trait + utilities. We expose `Stream<Item = JobEvent>` in the public
+# API, so `futures-core` is the minimum viable surface here.
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Wire format. Manifests and receipts are CBOR over the wire in phase-manifest /
+# phase-receipt; the protocol crate only needs serde derives so JobSpec /
+# JobResult / OutputChunk can be embedded in those signed envelopes.
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+# Opaque byte buffers for chunk payloads, conversation tokens, and the
+# streaming-commitment accumulator. `Bytes` is cheap to clone (Arc inside)
+# which matters for fan-out (signed receipt + verifier replay + on-the-wire
+# emission of the same chunk).
+bytes = { version = "1", features = ["serde"] }
+
+# Streaming commitment uses SHA-256 — already a transitive dep via libp2p-noise
+# and matches the digest scheme used by phase-manifest CIDs. One hash function
+# across the protocol.
+sha2 = "0.10"
+
+# Stable error type for trait return values without pulling in `anyhow`
+# (libraries should not impose anyhow on consumers).
+thiserror = "1"
+
+[dev-dependencies]
+# Smoke-test runtime: `#[tokio::test]` and a tiny ergonomic Stream macro.
+tokio = { version = "1.40", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+async-stream = "0.3"
+serde_json = "1"
+# Smoke test needs to generate identities + sign a real manifest/receipt
+# now that envelope types are non-trivial.
+phase-identity = { path = "../phase-identity" }
+
+[features]
+default = []
+# Historical: was used to gate placeholder envelopes during M1-M4. With
+# phase-core M5 the real envelope types ship as path deps unconditionally,
+# so this feature is a no-op kept for compatibility with downstreams that
+# may still pass `--features real-envelopes`.
+real-envelopes = []
