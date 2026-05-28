@@ -307,7 +307,25 @@ After the live LAN demo earlier in the day, the same session brought the substra
 - DNS record added (subdomain → `76.191.195.7`)
 - Verified reachable from a fresh lucidd instance via `--bootstrap-peer` in tens of ms
 
-**What's NOT in this session**: libp2p circuit-relay server protocol (`relay::server::Behaviour`), DCUtR hole-punching, libp2p rendezvous, DNS-based bootstrap. Those are the real v0.2 substantive substrate work, scoped for the next dedicated session.
+**What's NOT in this session**: libp2p circuit-relay server protocol (`relay::server::Behaviour`), DCUtR hole-punching, libp2p rendezvous. Those are the real v0.2 substantive substrate work, scoped for the next dedicated session.
+
+### 2026-05-28 (very late): DNS-based bootstrap
+
+Same session continued. Added `--bootstrap-dns <DOMAIN>` (repeatable) to lucidd. At startup, lucidd queries TXT records at each given domain and dials every multiaddr-shaped result. Uses `hickory-resolver` 0.24 (formerly trust-dns) with `system-config` for `/etc/resolv.conf` and Cloudflare/Google fallback for sandboxed envs.
+
+Validated end-to-end with the foundation TXT record:
+```
+$ dig +short TXT bootstrap.phasebased.net
+"/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB"
+
+$ lucidd --no-local-worker --bootstrap-dns bootstrap.phasebased.net
+  INFO lucidd: DNS bootstrap resolved domain=bootstrap.phasebased.net count=1
+  INFO lucidd: merged DNS-resolved bootstrap peers total=1 domains=1
+  INFO phase_net::discovery: Dialing bootstrap peer: /ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...
+  INFO phase_net::discovery: Connected to peer
+```
+
+Fresh peer, zero out-of-band knowledge, network joined. This is the missing piece for "install lucidd and it just works."
 
 ---
 

@@ -34,7 +34,14 @@ lucidd --worker llama-cpp --model-dir /opt/lucidd/models
 - `--mode worker|relay` — relay = no local worker
 - `--libp2p-port <N>` — pin a libp2p port (default 0 = random). Use a known value (e.g. 4001) when you want to forward the port on your router and let WAN peers dial you with a stable multiaddr.
 - `--identity-path <path>` — persistent libp2p identity file. Default `~/.config/phase/identity.key` (platform-aware). Same path = same peer-id across restarts.
-- `--bootstrap-peer <multiaddr>` — repeatable. Format `/dns4/host/tcp/<port>/p2p/<peer-id>` or `/ip4/.../tcp/.../p2p/<peer-id>`. Required for WAN discovery (mDNS only crosses LANs).
+- `--bootstrap-peer <multiaddr>` — repeatable. Format `/dns4/host/tcp/<port>/p2p/<peer-id>` or `/ip4/.../tcp/.../p2p/<peer-id>`. Explicit WAN bootstrap.
+- `--bootstrap-dns <domain>` — repeatable. Queries `TXT <domain>` at startup; every TXT record that looks like a multiaddr gets dialed. The foundation maintains `bootstrap.phasebased.net` with one TXT per public relay, so a one-shot install is:
+
+  ```bash
+  lucidd --no-local-worker --bootstrap-dns bootstrap.phasebased.net
+  ```
+
+  Zero out-of-band knowledge required — the daemon resolves the TXT, dials whatever's there, and joins the network.
 
 `LUCIDD_PORT` and `LUCIDD_HOST` env vars override the HTTP API bind. `--help` lists everything.
 

@@ -115,10 +115,11 @@ The relay is **directly dialable** today, which is enough for any peer to use it
 - [ ] Wire libp2p `relay::server::Behaviour` into phase-net's `CombinedBehaviour`
 - [ ] Wire libp2p `dcutr::Behaviour` for hole-punching
 - [ ] Wire libp2p `rendezvous::server::Behaviour` for the model-rendezvous design from MISSION discussion
-- [ ] DNS-based bootstrap: lucidd queries `TXT bootstrap.phasebased.net` at startup, dials results
+- [x] **DNS-based bootstrap shipped** — lucidd has `--bootstrap-dns <domain>` (repeatable) that resolves TXT records and dials each as a multiaddr. Validated with `bootstrap.phasebased.net TXT "/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc..."`. A fresh Mac peer with `--bootstrap-dns bootstrap.phasebased.net` (no explicit `--bootstrap-peer`) dialed umbp in ~70 ms. `hickory-resolver` 0.24 with `system-config` for `/etc/resolv.conf`, Cloudflare/Google fallback for sandboxed envs.
 - [ ] Stand up 2-3 more relays in geographically distinct regions (Hetzner CAX11s, $3.79/mo each)
 - [ ] Document the relay-operator setup (this systemd unit + DNS-record format)
 - [ ] Sonic IPv6 firewall investigation (umbp listens on IPv6 but Mac→IPv6 currently fails — separate debugging)
+- [ ] Decide whether `bootstrap.phasebased.net` should be the *default* `--bootstrap-dns` value for new installs (currently no default — flag must be explicit). Trade-off: defaulting on means "lucidd just works" out of the box but creates soft foundation-DNS dependency.
 
 ### Three bugs the demo found that the test suite missed
 

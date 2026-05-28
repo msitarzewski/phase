@@ -40,6 +40,10 @@ phase-net = { path = "../phase-net" }
 ed25519-dalek = "2.1"
 bincode = "1.3"
 sha2 = "0.10"
+# DNS resolver for --bootstrap-dns. system-config picks up /etc/resolv.conf
+# on Linux + macOS automatically; tokio-runtime keeps us on the same
+# async executor as the rest of lucidd.
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
 async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"

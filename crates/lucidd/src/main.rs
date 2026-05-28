@@ -120,6 +120,79 @@ struct Cli {
     /// other without at least one configured bootstrap.
     #[arg(long = "bootstrap-peer", value_name = "MULTIADDR")]
     bootstrap_peers: Vec<String>,
+
+    /// DNS domains to query for TXT-record bootstrap peers. Each TXT
+    /// record at the queried name is interpreted as one multiaddr in the
+    /// same format as `--bootstrap-peer`. Repeatable.
+    ///
+    /// Example: `--bootstrap-dns bootstrap.phasebased.net` queries:
+    ///   `dig TXT bootstrap.phasebased.net`
+    /// and dials every multiaddr it gets back. The foundation maintains
+    /// `bootstrap.phasebased.net` with one TXT per public relay so a
+    /// fresh install can join the network with zero out-of-band setup.
+    #[arg(long = "bootstrap-dns", value_name = "DOMAIN")]
+    bootstrap_dns: Vec<String>,
+}
+
+/// Query TXT records at each domain and return the parsed multiaddr
+/// strings (one per TXT record). Strings starting with `/` are kept; any
+/// other shape is logged and dropped. phase-net's bootstrap-peer parser
+/// is the authoritative validator — if a TXT contains garbage with a
+/// leading slash, it'll be logged as an invalid multiaddr there.
+///
+/// Failures are best-effort: a single domain returning NXDOMAIN, SERVFAIL,
+/// or timing out logs a warning and the function continues with whatever
+/// it did get from other domains.
+async fn resolve_dns_bootstrap_peers(domains: &[String]) -> Vec<String> {
+    if domains.is_empty() {
+        return Vec::new();
+    }
+    let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
+        Ok(r) => r,
+        Err(e) => {
+            // Most failure modes here mean /etc/resolv.conf isn't
+            // readable (containers without it, locked-down sandboxes).
+            // Fall back to Cloudflare/Google defaults.
+            tracing::warn!(
+                error = %e,
+                "could not load system DNS config; falling back to Cloudflare/Google"
+            );
+            hickory_resolver::TokioAsyncResolver::tokio(
+                hickory_resolver::config::ResolverConfig::cloudflare(),
+                hickory_resolver::config::ResolverOpts::default(),
+            )
+        }
+    };
+    let mut out = Vec::new();
+    for domain in domains {
+        match resolver.txt_lookup(domain).await {
+            Ok(answers) => {
+                let mut domain_count = 0usize;
+                for record in answers.iter() {
+                    for chunk in record.txt_data() {
+                        if let Ok(s) = std::str::from_utf8(chunk) {
+                            let s = s.trim().to_string();
+                            if s.starts_with('/') {
+                                out.push(s);
+                                domain_count += 1;
+                            } else if !s.is_empty() {
+                                tracing::debug!(
+                                    domain = %domain,
+                                    value = %s,
+                                    "skipping non-multiaddr TXT record"
+                                );
+                            }
+                        }
+                    }
+                }
+                tracing::info!(domain = %domain, count = domain_count, "DNS bootstrap resolved");
+            }
+            Err(e) => {
+                tracing::warn!(domain = %domain, error = %e, "DNS bootstrap lookup failed");
+            }
+        }
+    }
+    out
 }
 
 #[tokio::main]
@@ -164,12 +237,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "identity loaded (phase-net will log the libp2p peer-id on swarm init)"
     );
 
+    // Merge explicit --bootstrap-peer args with DNS-resolved ones from
+    // --bootstrap-dns. DNS failures (timeout, NXDOMAIN) are non-fatal
+    // because mDNS may still discover peers locally and the operator
+    // may have explicit --bootstrap-peer args that work.
+    let mut bootstrap_peers = cli.bootstrap_peers.clone();
+    let dns_peers = resolve_dns_bootstrap_peers(&cli.bootstrap_dns).await;
+    if !dns_peers.is_empty() {
+        tracing::info!(
+            total = dns_peers.len(),
+            domains = cli.bootstrap_dns.len(),
+            "merged DNS-resolved bootstrap peers"
+        );
+        bootstrap_peers.extend(dns_peers);
+    }
+
     // Build the phase-net discovery layer. mDNS may be denied in
     // restricted CI envs — that's expected; the daemon still serves
     // local requests in that case.
     let disc_config = DiscoveryConfig {
         identity: Some(node_identity.clone()),
-        bootstrap_peers: cli.bootstrap_peers.clone(),
+        bootstrap_peers,
         ..DiscoveryConfig::default()
     };
     let discovery = Arc::new(Discovery::new(disc_config)?);
