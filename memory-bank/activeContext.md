@@ -79,6 +79,47 @@ Workspace: 210 tests passing, ~20K LOC of Rust, `cargo clippy --workspace --all-
 
 The two-node demo ran end-to-end on real hardware. Mac M5 Max (128GB) hosting Qwen3-Next 35B-A3B on Metal via `llama-server`; Parallels Ubuntu ARM64 VM at `10.211.55.5` with `lucidd --no-local-worker`. `curl http://localhost:11434/api/chat` from inside the VM routed via libp2p + Kademlia DHT, served on the Mac, streamed back NDJSON with `x-lucid-routed-via: peer:ctCUGwkd` and `x_phase_commitment: <sha256>` in the terminal frame. Asciinema captured at `dist/demos/lucid-2node-demo.cast`.
 
+## v0.2 substrate prep — first foundation relay live (2026-05-28 late)
+
+The two-node demo proved the protocol works on a LAN. The follow-on session that same evening took the substrate from "works on a LAN" to "works across the public internet" and stood up the first 24/7 foundation-operated relay node.
+
+### Code changes (all in this commit)
+
+- **`--bootstrap-peer <multiaddr>`** (repeatable) — `phase-net`'s `DiscoveryConfig::bootstrap_peers` field existed since November but was just logged. Now properly parses the multiaddr, extracts the `/p2p/<peer-id>` component, adds the address to Kademlia's routing table, and queues a swarm dial. Connection in tens of ms once the SYN/ACK completes.
+- **`--libp2p-port <N>`** — was hardcoded `/ip4/0.0.0.0/tcp/0` (ephemeral random). Now configurable so home routers can forward a known port and DNS records can encode it.
+- **IPv6 listen** — lucidd now binds `/ip4/0.0.0.0/tcp/<port>` AND `/ip6/::/tcp/<port>`. Public IPv6 nodes (e.g. Sonic fiber) can be reached without any router port-forwarding.
+- **Persistent identity by default** — main.rs was calling `NodeIdentity::generate()` every startup (fresh ephemeral key every restart). Now uses `NodeIdentity::load_or_create(path)` with a platform-aware default (`~/.config/phase/identity.key` on Linux). Same peer-id across restarts.
+- **`--identity-path <path>`** — override for the above. Required when running two lucidd instances on the same host.
+- **`--mode {worker,relay}`** — clearer alias semantics over the older `--no-local-worker` flag.
+
+### First foundation relay
+
+```
+host:           umbp (Ubuntu 24.04 x86_64, Intel i7-3720QM, 15GB RAM, 10Gb sync fiber)
+peer_id:        12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB
+public mAddr:   /ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB
+service:        lucidd-relay.service (user-level systemd)
+                ├── enabled (boot-start)
+                ├── linger=yes (survives logout)
+                └── auto-restart on failure
+identity file:  ~/.config/phase/identity.key  (32 bytes, mode 600)
+DNS:            added 2026-05-28 (subdomain pointing at 76.191.195.7)
+```
+
+### What still needs to happen for the "coffee-shop scenario"
+
+The relay is **directly dialable** today, which is enough for any peer to use it as a bootstrap-peer. The full coffee-shop scenario (user behind NAT/VPN reachable through the relay) still needs the libp2p circuit-relay server protocol and DCUtR for hole-punching. That's v0.2 substantive engineering — ~100-200 lines in phase-net plus a real protocol decision about what relay traffic the foundation is willing to carry.
+
+### Next-session checklist for substrate v0.2
+
+- [ ] Wire libp2p `relay::server::Behaviour` into phase-net's `CombinedBehaviour`
+- [ ] Wire libp2p `dcutr::Behaviour` for hole-punching
+- [ ] Wire libp2p `rendezvous::server::Behaviour` for the model-rendezvous design from MISSION discussion
+- [ ] DNS-based bootstrap: lucidd queries `TXT bootstrap.phasebased.net` at startup, dials results
+- [ ] Stand up 2-3 more relays in geographically distinct regions (Hetzner CAX11s, $3.79/mo each)
+- [ ] Document the relay-operator setup (this systemd unit + DNS-record format)
+- [ ] Sonic IPv6 firewall investigation (umbp listens on IPv6 but Mac→IPv6 currently fails — separate debugging)
+
 ### Three bugs the demo found that the test suite missed
 
 These were genuine v0.1 gaps that landed during the demo session, not test-only hacks:

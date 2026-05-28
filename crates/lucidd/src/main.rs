@@ -25,7 +25,7 @@ use lucidd::ollama::{router as ollama_router, AppState};
 use lucidd::registry::DhtTransport;
 use lucidd::router::{make_inbound_relay_handler, Router as LucidRouter};
 use lucidd::{LlamaCppConfig, LlamaCppWorker, ModelRegistry, PhaseNetDhtTransport, PolicyEngine};
-use phase_identity::NodeIdentity;
+use phase_identity::{default_identity_path, NodeIdentity};
 use phase_net::{Discovery, DiscoveryConfig};
 use phase_protocol::DynWorker;
 
@@ -37,20 +37,38 @@ enum WorkerChoice {
     LlamaCpp,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum NodeMode {
+    /// Run a local worker. Default. Same node can also serve peers via the
+    /// inbound job-relay handler if --no-local-worker is not set.
+    Worker,
+    /// Consume-only / relay role: no local worker is loaded, every chat
+    /// request is routed to a peer (or refused). Sets the same internal
+    /// flag as --no-local-worker. Foundation relay-server protocol
+    /// (libp2p `relay::server::Behaviour`, DCUtR, etc.) lands in v0.2.
+    Relay,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "lucidd",
     about = "LUCID inference daemon — Ollama-compatible API backed by the LUCID M5 router."
 )]
 struct Cli {
+    /// Run as a worker (default) or as a consume-only relay node.
+    /// `--mode relay` is equivalent to `--no-local-worker`.
+    #[arg(long, value_enum, default_value_t = NodeMode::Worker)]
+    mode: NodeMode,
+
     /// Which `Worker` impl to expose on :11434. Ignored when
-    /// `--no-local-worker` is set.
+    /// `--no-local-worker` is set or `--mode relay` is selected.
     #[arg(long, value_enum, default_value_t = WorkerChoice::Echo)]
     worker: WorkerChoice,
 
     /// Run without any local worker — every request gets routed to a
     /// peer over the Phase DHT or refused. Useful on GPU-less laptops
-    /// that still want to be useful clients.
+    /// that still want to be useful clients. Same effect as
+    /// `--mode relay`.
     #[arg(long, default_value_t = false)]
     no_local_worker: bool,
 
@@ -78,6 +96,30 @@ struct Cli {
     /// resolution). `lucidd` seeds a fully-commented default if absent.
     #[arg(long)]
     policy_config: Option<PathBuf>,
+
+    /// Path to the persistent libp2p identity file. Default:
+    /// `~/.config/phase/identity.key` (platform-aware). If absent, lucidd
+    /// generates a fresh Ed25519 keypair on first run and persists it
+    /// here, so subsequent restarts keep the same peer ID. Two lucidd
+    /// instances on the same host need different paths.
+    #[arg(long)]
+    identity_path: Option<PathBuf>,
+
+    /// libp2p TCP/QUIC listen port. Default `0` = ephemeral random.
+    /// Set this to a known value (e.g. `4001`) when you want others to
+    /// dial you across WAN with a stable multiaddr — port forwarding on
+    /// the home router becomes possible, DNS-based bootstrap records can
+    /// be written, etc.
+    #[arg(long, default_value_t = 0)]
+    libp2p_port: u16,
+
+    /// Multiaddrs of bootstrap peers to dial on startup. Repeatable.
+    /// Format: `/ip4/x.x.x.x/tcp/<port>/p2p/<peer-id>` or
+    /// `/dns4/host/tcp/<port>/p2p/<peer-id>`. Without bootstraps, a node
+    /// on its own LAN finds peers via mDNS; WAN peers won't find each
+    /// other without at least one configured bootstrap.
+    #[arg(long = "bootstrap-peer", value_name = "MULTIADDR")]
+    bootstrap_peers: Vec<String>,
 }
 
 #[tokio::main]
@@ -101,23 +143,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host: String = std::env::var("LUCIDD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
 
+    // --mode relay collapses into --no-local-worker for the v0.1 binary.
+    // The real libp2p relay::server::Behaviour wiring lands in v0.2.
+    let no_local_worker = cli.no_local_worker || cli.mode == NodeMode::Relay;
+
     // Persistent identity: libp2p peer-id + receipt signing key derive
-    // from this. Default location matches plasm's convention.
-    let node_identity = NodeIdentity::generate();
+    // from this. Default location: ~/.config/phase/identity.key (or the
+    // platform equivalent). Persistent so peer-id is stable across
+    // restarts — required for any node that wants to be a bootstrap
+    // peer, since other nodes will encode the peer-id in their config.
+    let identity_path: PathBuf = match cli.identity_path.clone() {
+        Some(p) => p,
+        None => default_identity_path()
+            .map_err(|e| format!("could not resolve default identity path: {e}"))?,
+    };
+    let node_identity = NodeIdentity::load_or_create(&identity_path)
+        .map_err(|e| format!("identity load_or_create({identity_path:?}): {e}"))?;
+    tracing::info!(
+        path = %identity_path.display(),
+        "identity loaded (phase-net will log the libp2p peer-id on swarm init)"
+    );
 
     // Build the phase-net discovery layer. mDNS may be denied in
     // restricted CI envs — that's expected; the daemon still serves
     // local requests in that case.
     let disc_config = DiscoveryConfig {
         identity: Some(node_identity.clone()),
+        bootstrap_peers: cli.bootstrap_peers.clone(),
         ..DiscoveryConfig::default()
     };
     let discovery = Arc::new(Discovery::new(disc_config)?);
 
-    // Start the libp2p listener and bootstrap the DHT. Both calls are
-    // tolerant of network restrictions.
-    if let Err(e) = discovery.listen("/ip4/0.0.0.0/tcp/0").await {
-        tracing::warn!(error = %e, "discovery listen failed (continuing)");
+    // Start the libp2p listeners — both IPv4 and IPv6 wildcard binds on
+    // the configured port. IPv6 matters for residential nodes on dual-
+    // stack ISPs (e.g. Sonic) because the public IPv6 is typically
+    // routable without any router port-forwarding — the firewall just
+    // needs to allow inbound for /tcp/<port>. Port `0` = ephemeral
+    // random (the historical default; fine on LAN where mDNS handles
+    // discovery). Port `>0` = stable, suitable for WAN bootstrap-peer
+    // multiaddrs and for routers that need a known forward port.
+    let listen_v4 = format!("/ip4/0.0.0.0/tcp/{}", cli.libp2p_port);
+    let listen_v6 = format!("/ip6/::/tcp/{}", cli.libp2p_port);
+    if let Err(e) = discovery.listen(&listen_v4).await {
+        tracing::warn!(error = %e, addr = %listen_v4, "discovery IPv4 listen failed (continuing)");
+    }
+    if let Err(e) = discovery.listen(&listen_v6).await {
+        tracing::warn!(error = %e, addr = %listen_v6, "discovery IPv6 listen failed (continuing)");
     }
     if let Err(e) = discovery.bootstrap().await {
         tracing::warn!(error = %e, "discovery bootstrap failed (continuing)");
@@ -133,8 +204,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = Arc::new(PolicyEngine::load_or_default(cli.policy_config.clone()).await?);
 
     // Optional local worker.
-    let local_worker: Option<Arc<dyn DynWorker>> = if cli.no_local_worker {
-        tracing::info!("--no-local-worker: this daemon is consume-only");
+    let local_worker: Option<Arc<dyn DynWorker>> = if no_local_worker {
+        tracing::info!(
+            mode = ?cli.mode,
+            "consume-only / relay node (no local worker loaded)"
+        );
         None
     } else {
         match cli.worker {

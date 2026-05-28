@@ -288,6 +288,29 @@ Final asciinema recording is the artifact for the eventual launch.
 
 ---
 
+### 2026-05-28 (late): v0.2 substrate prep + first foundation relay
+
+After the live LAN demo earlier in the day, the same session brought the substrate from "works on a LAN" to "works on the public internet" and stood up the first 24/7 relay node.
+
+**Changes**:
+- Wired `phase-net::DiscoveryConfig::bootstrap_peers` to actually dial (was a logged no-op since November)
+- Added lucidd flags: `--bootstrap-peer` (repeatable), `--libp2p-port`, `--identity-path`, `--mode {worker,relay}`
+- Default identity is now persistent (`NodeIdentity::load_or_create` at `~/.config/phase/identity.key`) instead of fresh-per-restart
+- Dual-stack libp2p listen: `/ip4/0.0.0.0/tcp/<port>` AND `/ip6/::/tcp/<port>`
+- Added user-level systemd unit at `crates/lucidd/systemd/lucidd-relay.service`
+- New `x86_64-unknown-linux-gnu` dist target (previously only had `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu`)
+
+**First foundation relay live on umbp** (Ubuntu 24.04 x86_64, 10Gb sync Sonic fiber):
+- peer_id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB`
+- multiaddr `/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`
+- managed by `lucidd-relay.service` (user systemd, `Linger=yes` for boot survival)
+- DNS record added (subdomain → `76.191.195.7`)
+- Verified reachable from a fresh lucidd instance via `--bootstrap-peer` in tens of ms
+
+**What's NOT in this session**: libp2p circuit-relay server protocol (`relay::server::Behaviour`), DCUtR hole-punching, libp2p rendezvous, DNS-based bootstrap. Those are the real v0.2 substantive substrate work, scoped for the next dedicated session.
+
+---
+
 ## Totals
 
 - **Phase Core**: 8 of 8 milestones shipped (M1–M8).

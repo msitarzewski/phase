@@ -85,6 +85,25 @@ The inference flagship was built in a continuation of the same sprint. Eight of 
 - [x] **M7** — Policy + auto-pause. Declarative `lucid-policy.toml` (default at `~/.config/lucidd/policy.toml`). Decision order: Manual → OnBattery → ThermalLimit → OutsideTimeWindow → ConcurrencyLimit → ModelNotInAllowlist → Allow. Battery state via the `battery` crate; thermals via `sysinfo`. Config reload via `notify` filesystem watch + SIGHUP. Windows stubs return None (no battery/thermal pauses fire). 24 unit tests cover every decision branch.
 - [x] **M8** — **Live two-node end-to-end demo DONE 2026-05-28.** Mac M5 Max (128GB) hosting Qwen3-Next 35B-A3B on Metal; Ubuntu ARM64 in Parallels at 10.211.55.5 running `lucidd --no-local-worker`. `curl localhost:11434/api/chat` from inside the VM routed via Phase DHT to Mac, streamed back NDJSON with `x-lucid-routed-via: peer:ctCUGwkd`. Asciinema recording at `dist/demos/lucid-2node-demo.cast`. Three v0.1 bugs landed during the demo session — see `activeContext.md#three-bugs-the-demo-found`.
 
+### v0.2 substrate prep — first foundation relay (2026-05-28 late evening)
+
+After the LAN demo proved the protocol works, the same session brought the substrate up to WAN-ready and stood up the first 24/7 foundation-operated relay.
+
+| Change | Where |
+|---|---|
+| `--bootstrap-peer <multiaddr>` actually dials (was a no-op stub from Nov 2025) | `phase-net/src/discovery.rs` |
+| `--libp2p-port <N>` (was hardcoded ephemeral) | `lucidd/src/main.rs` |
+| IPv6 listen alongside IPv4 (`/ip6/::/tcp/<port>`) | `lucidd/src/main.rs` |
+| Persistent identity by default (`NodeIdentity::load_or_create` instead of `::generate`) | `lucidd/src/main.rs` |
+| `--identity-path <path>` override | `lucidd/src/main.rs` |
+| `--mode {worker,relay}` semantic alias | `lucidd/src/main.rs` |
+| New x86_64-linux dist target + README | `dist/lucidd-0.1.0-x86_64-unknown-linux-gnu/` |
+| User-level systemd unit for relay mode | `crates/lucidd/systemd/lucidd-relay.service` |
+
+First foundation relay: peer_id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB`, public mAddr `/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`, running under `systemctl --user lucidd-relay.service` with `Linger=yes`. Connection from a fresh Mac lucidd via `--bootstrap-peer` confirmed in tens of ms.
+
+The full coffee-shop / NAT-traversal story (`libp2p::relay::server::Behaviour` + DCUtR + rendezvous) is the real v0.2 substantive engineering. This session built the prerequisite: a node that other peers can find by name and dial without prior introduction.
+
 **Final workspace verification (post-LUCID M5)**:
 
 - `cargo build --workspace` clean.

@@ -1,0 +1,37 @@
+[Unit]
+Description=lucidd — LUCID inference daemon (relay mode)
+Documentation=https://github.com/msitarzewski/phase
+After=network-online.target
+Wants=network-online.target
+# Don't crash-loop forever if something is fundamentally broken: 10
+# restart attempts within 10 minutes, then give up until manual
+# intervention.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=%h/bin/lucidd --mode relay --libp2p-port 4001
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lucidd
+
+# Bind the Ollama API to loopback — relays don't expose a useful local
+# API surface, and this prevents accidental WAN exposure if a future
+# reverse-proxy rule drifts.
+Environment=LUCIDD_PORT=11434
+Environment=LUCIDD_HOST=127.0.0.1
+Environment=RUST_LOG=info,phase_net=info,lucidd=info
+
+# libp2p maintains many concurrent connections + Kademlia routing
+# tables; bump the default file-descriptor limit.
+LimitNOFILE=65536
+
+[Install]
+# `default.target` for a user-level service is the equivalent of
+# `multi-user.target` for a system service: starts at login. Combined
+# with `loginctl enable-linger <user>`, the service starts at boot and
+# survives logout.
+WantedBy=default.target

@@ -689,6 +689,66 @@ LUCID's router needs a way to find which peers have a given model loaded. Phase 
 
 ---
 
+### 2026-05-28: Bootstrap Peers Wired via CLI / Config (Not DNS — Yet)
+
+**Status**: Accepted (v0.2 substrate prep). DNS-based bootstrap deferred to a follow-up sprint.
+
+**Context**:
+mDNS handles peer discovery on a LAN. For WAN discovery (the actual "anyone can find anyone" story from MISSION.md) peers need *some* way to find their first hop. The `phase-net::DiscoveryConfig::bootstrap_peers` field existed since November 2025 but was a no-op — it parsed the multiaddr, logged it, and never actually dialed.
+
+**Decision**:
+Wire the existing field so each entry in `bootstrap_peers` actually (a) parses as a multiaddr with a `/p2p/<peer-id>` tail, (b) adds the address to Kademlia's routing table, (c) queues a `swarm.dial(...)`. Expose this through lucidd via repeatable `--bootstrap-peer <multiaddr>`. **No DNS lookup in v0.2 substrate prep.**
+
+**Alternatives Considered**:
+1. **DNS-based seeds at `bootstrap.phasebased.net`** (Bitcoin Core pattern) — the right long-term answer, but requires owning DNS records, picking a TXT format, and writing the DNS-resolution code path. Bigger scope; deferred.
+2. **Hardcoded foundation peer-ids in the binary** — embed N peer-ids in the lucidd source. Operationally brittle (releases needed to add/remove relays) and centralizes trust in the build pipeline. Rejected.
+3. **libp2p Rendezvous Protocol** — proper service discovery, but requires the server side (`rendezvous::server::Behaviour`) to be wired into phase-net's `NetworkBehaviour`. Real v0.2 engineering work. Will be done — but the simpler `--bootstrap-peer` path unblocks today.
+
+**Consequences**:
+- Positive: minimum viable WAN bootstrap, works today, simple to reason about.
+- Negative: relay rotation requires consumers to update their config file or CLI flags. Acceptable for the v0.1.1 audience (technical contributors).
+- DNS-based seeds remain a clear v0.2 milestone — the wire-up here is *additive*, not a replacement.
+
+**References**:
+- `crates/phase-net/src/discovery.rs` (bootstrap-peer wire-up)
+- `crates/lucidd/src/main.rs` (CLI flag + `DiscoveryConfig` passthrough)
+- First foundation relay coordinates in `activeContext.md`
+
+---
+
+### 2026-05-28: Persistent Identity by Default, User-Level systemd for Relays
+
+**Status**: Accepted
+
+**Context**:
+Two operational sub-decisions landed in the same session:
+
+(a) `lucidd/main.rs` was calling `NodeIdentity::generate()` every startup (fresh ephemeral keypair), so every restart produced a new peer-id. That's incompatible with "be a bootstrap peer" because the peer-id is encoded in the multiaddr other nodes use to dial you.
+
+(b) Standing up lucidd as a long-running service required a process supervisor. `nohup` survives the launching shell but not reboot; raw cron-on-reboot lacks logging and restart-on-failure.
+
+**Decision**:
+(a) `NodeIdentity::load_or_create(path)` with `default_identity_path()` (platform-aware: `~/.config/phase/identity.key` on Linux). `--identity-path <path>` overrides. `phase-identity` already had `load_or_create`; main.rs just needed to use it.
+
+(b) **User-level systemd service** (`~/.config/systemd/user/lucidd-relay.service`, `WantedBy=default.target`). Combined with `loginctl enable-linger <user>`, the service starts at boot and survives logout — without ever needing root privileges to install. The unit file ships in the repo at `crates/lucidd/systemd/lucidd-relay.service`.
+
+**Alternatives Considered**:
+- **System-level service at `/etc/systemd/system/`** — standard pattern, but requires sudo for installation, places lucidd in the root-owned filesystem, and bleeds permission concerns into the operator setup story. Rejected for v0.2 prep; will reconsider when running on dedicated VPSes where the user IS root.
+- **Manual `nohup`** — adequate for one demo, brittle for any persistent role. Rejected.
+- **Docker container** — adds a runtime dependency. Lucidd is a single static-ish ELF binary; the simplest deployment is `install -m 0755 lucidd ~/bin/lucidd` + a systemd unit. Future packaged release may use systemd-nspawn or similar; not now.
+
+**Consequences**:
+- Positive: relay node restarts cleanly, journals to systemd-journald, survives logout, fits the homelab-operator pattern that the early-adopter audience already knows.
+- Negative: relay operators need to know that `loginctl enable-linger <user>` is a one-time sudo step. Documented in the unit file and the dist README.
+- User-level services have weaker security-hardening options than system-level (no `User=`, no `PrivateNetwork=`, etc.). Acceptable v0.2 trade-off; revisited when the foundation operates on cloud VPSes.
+
+**References**:
+- `crates/lucidd/systemd/lucidd-relay.service`
+- `crates/lucidd/src/main.rs` (identity path resolution)
+- `crates/phase-identity/src/keypair.rs` (`load_or_create` was there since M3)
+
+---
+
 ### 2026-05-27: Auto-Pause Policy is Declarative TOML + Pause-Not-Deprioritize
 
 **Status**: Accepted

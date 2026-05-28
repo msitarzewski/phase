@@ -214,23 +214,14 @@ impl Discovery {
         // discovery on a LAN, no global DHT bootstrap), we always want to
         // be a server so other peers can resolve our advertised records.
         let store = MemoryStore::new(local_peer_id);
-        let mut kad_behaviour = KademliaBehaviour::new(local_peer_id, store);
-        kad_behaviour.set_mode(Some(KademliaMode::Server));
-
-        // Add bootstrap peers.
-        for peer_addr in &config.bootstrap_peers {
-            if let Ok(_addr) = peer_addr.parse::<Multiaddr>() {
-                // Bootstrap peer format should be:
-                //   /ip4/x.x.x.x/tcp/port/p2p/PeerID
-                // The previous implementation logged but never actually
-                // added them; the parsing-and-routing path lands in a
-                // follow-up task on the M2 backlog.
-                debug!("Adding bootstrap peer: {}", peer_addr);
-            }
-        }
+        let kad_behaviour = {
+            let mut k = KademliaBehaviour::new(local_peer_id, store);
+            k.set_mode(Some(KademliaMode::Server));
+            k
+        };
 
         // Build swarm with tokio executor.
-        let swarm = SwarmBuilder::with_existing_identity(keypair)
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 libp2p::tcp::Config::default(),
@@ -276,6 +267,38 @@ impl Discovery {
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
+
+        // Wire up bootstrap peers. Format expected:
+        //   /ip4/x.x.x.x/tcp/<port>/p2p/<peer-id>
+        //   /dns4/host.example/tcp/<port>/p2p/<peer-id>
+        //   /ip6/...
+        // We extract the trailing /p2p/<id> component, add the address to
+        // Kademlia's routing table so DHT queries can route to it, then
+        // queue a dial so the connection establishes during driver startup.
+        for peer_addr_str in &config.bootstrap_peers {
+            match peer_addr_str.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    let peer_id_opt = addr.iter().find_map(|p| match p {
+                        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+                        _ => None,
+                    });
+                    match peer_id_opt {
+                        Some(peer_id) => {
+                            swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, addr.clone());
+                            match swarm.dial(addr.clone()) {
+                                Ok(()) => info!("Dialing bootstrap peer: {}", addr),
+                                Err(e) => warn!("Bootstrap dial failed: {}: {}", addr, e),
+                            }
+                        }
+                        None => warn!("Bootstrap peer missing /p2p/ component: {}", addr),
+                    }
+                }
+                Err(e) => warn!("Invalid bootstrap multiaddr {peer_addr_str:?}: {e}"),
+            }
+        }
 
         // Channel sized large enough for typical bursts (one command per
         // public method call). Backpressure here would mean the daemon is
