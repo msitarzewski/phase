@@ -31,3 +31,15 @@ Thumbs.db
 # Local AI tool configs
 .cascade_todo.json
 .claude/
+
+# Private key material. The Phase substrate uses Ed25519 keypairs via
+# phase-identity. Public keys (peer-ids) are safe to publish; private
+# keys are not. These patterns prevent accidental commits if someone
+# ever runs lucidd from inside the repo dir or scp's an identity.key
+# in for setup work. The legitimate location is always
+# ~/.config/phase/identity.key (Linux) or the platform equivalent.
+identity.key
+*.identity.key
+**/identity.key
+*.key
+!keys/*.pub.placeholder
