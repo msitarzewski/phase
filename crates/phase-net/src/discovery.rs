@@ -22,7 +22,7 @@ use libp2p::{
     identity::Keypair,
     kad::{
         store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent,
-        GetRecordOk, QueryId, QueryResult,
+        GetRecordOk, Mode as KademliaMode, QueryId, QueryResult,
     },
     mdns,
     request_response::{self, cbor, json, OutboundRequestId, ProtocolSupport, ResponseChannel},
@@ -207,9 +207,15 @@ impl Discovery {
             hex::encode(signing_key.verifying_key().to_bytes())
         );
 
-        // Create Kademlia behaviour.
+        // Create Kademlia behaviour. libp2p-kad 0.48 defaults new nodes to
+        // `Mode::Client`, which means they CAN issue queries but won't
+        // SERVE them — `GetRecord` requests to a client-mode peer fail
+        // with "protocol not supported". For our small-network use (mDNS
+        // discovery on a LAN, no global DHT bootstrap), we always want to
+        // be a server so other peers can resolve our advertised records.
         let store = MemoryStore::new(local_peer_id);
-        let kad_behaviour = KademliaBehaviour::new(local_peer_id, store);
+        let mut kad_behaviour = KademliaBehaviour::new(local_peer_id, store);
+        kad_behaviour.set_mode(Some(KademliaMode::Server));
 
         // Add bootstrap peers.
         for peer_addr in &config.bootstrap_peers {

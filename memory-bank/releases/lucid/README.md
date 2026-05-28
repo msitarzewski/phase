@@ -1,7 +1,7 @@
 # Release: LUCID — Layered Universal Compute Inference Daemon
 
-**Status: SOFTWARE COMPLETE 2026-05-27. M8 (live two-node demo) hardware-blocked.**
-M1 (scaffold + spike), M2 (LlamaCppWorker), M5 (router), M6 (model registry), M7 (policy + auto-pause) fully shipped. M4 (Ollama API) demo-sufficient — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/version`. M3 (MlxWorker) deferred to v0.1.1. `cargo test --workspace` 210 passing; `cargo clippy --workspace --all-targets -- -D warnings` clean. See `memory-bank/tasks/2026-05/README.md#lucid-m8` for the demo recipe once hardware arrives.
+**Status: RELEASED 2026-05-28. M8 live two-node demo proven on real hardware.**
+M1 (scaffold + spike), M2 (LlamaCppWorker), M5 (router), M6 (model registry), M7 (policy + auto-pause), M8 (live demo) all shipped. M4 (Ollama API) demo-sufficient — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/version`. M3 (MlxWorker) deferred to v0.1.1. Asciinema artifact at `dist/demos/lucid-2node-demo.cast`. Three v0.1 bugs caught during the demo session and fixed in place: `ModelCid::from_model_id` deterministic placeholder, `Kademlia::set_mode(Server)`, JSON peer-relay encoding (replacing bincode for `SignedManifest`). See `memory-bank/activeContext.md` for the postmortem.
 
 **Scope:** New Phase node implementation focused on open GPU inference. Exposes Ollama-compatible API on `:11434`, runs llama.cpp / MLX backends locally, routes overflow requests across the Phase DHT to peers with the requested model loaded.
 

@@ -167,6 +167,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     cli.llama_n_gpu_layers
                 };
+
+                // Auto-detect GGUFs and advertise them so the router's local
+                // check resolves on first request (otherwise the registry is
+                // empty until a model is loaded, causing Refused before
+                // ensure_loaded() even runs).
+                if let Ok(entries) = std::fs::read_dir(&model_dir) {
+                    let mut advertised = 0usize;
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) != Some("gguf") {
+                            continue;
+                        }
+                        let Some(model_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        // Deterministic placeholder CID derived from the
+                        // name via SHA-256 with domain separation. Two
+                        // peers see the same CID for the same model_id, so
+                        // a consume-only peer can DHT-look-up by name
+                        // without ever loading the weights itself. Real
+                        // content-hashed CIDs land in v0.2.
+                        let cid = lucidd::ModelCid::from_model_id(model_id);
+
+                        let caps = lucidd::ModelCapabilities::now(
+                            model_id,
+                            cid,
+                            "unknown",
+                            cli.llama_ctx_size as u32,
+                            1,
+                            "llama.cpp",
+                        );
+                        if let Err(e) = registry.advertise_loaded(caps).await {
+                            tracing::warn!(model = %model_id, error = %e, "failed to advertise");
+                        } else {
+                            advertised += 1;
+                            tracing::info!(model = %model_id, "advertised local model");
+                        }
+                    }
+                    tracing::info!(count = advertised, dir = ?model_dir, "advertised local models");
+                }
+
                 let config = LlamaCppConfig {
                     server_binary_path: cli.llama_server_binary.clone(),
                     model_dir,

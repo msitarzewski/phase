@@ -121,6 +121,31 @@ impl ModelCid {
         out.extend_from_slice(&self.0);
         out
     }
+
+    /// Deterministic placeholder CID derived from a model_id string.
+    ///
+    /// v0.1 stand-in for "real CID = SHA-256 of the GGUF weight file". Two
+    /// peers running the same model name compute the same CID *without*
+    /// reading the weights, which lets the router resolve
+    /// `find_peers_by_model_id("qwen3")` to a DHT key even when this peer
+    /// has no local copy of qwen3. The trade-off is that two peers serving
+    /// genuinely different files under the same name collide — fine for
+    /// the v0.1 demo, replaced by real content hashing in v0.2 when models
+    /// are pulled via `/api/pull` and verified.
+    ///
+    /// Uses SHA-256 with the domain-separation prefix
+    /// `b"phase/model-id-v1:"` so it is stable across Rust versions and
+    /// architectures (`DefaultHasher` is not).
+    pub fn from_model_id(model_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"phase/model-id-v1:");
+        hasher.update(model_id.as_bytes());
+        let out = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&out);
+        Self(bytes)
+    }
 }
 
 /// What a peer claims about a single loaded model.
@@ -593,10 +618,13 @@ impl ModelRegistry {
                 .find(|c| c.model_id == model_id)
                 .map(|c| c.model_cid)
         };
-        match cid_opt {
-            Some(cid) => self.find_peers_for_model(&cid).await,
-            None => Ok(Vec::new()),
-        }
+        // v0.1: when we don't have the model loaded locally, fall back to
+        // the deterministic name→CID derivation so the DHT lookup still
+        // happens. v0.2 will publish a separate cross-peer name index and
+        // verify with real content hashes; this fallback is what closes
+        // the loop for the two-node demo without that machinery.
+        let cid = cid_opt.unwrap_or_else(|| ModelCid::from_model_id(model_id));
+        self.find_peers_for_model(&cid).await
     }
 }
 

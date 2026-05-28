@@ -75,9 +75,23 @@ Workspace: 210 tests passing, ~20K LOC of Rust, `cargo clippy --workspace --all-
 
 ---
 
-## Hardware-Blocked Items
+## LUCID M8 — DONE 2026-05-28
 
-- **LUCID M8 (Two-node demo)** — software is ready; needs Machine A (Linux + 24GB+ NVIDIA GPU + llama-server + GGUF model) and Machine B (any second machine), Tailscale-bridged or real WAN. This is the *only* remaining blocker for the 0→1 demo.
+The two-node demo ran end-to-end on real hardware. Mac M5 Max (128GB) hosting Qwen3-Next 35B-A3B on Metal via `llama-server`; Parallels Ubuntu ARM64 VM at `10.211.55.5` with `lucidd --no-local-worker`. `curl http://localhost:11434/api/chat` from inside the VM routed via libp2p + Kademlia DHT, served on the Mac, streamed back NDJSON with `x-lucid-routed-via: peer:ctCUGwkd` and `x_phase_commitment: <sha256>` in the terminal frame. Asciinema captured at `dist/demos/lucid-2node-demo.cast`.
+
+### Three bugs the demo found that the test suite missed
+
+These were genuine v0.1 gaps that landed during the demo session, not test-only hacks:
+
+1. **`registry.rs` — name→CID lookup couldn't cross peers.** `find_peers_by_model_id("qwen3")` only checked the local loaded set; if a node had no local copy of the model, it couldn't translate the name into a DHT key. Fixed with `ModelCid::from_model_id`, a deterministic SHA-256 with `b"phase/model-id-v1:"` domain separation. Two peers compute the same CID for the same name without coordinating. v0.2 will replace this placeholder with real content-hashed CIDs from `/api/pull` verification.
+
+2. **`phase-net/discovery.rs` — Kademlia was Client-mode by default.** libp2p-kad 0.48 ships new nodes as `Mode::Client`, meaning they can issue queries but refuse to serve them. `GetRecord` requests came back as "protocol not supported". Fixed with `kad_behaviour.set_mode(Some(KademliaMode::Server))`. **Every v0.1 deployment hit this — the only reason internal tests passed is they all used the mock `DhtTransport` and never exercised real libp2p Kademlia between peers.**
+
+3. **`lucidd/router.rs` — bincode 1.x can't roundtrip `Option<DateTime<Utc>>` with `skip_serializing_if`.** The peer-relay request was `bincode(SignedManifest<JobSpec>)`; bincode bailed on the optional `expires_at` field. Switched to `serde_json` for both request and response payloads (CBOR-wrapped on the wire). Costs us ~1KB more per relay; gains us a transport that handles every serde type cleanly.
+
+### Honest postmortem
+
+The first "M8 complete" claim earlier in the day was premature — the user got lucidd starting cleanly on both sides and I jumped to "done." The actual end-to-end curl was never run that round. The follow-up session caught all three real bugs above. Lesson worth remembering: **"daemon starts cleanly" is not the same as "demo works."** Demo verification means running the actual user-facing command and seeing a real response. The protocol stack has multiple silent-failure modes (peer discovered but Kademlia in client mode; CID lookup mismatch; serialization incompatibility) that only show under real cross-peer load.
 - **LUCID M3 (MlxWorker)** — deferred to v0.1.1. Apple Silicon test rig needed for MLX path.
 - **Phase Boot hardware boot loop** — pre-existing November 2025 work; carry-forward from `tasks/2025-11/`. Real-hardware kexec on 2009 MacBook x86_64 was demonstrated; broader hardware matrix remains aspirational.
 

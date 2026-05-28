@@ -1,7 +1,7 @@
 release: lucid
 version: "0.1.0"
-status: software-complete
-released_on: "2026-05-27"
+status: released
+released_on: "2026-05-28"
 owner: Michael S.
 license: AGPL-3.0-or-later
 tagline: Open inference, on the public's hardware, that can't be turned off.
@@ -150,8 +150,9 @@ milestones:
   - id: M8
     name: End-to-End Demo
     description: Two-node demo with model loaded on one, request from the other
-    status: blocked-hardware
-    notes_v0_1: "Software ready. Needs Machine A (Linux + 24GB+ NVIDIA GPU + real llama-server + GGUF model) and Machine B (any second Linux machine), Tailscale-bridged or real WAN. Demo recipe in memory-bank/tasks/2026-05/README.md#lucid-m8."
+    status: complete
+    completed_on: "2026-05-28"
+    notes_v0_1: "Mac M5 Max hosting Qwen3-Next 35B-A3B on Metal via llama-server. Parallels Ubuntu ARM64 VM at 10.211.55.5 with lucidd --no-local-worker. curl localhost:11434/api/chat from inside the VM routed via Phase DHT to Mac. End-to-end ~2-4s for short responses. Asciinema artifact at dist/demos/lucid-2node-demo.cast. Three real v0.1 bugs landed during this session — ModelCid::from_model_id deterministic placeholder, Kademlia set_mode(Server), and JSON peer-relay encoding for bincode-incompatible SignedManifest. See activeContext.md for the postmortem."
     tasks_dir: tasks/M8
     deliverables:
       - Two machines on different networks (test via Tailscale or two real internet hops)

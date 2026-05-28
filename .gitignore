@@ -1,5 +1,7 @@
 # Rust workspace
 /target/
+/target-linux-arm64/
+/target-linux-x86_64/
 **/target/
 
 # Per-crate locks (workspace Cargo.lock IS committed; only per-example locks ignored)

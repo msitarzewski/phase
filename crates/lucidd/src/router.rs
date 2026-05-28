@@ -265,9 +265,13 @@ impl Router {
             .map_err(|e| RouterError::Relay(format!("manifest hash: {e}")))?;
         let job_id = JobId(manifest_hash);
 
-        // Encode the request payload. bincode keeps the wire compact;
-        // CBOR wraps it for transport.
-        let payload = bincode::serialize(&job)
+        // Encode the request payload as JSON. We initially tried bincode
+        // 1.x but `SignedManifest` has `expires_at: Option<DateTime<Utc>>`
+        // with `#[serde(skip_serializing_if = "Option::is_none")]`, which
+        // bincode 1.x can't roundtrip. JSON costs us a few extra bytes on
+        // the wire (~1-2KB per relay request) in exchange for compatibility
+        // with every serde-friendly type — fine for v0.1.
+        let payload = serde_json::to_vec(&job)
             .map_err(|e| RouterError::Relay(format!("encode SignedManifest: {e}")))?;
         let request = JobRelayRequest { payload };
 
@@ -294,7 +298,7 @@ impl Router {
             }
         };
 
-        let events: Vec<JobEvent> = bincode::deserialize(&events_bytes)
+        let events: Vec<JobEvent> = serde_json::from_slice(&events_bytes)
             .map_err(|e| RouterError::Relay(format!("decode peer events: {e}")))?;
         debug!(
             peer = %peer_id,
@@ -367,8 +371,9 @@ pub fn make_inbound_relay_handler(
         let registry = registry.clone();
         let policy = policy.clone();
         Box::pin(async move {
-            // 1. Decode.
-            let job: SignedManifest<JobSpec> = match bincode::deserialize(&bytes) {
+            // 1. Decode. JSON (matches the request-side encoding); see the
+            //    note on the requesting side about why not bincode.
+            let job: SignedManifest<JobSpec> = match serde_json::from_slice(&bytes) {
                 Ok(j) => j,
                 Err(e) => {
                     return JobRelayResponse::Err {
@@ -427,7 +432,7 @@ pub fn make_inbound_relay_handler(
             // the relay response.
             let _ = handle.finish().await;
 
-            let encoded = match bincode::serialize(&events) {
+            let encoded = match serde_json::to_vec(&events) {
                 Ok(b) => b,
                 Err(e) => {
                     return JobRelayResponse::Err {
