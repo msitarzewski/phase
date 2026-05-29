@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![deny(unsafe_code)]
+
 //! libp2p, Kademlia DHT, mDNS, Noise+QUIC transport. Decentralized peer
 //! discovery and capability advertisement for the Phase substrate.
 //!

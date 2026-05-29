@@ -11,6 +11,7 @@
 //! Persistence format is delegated to `storage` (raw 32-byte secret,
 //! `0o600` on Unix).
 
+use std::fmt;
 use std::path::Path;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -22,9 +23,29 @@ use crate::storage::{create_new_secret, read_secret, write_secret, SECRET_LEN};
 /// A persistent Ed25519 node identity. Cheap to clone (`SigningKey` is a
 /// 32-byte secret + cached scalar internally), so callers may freely pass
 /// it where they need to sign.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeIdentity {
     signing_key: SigningKey,
+}
+
+/// Manual `Debug` so a `NodeIdentity` can never leak its secret key. We print
+/// only the public key (the same 32 bytes from which the libp2p `PeerId` is
+/// derived), never the secret scalar. The derived `Debug` was replaced as a
+/// defense-in-depth measure: dalek 2.x already redacts the secret, but this
+/// guarantees that even a future `debug!("{identity:?}")` cannot regress into
+/// a key leak.
+impl fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut public_key_hex = String::with_capacity(64);
+        for byte in self.peer_id_bytes() {
+            // Lower-case hex, two digits per byte. No `hex` crate dependency.
+            use std::fmt::Write as _;
+            let _ = write!(public_key_hex, "{byte:02x}");
+        }
+        f.debug_struct("NodeIdentity")
+            .field("public_key", &public_key_hex)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NodeIdentity {
@@ -242,6 +263,40 @@ mod tests {
             let on_disk = NodeIdentity::load(&path).expect("load").peer_id_bytes();
             assert_eq!(on_disk, results[0], "disk must hold the single winner key");
         }
+    }
+
+    #[test]
+    fn debug_prints_public_key_and_never_the_secret() {
+        // Defense-in-depth: the manual Debug impl must surface only public
+        // material. A future `debug!("{identity:?}")` must never leak the
+        // secret scalar.
+        let id = NodeIdentity::generate();
+        let rendered = format!("{id:?}");
+
+        // The public key (peer-id material) appears as lower-case hex.
+        let pub_hex: String = id
+            .peer_id_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            rendered.contains(&pub_hex),
+            "Debug output must contain the public key hex; got: {rendered}"
+        );
+
+        // The secret bytes must NOT appear in any common encoding.
+        let secret = id.signing_key().to_bytes();
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !rendered.contains(&secret_hex),
+            "Debug output must not contain the secret key hex"
+        );
+        // Also reject the raw debug-array form of the secret bytes.
+        let secret_array_dbg = format!("{secret:?}");
+        assert!(
+            !rendered.contains(&secret_array_dbg),
+            "Debug output must not contain the raw secret byte array"
+        );
     }
 
     #[test]
