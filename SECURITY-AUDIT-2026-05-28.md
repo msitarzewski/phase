@@ -1,5 +1,26 @@
 # Phase / LUCID Security Audit — 2026-05-28
 
+> **REMEDIATION STATUS — 2026-05-28, branch `security-hardening`.** All findings remediated. 14-task hardening plan (`memory-bank/plans/security-hardening/`) executed in 5 waves. Workspace: 246 tests pass, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo audit` 0 vulnerabilities, `cargo deny check` ok. Per-finding status below.
+>
+> | Finding | Status | Fix |
+> |---|---|---|
+> | C1 signer authz | ✅ FIXED | SEC-01 — allowlist + PeerID-bind gate on relay + plasm, caps clamped |
+> | C2 wasmtime/deps | ✅ FIXED | SEC-02 — wasmtime 27→36, hickory 0.24→0.26; 20→0 vulns |
+> | C3 PHP SDK | ✅ FIXED | SEC-03 — downgrade + magic-string removed, pinned key mandatory |
+> | H1 path traversal | ✅ FIXED | SEC-04 — model_id confined, oracle closed, env_clear |
+> | H2 receipt verify | ✅ FIXED | SEC-05 — verify+bind (job_id/key/commitment), X-Lucid-Receipt-Verified |
+> | M1 inbound DoS | ✅ FIXED | SEC-06 — size caps, semaphore, off-driver exec |
+> | M2 worker limits | ✅ FIXED | SEC-07 — model LRU, port tracking |
+> | M3 key write race | ✅ FIXED | SEC-08 — atomic create_new+0600, exclusive publish |
+> | M4 DNS bootstrap | ✅ FIXED | SEC-09 — cap, /p2p/ pin, fail-closed fallback |
+> | M6 log injection | ✅ FIXED | SEC-10 — URI sanitize+cap |
+> | L2/L5/L7/L9 hygiene | ✅ FIXED | SEC-11 — deny(unsafe)×4, Debug redact, range stream, lock recover |
+> | L3/L4 dep hygiene | ✅ FIXED | SEC-12 — bincode→postcard; transitive unmaintained tracked |
+> | (process) advisory gate | ✅ ADDED | SEC-00 — CI + deny.toml + .cargo/audit.toml |
+> | L6 content CID | ⏳ DEFERRED | SEC-13 — v0.2 (needs /api/pull content layer) |
+>
+> Three dependency advisories remain documented-and-accepted in `.cargo/audit.toml` + `deny.toml` (2 hickory-proto-via-libp2p-mdns: upstream-pinned, link-local mDNS path; 1 nix: BSD-only, never compiled on our targets). `cargo deny` scopes unmaintained checking to first-party deps.
+
 **Scope:** Full-codebase sweep. 5 parallel specialist passes (network trust boundary, subprocess/path, cryptography, HTTP+PHP SDK, supply-chain/DoS/secrets) + empirical `cargo audit`.
 
 **Bottom line:** The cryptographic *primitives* are well-built (proper CSPRNG, domain separation, sound canonicalization, tamper-evident commitment chain). The **trust model around them is not enforced** — `verify()` proves "someone signed this," nobody checks "someone *authorized* signed this," and the verifiable-compute receipt loop is currently a no-op on the consumer side. Combined with a vulnerable wasmtime and missing DoS guards, a worker node exposed to the internet today is wide open. The good news: the one node currently on the public internet (umbp) runs `--mode relay` with **no worker**, so it refuses all jobs — the live exposure is latent, not active.

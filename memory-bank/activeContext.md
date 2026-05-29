@@ -37,6 +37,22 @@ crates/
 
 ---
 
+## Security Hardening COMPLETE (2026-05-28, branch `security-hardening`)
+
+A 5-agent security audit (`SECURITY-AUDIT-2026-05-28.md`) found sound crypto primitives but an unenforced trust model, 20 dependency advisories (incl. wasmtime sandbox escapes), and a PHP SDK verification bypass. The 14-task remediation plan (`memory-bank/plans/security-hardening/`) was executed in 5 agent-team waves, all on branch `security-hardening`:
+
+- **C1** (keystone): signer authorization — allowlist + PeerID-bind gate on the lucidd relay handler and plasm WASM worker; `verify()` now actually called before dispatch; manifest resource caps clamped server-side. Default-deny with `allow_unauthenticated_jobs=false` escape hatch (hybrid policy — Michael's call delegated, recommended option taken).
+- **C2**: wasmtime 27→36 (clears 16 advisories incl. aarch64/Winch sandbox escapes), hickory 0.24→0.26. `cargo audit` 20→0 vulnerabilities. hello.wasm byte-identical.
+- **C3**: PHP SDK — removed dual-format downgrade + `local_execution` magic-string bypass, pinned expected-key now mandatory.
+- **H1/H2**: model-path traversal confined; peer-served receipts verified + bound (job_id/worker-key/commitment) with `X-Lucid-Receipt-Verified` header.
+- **M1/M2/M3/M4/M6**: inbound DoS caps (size + semaphore + off-driver exec), worker model-LRU + port tracking, atomic 0600 key write, DNS-bootstrap caps + /p2p/ pin + fail-closed, URI log sanitization.
+- **Hygiene**: deny(unsafe_code) on all crates, NodeIdentity Debug redaction, streamed artifact ranges, lock-poison recovery, bincode→postcard (unmaintained).
+- **Process**: first CI workflow + `cargo audit`/`cargo deny` gate (`.github/workflows/security.yml`, `deny.toml`, `.cargo/audit.toml`).
+
+Three dependency advisories documented-and-accepted (upstream-pinned hickory via libp2p-mdns; BSD-only nix). v0.1 content-CID hardening (SEC-13/L6) deferred to v0.2.
+
+**Final gate:** 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns, `cargo deny check` ok. Branch not yet merged to main — pending review + a decision on redeploying the umbp relay from the hardened binary.
+
 ## LUCID Software COMPLETE (May 2026)
 
 - [x] **LUCID M1**: `crates/lucidd/` scaffold with AGPL-3.0 license. Echo worker spike validated the streaming Worker trait against real Ollama clients (`ollama` CLI v0.24 streamed `dlrow olleh` against EchoWorker via `/api/chat`).

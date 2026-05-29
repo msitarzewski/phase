@@ -3,7 +3,7 @@
 **Created:** 2026-05-28
 **Source:** [SECURITY-AUDIT-2026-05-28.md](../../../SECURITY-AUDIT-2026-05-28.md) (repo root)
 **Owner:** Michael S.
-**Status:** Planned — not started
+**Status:** ✅ COMPLETE (2026-05-28) — SEC-00 through SEC-12 shipped on branch `security-hardening` in 5 waves; SEC-13 deferred to v0.2. Workspace: 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns, `cargo deny check` ok. See the remediation table at the top of the audit doc.
 
 This plan turns the 2026-05-28 security audit findings into discrete, independently-shippable tasks. Each `SEC-NN-*.md` file is one task: objective, the finding it closes, exact files, fix approach, acceptance criteria, test plan, dependencies, effort.
 
