@@ -57,7 +57,13 @@ $client = new Plasm\Client(['mode' => 'remote']);
 $job = $client->createJob('hello.wasm')->submit();
 $result = $job->wait();
 echo $result->stdout();
-echo $result->receipt()->verify() ? "✓ Verified" : "✗ Failed";
+
+// SECURITY: verify() REQUIRES the pinned public key of the worker you trust.
+// The key embedded in the receipt is attacker-controlled and is never used for
+// the trust decision — only a real `phase-receipt:v1:` signature that matches
+// your pinned key is accepted. Legacy receipts are never trusted.
+$trustedWorkerPubkeyHex = getenv('PHASE_EXPECTED_WORKER_PUBKEY');
+echo $result->receipt()->verify($trustedWorkerPubkeyHex) ? "✓ Verified" : "✗ Failed";
 ```
 
 ## Validation

@@ -13,12 +13,17 @@ use futures_util::StreamExt;
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
 use phase_protocol::{JobEvent, JobSpec, WasmJobSpec, Worker};
-use plasm::worker::WasmtimeWorker;
+use plasm::worker::{WasmtimeWorker, WorkerSecurityConfig};
 
 #[tokio::test]
 async fn wasm_worker_emits_php_verifiable_receipt() {
     let id = NodeIdentity::generate();
-    let worker = WasmtimeWorker::new(id.clone());
+    // SEC-01: worker is deny-all by default. This boundary test signs with
+    // `id` and submits to itself; allowlist that key so the job dispatches.
+    let worker = WasmtimeWorker::new(id.clone()).with_security(WorkerSecurityConfig {
+        authorized_submitters: vec![hex::encode(id.verifying_key().to_bytes())],
+        ..WorkerSecurityConfig::default()
+    });
 
     let payload = JobSpec::Wasm(WasmJobSpec {
         module_cid: "inline".to_string(),

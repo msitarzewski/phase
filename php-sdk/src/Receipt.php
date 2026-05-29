@@ -147,26 +147,54 @@ class Receipt
     }
 
     /**
-     * Verify the receipt signature.
+     * Verify the receipt signature against a PINNED, caller-supplied public
+     * key.
      *
-     * If `$publicKey` is supplied, it is used instead of the key carried in
-     * the receipt; this is how a verifier pins to a known worker identity.
+     * Security contract (SEC-03 / audit C1+C3):
+     *
+     *  - The pinned key is MANDATORY. There is deliberately no zero-argument
+     *    form. A verifier must already know the public key of the worker it
+     *    trusts (from an operator allowlist, a libp2p PeerId binding, a
+     *    pre-shared key, etc.) and pass it here. The key embedded in the
+     *    receipt is attacker-controlled and is NEVER consulted for a trust
+     *    decision — it may only be displayed via `getNodePubkey()` to show
+     *    *who claims* to have signed.
+     *
+     *  - Only the M7 `phase-receipt:v1:` Ed25519-over-canonical-JSON path is
+     *    trusted. Legacy (November-2025 pipe-format) receipts can still be
+     *    parsed for display, but `verify()` returns false for them: there is
+     *    no downgrade path to a weaker signing format.
+     *
+     *  - There is no `local_execution` (or any other) magic-string bypass.
+     *    Trust in a locally-executed job must come from the transport context
+     *    the caller controls, never from a field inside the untrusted object.
+     *
+     * @param string $expectedPubkeyHex Hex-encoded Ed25519 public key the
+     *                                  caller trusts. Required.
+     * @return bool True only if this is a v1 signed envelope whose signature
+     *              verifies against `$expectedPubkeyHex`.
      */
-    public function verify(?string $publicKey = null): bool
+    public function verify(string $expectedPubkeyHex): bool
     {
-        // Local-execution mock always verifies — there is no real signature.
-        if (!$this->signedEnvelope && $this->nodePubkey === 'local_execution') {
-            return true;
+        // Legacy / non-envelope receipts are never trusted. No downgrade.
+        if (!$this->signedEnvelope) {
+            return false;
         }
 
-        if ($publicKey === null) {
-            return Crypto::verifyReceipt($this);
+        // Reject schema versions newer than we understand (mirrors the Rust
+        // verifier, which errors on schema_version > SCHEMA_VERSION).
+        if (($this->schemaVersion ?? 0) > Crypto::SCHEMA_VERSION) {
+            return false;
         }
 
-        // Caller pinned an explicit public key. Build the canonical message
-        // appropriate for this receipt's shape and verify against it.
+        if ($expectedPubkeyHex === '') {
+            return false;
+        }
+
+        // Verify the v1 signature against the PINNED key only. The receipt's
+        // own embedded worker_pubkey is intentionally ignored here.
         $message = Crypto::getCanonicalMessage($this);
-        return Crypto::verifySignature($message, $this->signature, $publicKey);
+        return Crypto::verifySignature($message, $this->signature, $expectedPubkeyHex);
     }
 
     // ------------------------------------------------------------------
@@ -209,6 +237,11 @@ class Receipt
     /**
      * The node / worker public key, hex-encoded. Returns `worker_pubkey`
      * for M7 envelopes and `node_pubkey` for legacy receipts.
+     *
+     * DISPLAY ONLY. This value comes straight from the untrusted receipt and
+     * states only *who claims* to have signed. Never use it as the pinned key
+     * for `verify()` — doing so would make verification self-referential and
+     * meaningless (see audit C1).
      */
     public function getNodePubkey(): string
     {

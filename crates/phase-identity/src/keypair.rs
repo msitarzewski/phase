@@ -17,7 +17,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
 use crate::error::IdentityError;
-use crate::storage::{read_secret, write_secret, SECRET_LEN};
+use crate::storage::{create_new_secret, read_secret, write_secret, SECRET_LEN};
 
 /// A persistent Ed25519 node identity. Cheap to clone (`SigningKey` is a
 /// 32-byte secret + cached scalar internally), so callers may freely pass
@@ -47,13 +47,28 @@ impl NodeIdentity {
     /// Load the identity at `path` if it exists, otherwise generate a new
     /// one and persist it to that path. This is the entry point the daemon
     /// uses on startup.
+    ///
+    /// Race-free: when several callers (threads, processes) hit a fresh path
+    /// at once, the persistence layer uses `O_CREAT|O_EXCL` so exactly one
+    /// creator wins and writes its key. Every loser observes `AlreadyExists`
+    /// and falls back to `load`, so all callers converge on the **same** key
+    /// and only one generation is ever published. This guarantees the
+    /// daemon's "stable peer id across restart" property even under
+    /// concurrent startup.
     pub fn load_or_create(path: &Path) -> Result<Self, IdentityError> {
         match Self::load(path) {
             Ok(id) => Ok(id),
             Err(IdentityError::NotFound(_)) => {
-                let id = Self::generate();
-                id.save(path)?;
-                Ok(id)
+                let candidate = Self::generate();
+                let secret = candidate.signing_key.to_bytes();
+                match create_new_secret(path, &secret) {
+                    // We won the create race: our generated key is the one on
+                    // disk.
+                    Ok(()) => Ok(candidate),
+                    // Someone else created it first; adopt the winner's key.
+                    Err(IdentityError::AlreadyExists(_)) => Self::load(path),
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -188,6 +203,45 @@ mod tests {
         NodeIdentity::generate().save(&path).expect("save");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "identity file must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn concurrent_load_or_create_converges_on_one_key() {
+        // Two threads race load_or_create on a fresh path. Exactly one
+        // creator may win the O_CREAT|O_EXCL publish; both threads must
+        // return the SAME key (the winner's), and the loser must adopt it
+        // via fallback load rather than generating a second key.
+        use std::sync::{Arc, Barrier};
+
+        // Repeat to make the race more likely to surface.
+        for _ in 0..32 {
+            let tmp = TempDir::new().unwrap();
+            let path = Arc::new(tmp.path().join("nested").join("race.key"));
+            let barrier = Arc::new(Barrier::new(2));
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = Arc::clone(&path);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        NodeIdentity::load_or_create(&path)
+                            .expect("load_or_create")
+                            .peer_id_bytes()
+                    })
+                })
+                .collect();
+
+            let results: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                results[0], results[1],
+                "both concurrent callers must converge on the same key"
+            );
+            // And that converged key is exactly what is persisted on disk:
+            // only one generation was published.
+            let on_disk = NodeIdentity::load(&path).expect("load").peer_id_bytes();
+            assert_eq!(on_disk, results[0], "disk must hold the single winner key");
+        }
     }
 
     #[test]

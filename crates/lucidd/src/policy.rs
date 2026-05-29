@@ -99,6 +99,29 @@ pub struct PolicyConfig {
     /// the router (M5) is expected to surface that as a peer-visible
     /// refusal.
     pub max_concurrent_remote_jobs: u32,
+
+    /// SEC-01: operator allowlist of authorized client pubkeys (lowercase
+    /// hex of the 32-byte Ed25519 verifying key). A signed manifest only
+    /// passes the authorization gate if its `signer_pubkey` appears here
+    /// (case-insensitive) — *after* `verify()` proves the signature.
+    ///
+    /// Default is **empty = deny everyone**. `verify()` only proves "some
+    /// keyholder signed this", not "an authorized party signed this"; the
+    /// allowlist is what pins the key to an authorized identity.
+    pub authorized_submitters: Vec<String>,
+
+    /// SEC-01 escape hatch: when `true`, skip the authorization gate
+    /// entirely and accept any manifest that passes `verify()`. This
+    /// restores the pre-SEC-01 open behavior and is **insecure** — it lets
+    /// any anonymous peer use this node's GPU. Intended only for local
+    /// development / single-machine testing. Default `false`.
+    pub allow_unauthenticated_jobs: bool,
+
+    /// SEC-01: server-side hard ceiling on a manifest's `max_tokens`. Any
+    /// manifest-supplied value above this is clamped down regardless of
+    /// what the (untrusted) client asked for. Protects against a peer
+    /// requesting an enormous generation to exhaust GPU time.
+    pub max_tokens_ceiling: u32,
 }
 
 impl Default for PolicyConfig {
@@ -111,6 +134,13 @@ impl Default for PolicyConfig {
             time_of_day_window: None,
             manual_pause: false,
             max_concurrent_remote_jobs: 4,
+            // SEC-01: default-deny. Operator must explicitly list keys, or
+            // flip `allow_unauthenticated_jobs` for local dev.
+            authorized_submitters: Vec::new(),
+            allow_unauthenticated_jobs: false,
+            // 8192 tokens is a generous default ceiling; operators can raise
+            // it. Clamps a hostile manifest's `max_tokens` server-side.
+            max_tokens_ceiling: 8192,
         }
     }
 }
@@ -124,6 +154,37 @@ pub struct TimeWindow {
     /// `start_hour_local > end_hour_local`, the window wraps midnight —
     /// `(23, 7)` means "23:00 through 06:59".
     pub end_hour_local: u8,
+}
+
+impl PolicyConfig {
+    /// SEC-01 authorization gate. Returns `true` if `pubkey_hex` (the
+    /// `signer_pubkey` from a *verified* manifest) is permitted to submit
+    /// work to this node. Comparison is case-insensitive on the hex.
+    ///
+    /// Order of decisions:
+    /// 1. `allow_unauthenticated_jobs == true` → accept anything (insecure
+    ///    local-dev mode).
+    /// 2. Otherwise the key must appear in `authorized_submitters`.
+    ///
+    /// NOTE (SEC-06 / PeerID-bind hook): v0.2 will additionally accept a key
+    /// whose bytes match the delivering libp2p `PeerId`. That requires the
+    /// relay handler to receive the peer identity (SEC-06). Until then, the
+    /// allowlist is the sole authorization source.
+    pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
+        if self.allow_unauthenticated_jobs {
+            return true;
+        }
+        self.authorized_submitters
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(pubkey_hex))
+    }
+
+    /// SEC-01: clamp a manifest-supplied `max_tokens` to the operator
+    /// ceiling. `None` (client didn't ask) stays `None`; any value above
+    /// the ceiling is reduced to it.
+    pub fn clamp_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
+        requested.map(|n| n.min(self.max_tokens_ceiling))
+    }
 }
 
 impl TimeWindow {
@@ -249,6 +310,25 @@ impl PolicyEngine {
     /// Snapshot of the current config. Cheap (`Clone`).
     pub fn config(&self) -> PolicyConfig {
         self.config.read().expect("policy config lock poisoned").clone()
+    }
+
+    /// SEC-01: is `pubkey_hex` (from a *verified* manifest) authorized to
+    /// submit work? Reads the live config under the lock. Cheap; never held
+    /// across an `.await`.
+    pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
+        self.config
+            .read()
+            .expect("policy config lock poisoned")
+            .is_authorized_submitter(pubkey_hex)
+    }
+
+    /// SEC-01: clamp a manifest-supplied `max_tokens` to the live operator
+    /// ceiling.
+    pub fn clamp_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
+        self.config
+            .read()
+            .expect("policy config lock poisoned")
+            .clamp_max_tokens(requested)
     }
 
     /// Snapshot of the current state. Cheap (`Clone`).
@@ -469,6 +549,30 @@ manual_pause = false
 # Hard ceiling on concurrent remote jobs. Past this, fresh requests are
 # refused with a structured reason. Local requests are not counted.
 max_concurrent_remote_jobs = 4
+
+# --- SEC-01: signer authorization (default-DENY) ---------------------------
+#
+# A signed job manifest only proves *some* keyholder signed it. To prove an
+# *authorized* party signed it, this node checks the manifest's signer pubkey
+# against the allowlist below AFTER verifying the signature.
+#
+# List the lowercase-hex Ed25519 public keys (64 hex chars each) you trust to
+# submit work to this node. Empty list = nobody is authorized (default-deny).
+#   authorized_submitters = [
+#     "3b6a...e9",   # alice's client key
+#     "f10c...22",   # ci runner
+#   ]
+authorized_submitters = []
+
+# INSECURE escape hatch for local development only. When true, the signer
+# allowlist is bypassed and ANY peer whose manifest verifies can use this
+# node's GPU. Never enable on an internet-exposed node.
+allow_unauthenticated_jobs = false
+
+# Server-side hard ceiling on a job's requested max_tokens. A hostile client
+# can ask for an enormous generation; this clamps it regardless of what the
+# manifest claims.
+max_tokens_ceiling = 8192
 "#;
 
 // ---------------------------------------------------------------------------
@@ -928,6 +1032,9 @@ mod tests {
             }),
             manual_pause: false,
             max_concurrent_remote_jobs: 2,
+            authorized_submitters: vec!["aa".repeat(32), "bb".repeat(32)],
+            allow_unauthenticated_jobs: false,
+            max_tokens_ceiling: 4096,
         };
         let serialized = toml::to_string(&original).expect("serialize");
         let parsed: PolicyConfig = toml::from_str(&serialized).expect("parse back");

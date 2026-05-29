@@ -49,7 +49,19 @@ echo "--------\n";
 echo "Output: " . $result->stdout() . "\n";
 echo "Exit code: " . $result->exitCode() . "\n";
 echo "Wall time: " . $result->receipt()->getWallTimeMs() . "ms\n";
-echo "Receipt verified: " . ($result->receipt()->verify() ? "✓" : "✗") . "\n";
+
+// Trust for LOCAL execution comes from the transport context, NOT from the
+// receipt object. We ran this job ourselves through LocalTransport, so we
+// already know it executed locally — there is no remote signer to pin.
+//
+// Receipt::verify() now REQUIRES a pinned public key and only trusts a real
+// `phase-receipt:v1:` Ed25519 envelope. A local mock receipt is unsigned, so
+// verify() would (correctly) return false. We therefore do NOT call verify()
+// here; the security guarantee is "we executed it", established by transport.
+//
+// If you ever receive a receipt over an untrusted channel, see remote_test.php
+// for the secure pinned-key verification pattern.
+echo "Execution trusted via local transport context (no remote signature).\n";
 
 if ($result->isSuccess()) {
     echo "\n✓ Success!\n";

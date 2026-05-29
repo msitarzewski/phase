@@ -373,7 +373,7 @@ pub fn make_inbound_relay_handler(
         Box::pin(async move {
             // 1. Decode. JSON (matches the request-side encoding); see the
             //    note on the requesting side about why not bincode.
-            let job: SignedManifest<JobSpec> = match serde_json::from_slice(&bytes) {
+            let mut job: SignedManifest<JobSpec> = match serde_json::from_slice(&bytes) {
                 Ok(j) => j,
                 Err(e) => {
                     return JobRelayResponse::Err {
@@ -381,6 +381,52 @@ pub fn make_inbound_relay_handler(
                     };
                 }
             };
+
+            // 1a. SEC-01: VERIFY the signature before trusting anything in
+            //     the manifest. The pre-SEC-01 code dispatched without ever
+            //     calling verify(), so any malformed/forged envelope reached
+            //     the worker. verify() proves "some keyholder signed this".
+            if let Err(e) = job.verify() {
+                warn!(error = %e, "relay: rejecting manifest that failed verify()");
+                return JobRelayResponse::Err {
+                    reason: format!("manifest verification failed: {e}"),
+                };
+            }
+
+            // 1b. SEC-01: AUTHORIZATION gate. verify() only proves *some*
+            //     keyholder signed it — not an *authorized* one. Require the
+            //     signer pubkey to be in the operator allowlist (or the
+            //     insecure `allow_unauthenticated_jobs` escape hatch).
+            //
+            //     SEC-06 / PeerID-bind hook: when SEC-06 plumbs the
+            //     delivering libp2p PeerId into this handler, also accept a
+            //     signer whose key bytes match that PeerId. Today the
+            //     PeerId is not available here, so the allowlist is the sole
+            //     authorization source. See SEC-06.
+            if !policy.is_authorized_submitter(&job.signer_pubkey) {
+                warn!(
+                    signer = %job.signer_pubkey,
+                    "relay: rejecting job from unauthorized signer (not in allowlist)"
+                );
+                return JobRelayResponse::Err {
+                    reason: "submitter not authorized".to_string(),
+                };
+            }
+
+            // 1c. SEC-01: clamp manifest-supplied resource limits to operator
+            //     maxima BEFORE dispatch, regardless of what the (untrusted)
+            //     client requested.
+            if let JobSpec::Inference(spec) = &mut job.payload {
+                let clamped = policy.clamp_max_tokens(spec.max_tokens);
+                if clamped != spec.max_tokens {
+                    debug!(
+                        requested = ?spec.max_tokens,
+                        clamped = ?clamped,
+                        "relay: clamped max_tokens to operator ceiling"
+                    );
+                    spec.max_tokens = clamped;
+                }
+            }
 
             // 2. Pull out the model id (so we can policy-check) and ensure
             //    the spec is an inference job.
@@ -746,6 +792,195 @@ mod tests {
         }
         assert!(saw_output, "expected at least one Output event");
         assert!(saw_final, "expected a terminal Final event");
+    }
+
+    // --- SEC-01: inbound relay handler authorization ----------------------
+
+    /// A spy worker that records how many times `execute` was invoked. Used
+    /// to prove the authz gate rejects *before* any worker dispatch.
+    #[derive(Clone)]
+    struct SpyWorker {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        inner: EchoWorker,
+    }
+    impl SpyWorker {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                inner: EchoWorker::new(),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl phase_protocol::Worker for SpyWorker {
+        fn supported_kinds(&self) -> &[phase_protocol::JobSpecKind] {
+            &[phase_protocol::JobSpecKind::Inference]
+        }
+        async fn execute(
+            &self,
+            job: SignedManifest<JobSpec>,
+        ) -> Result<(JobHandle, JobStream), WorkerError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.execute(job).await
+        }
+    }
+
+    fn inference_manifest(
+        client: &NodeIdentity,
+        model_id: &str,
+        max_tokens: Option<u32>,
+    ) -> SignedManifest<JobSpec> {
+        use phase_manifest::ManifestBuilder;
+        use phase_protocol::{ChatMessage, ChatRole, InferenceJobSpec, SamplingParams};
+        let spec = JobSpec::Inference(InferenceJobSpec {
+            model_cid: model_id.to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                images: vec![],
+            }],
+            prompt: None,
+            resume_from: None,
+            sampling: SamplingParams::default(),
+            max_tokens,
+            stream: true,
+        });
+        ManifestBuilder::new(spec).sign_with(client).unwrap()
+    }
+
+    async fn registry_with_model(model_id: &str) -> Arc<ModelRegistry> {
+        let identity = NodeIdentity::generate();
+        let transport: Arc<dyn DhtTransport> = Arc::new(MockDht::default());
+        let registry = Arc::new(ModelRegistry::new(identity, transport));
+        registry
+            .advertise_loaded(sample_caps(model_id, 1))
+            .await
+            .unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn sec01_relay_rejects_unauthorized_signer_without_dispatch() {
+        let spy = SpyWorker::new();
+        let worker: Arc<dyn DynWorker> = Arc::new(spy.clone());
+        let registry = registry_with_model("qwen3-mini").await;
+        // Default config: empty allowlist, allow_unauthenticated = false.
+        let policy = Arc::new(PolicyEngine::new_for_tests(
+            PolicyConfig::default(),
+            PolicyState::default(),
+        ));
+        let handler = make_inbound_relay_handler(worker, registry, policy);
+
+        let attacker = NodeIdentity::generate();
+        let manifest = inference_manifest(&attacker, "qwen3-mini", None);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let resp = handler(bytes).await;
+        match resp {
+            JobRelayResponse::Err { reason } => {
+                assert!(reason.contains("not authorized"), "reason: {reason}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert_eq!(spy.call_count(), 0, "worker must NOT be dispatched");
+    }
+
+    #[tokio::test]
+    async fn sec01_relay_accepts_allowlisted_signer() {
+        let spy = SpyWorker::new();
+        let worker: Arc<dyn DynWorker> = Arc::new(spy.clone());
+        let registry = registry_with_model("qwen3-mini").await;
+
+        let client = NodeIdentity::generate();
+        let manifest = inference_manifest(&client, "qwen3-mini", None);
+        // signer_pubkey is the canonical lowercase-hex the manifest carries.
+        let config = PolicyConfig {
+            authorized_submitters: vec![manifest.signer_pubkey.clone()],
+            ..PolicyConfig::default()
+        };
+        let policy = Arc::new(PolicyEngine::new_for_tests(config, PolicyState::default()));
+        let handler = make_inbound_relay_handler(worker, registry, policy);
+
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let resp = handler(bytes).await;
+        assert!(matches!(resp, JobRelayResponse::Ok { .. }), "got {resp:?}");
+        assert_eq!(spy.call_count(), 1, "allowlisted job should dispatch once");
+    }
+
+    #[tokio::test]
+    async fn sec01_relay_open_mode_accepts_any_verified_signer() {
+        // allow_unauthenticated_jobs = true restores pre-SEC-01 open behavior
+        // (local dev / demos). Any verified manifest dispatches.
+        let spy = SpyWorker::new();
+        let worker: Arc<dyn DynWorker> = Arc::new(spy.clone());
+        let registry = registry_with_model("qwen3-mini").await;
+        let config = PolicyConfig {
+            allow_unauthenticated_jobs: true,
+            ..PolicyConfig::default()
+        };
+        let policy = Arc::new(PolicyEngine::new_for_tests(config, PolicyState::default()));
+        let handler = make_inbound_relay_handler(worker, registry, policy);
+
+        let anyone = NodeIdentity::generate();
+        let manifest = inference_manifest(&anyone, "qwen3-mini", None);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let resp = handler(bytes).await;
+        assert!(matches!(resp, JobRelayResponse::Ok { .. }), "got {resp:?}");
+        assert_eq!(spy.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn sec01_relay_clamps_max_tokens_to_ceiling() {
+        // A manifest claiming max_tokens = u32::MAX must be clamped to the
+        // operator ceiling before the worker ever sees it.
+        let ceiling = 256u32;
+        let captured: Arc<StdMutex<Option<u32>>> = Arc::new(StdMutex::new(None));
+
+        #[derive(Clone)]
+        struct CaptureWorker {
+            captured: Arc<StdMutex<Option<u32>>>,
+            inner: EchoWorker,
+        }
+        impl phase_protocol::Worker for CaptureWorker {
+            fn supported_kinds(&self) -> &[phase_protocol::JobSpecKind] {
+                &[phase_protocol::JobSpecKind::Inference]
+            }
+            async fn execute(
+                &self,
+                job: SignedManifest<JobSpec>,
+            ) -> Result<(JobHandle, JobStream), WorkerError> {
+                if let JobSpec::Inference(spec) = &job.payload {
+                    *self.captured.lock().unwrap() = Some(spec.max_tokens.unwrap_or(0));
+                }
+                self.inner.execute(job).await
+            }
+        }
+
+        let worker: Arc<dyn DynWorker> = Arc::new(CaptureWorker {
+            captured: captured.clone(),
+            inner: EchoWorker::new(),
+        });
+        let registry = registry_with_model("qwen3-mini").await;
+        let client = NodeIdentity::generate();
+        let manifest = inference_manifest(&client, "qwen3-mini", Some(u32::MAX));
+        let config = PolicyConfig {
+            authorized_submitters: vec![manifest.signer_pubkey.clone()],
+            max_tokens_ceiling: ceiling,
+            ..PolicyConfig::default()
+        };
+        let policy = Arc::new(PolicyEngine::new_for_tests(config, PolicyState::default()));
+        let handler = make_inbound_relay_handler(worker, registry, policy);
+
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let resp = handler(bytes).await;
+        assert!(matches!(resp, JobRelayResponse::Ok { .. }), "got {resp:?}");
+
+        let seen = captured.lock().unwrap().expect("worker saw the job");
+        assert_eq!(seen, ceiling, "max_tokens must be clamped to ceiling");
     }
 
     #[test]
