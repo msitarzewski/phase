@@ -166,10 +166,11 @@ impl PolicyConfig {
     ///    local-dev mode).
     /// 2. Otherwise the key must appear in `authorized_submitters`.
     ///
-    /// NOTE (SEC-06 / PeerID-bind hook): v0.2 will additionally accept a key
-    /// whose bytes match the delivering libp2p `PeerId`. That requires the
-    /// relay handler to receive the peer identity (SEC-06). Until then, the
-    /// allowlist is the sole authorization source.
+    /// NOTE (SEC-06 / PeerID-bind): the relay handler (`router.rs`) now ALSO
+    /// accepts a signer whose Ed25519 key derives to the delivering libp2p
+    /// `PeerId` — implemented in `make_inbound_relay_handler` as an
+    /// alternative acceptance path alongside this allowlist. This method
+    /// remains the allowlist-only check; the bind is applied by the handler.
     pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
         if self.allow_unauthenticated_jobs {
             return true;
@@ -309,7 +310,15 @@ impl PolicyEngine {
 
     /// Snapshot of the current config. Cheap (`Clone`).
     pub fn config(&self) -> PolicyConfig {
-        self.config.read().expect("policy config lock poisoned").clone()
+        // SEC-11 (L9): recover from poison rather than re-panicking. A prior
+        // panic while holding the lock poisons it; re-panicking here would
+        // turn one fault into a node-wide policy-check outage. The guarded
+        // data (config/state) is plain data with no broken invariant, so
+        // reading through the poison is safe.
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// SEC-01: is `pubkey_hex` (from a *verified* manifest) authorized to
@@ -318,7 +327,7 @@ impl PolicyEngine {
     pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
         self.config
             .read()
-            .expect("policy config lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_authorized_submitter(pubkey_hex)
     }
 
@@ -327,13 +336,16 @@ impl PolicyEngine {
     pub fn clamp_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
         self.config
             .read()
-            .expect("policy config lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clamp_max_tokens(requested)
     }
 
     /// Snapshot of the current state. Cheap (`Clone`).
     pub fn state(&self) -> PolicyState {
-        self.state.read().expect("policy state lock poisoned").clone()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The actual decision function. `current_concurrency` is supplied by
@@ -341,8 +353,8 @@ impl PolicyEngine {
     /// because the router's bookkeeping is per-request and lives closer to
     /// the dispatch path.
     pub fn should_serve(&self, model_id: &str, current_concurrency: u32) -> PolicyDecision {
-        let config = self.config.read().expect("policy config lock poisoned").clone();
-        let state = self.state.read().expect("policy state lock poisoned").clone();
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         let decision = decide(&config, &state, model_id, current_concurrency);
         // Best-effort record of the last decision. We try a non-blocking
         // write so a contended watcher tick can't stall a request; if it
@@ -359,7 +371,7 @@ impl PolicyEngine {
     /// concern (M7 future work — the operator can also just edit the
     /// config file).
     pub async fn set_manual_pause(&self, paused: bool) {
-        let mut c = self.config.write().expect("policy config lock poisoned");
+        let mut c = self.config.write().unwrap_or_else(|e| e.into_inner());
         c.manual_pause = paused;
     }
 
@@ -375,7 +387,7 @@ impl PolicyEngine {
         let new = tokio::task::spawn_blocking(move || read_config(&path))
             .await
             .context("reload join")??;
-        *self.config.write().expect("policy config lock poisoned") = new;
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = new;
         if let Some(p) = &self.config_path {
             tracing::info!(path = %p.display(), "policy config reloaded");
         }

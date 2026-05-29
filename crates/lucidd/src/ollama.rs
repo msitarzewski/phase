@@ -170,6 +170,11 @@ pub const HEADER_LOCAL_ONLY: &str = "x-lucid-local-only";
 /// served. `local` or `peer:<short>`; omitted on Refused.
 pub const HEADER_ROUTED_VIA: &str = "x-lucid-routed-via";
 
+/// SEC-05: HTTP response header reporting whether a peer-served job's signed
+/// receipt verified and bound to the dispatched job + peer. `true` / `false` /
+/// `unverifiable`; omitted on the local path (no peer receipt to assert).
+pub const HEADER_RECEIPT_VERIFIED: &str = "x-lucid-receipt-verified";
+
 /// Parse `X-Lucid-Local-Only`. Anything that looks truthy ("1", "true",
 /// "yes", case-insensitive) flips the flag. Absent / empty → false.
 fn parse_local_only(headers: &HeaderMap) -> bool {
@@ -369,18 +374,19 @@ async fn handle_generate(
         }
     };
 
-    let (handle, mut job_stream) = match state.router.execute(&decision, manifest).await {
-        Ok(t) => t,
-        Err(RouterError::Refused { reason }) => return refused_response(&reason),
-        Err(e) => {
-            tracing::error!(error = %e, "router dispatch failed (/api/generate)");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("router dispatch failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+    let (handle, mut job_stream, receipt_verification) =
+        match state.router.execute(&decision, manifest).await {
+            Ok(t) => t,
+            Err(RouterError::Refused { reason }) => return refused_response(&reason),
+            Err(e) => {
+                tracing::error!(error = %e, "router dispatch failed (/api/generate)");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("router dispatch failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let job_id = handle.job_id().clone();
     let started_at = std::time::Instant::now();
@@ -440,6 +446,12 @@ async fn handle_generate(
         if let Some(rv) = routed_via.as_deref() {
             if let Ok(hv) = rv.parse() {
                 resp.headers_mut().insert(HEADER_ROUTED_VIA, hv);
+            }
+        }
+        // SEC-05: surface peer-receipt verification status.
+        if let Some(v) = receipt_verification.header_value() {
+            if let Ok(hv) = v.parse() {
+                resp.headers_mut().insert(HEADER_RECEIPT_VERIFIED, hv);
             }
         }
         tracing::info!(%job_id, "non-streaming generate complete");
@@ -530,6 +542,11 @@ async fn handle_generate(
     if let Some(rv) = routed_via.as_deref() {
         builder = builder.header(HEADER_ROUTED_VIA, rv);
     }
+    // SEC-05: the relay batch (and its receipt) is fully verified inside the
+    // router before streaming starts, so the verdict is known here.
+    if let Some(v) = receipt_verification.header_value() {
+        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
+    }
     builder
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response())
@@ -591,7 +608,8 @@ async fn handle_chat(
         }
     };
 
-    let (handle, mut job_stream) = match state.router.execute(&decision, manifest).await {
+    let (handle, mut job_stream, receipt_verification) =
+        match state.router.execute(&decision, manifest).await {
         Ok(t) => t,
         Err(RouterError::Refused { reason }) => return refused_response(&reason),
         Err(e) => {
@@ -666,6 +684,12 @@ async fn handle_chat(
         if let Some(rv) = routed_via.as_deref() {
             if let Ok(hv) = rv.parse() {
                 resp.headers_mut().insert(HEADER_ROUTED_VIA, hv);
+            }
+        }
+        // SEC-05: surface peer-receipt verification status.
+        if let Some(v) = receipt_verification.header_value() {
+            if let Ok(hv) = v.parse() {
+                resp.headers_mut().insert(HEADER_RECEIPT_VERIFIED, hv);
             }
         }
         tracing::info!(%job_id, "non-streaming chat complete");
@@ -773,6 +797,10 @@ async fn handle_chat(
         .header("X-Phase-Worker", "lucidd");
     if let Some(rv) = routed_via.as_deref() {
         builder = builder.header(HEADER_ROUTED_VIA, rv);
+    }
+    // SEC-05: peer-receipt verdict is known before streaming starts.
+    if let Some(v) = receipt_verification.header_value() {
+        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
     }
     builder
         .body(body)
