@@ -799,6 +799,8 @@ The 2026-05-28 audit's keystone finding (C1): `SignedManifest::verify()` checks 
 - Negative: contributors must be allowlisted (or rely on PeerID-bind semantics) — friction matching the intended soft launch.
 - The decision was delegated to the agent during the "get'r done" hardening run; recommended option taken and flagged for Michael's review. Reversible via config.
 
+**Revisit trigger** (Michael, 2026-05-29): default-deny is right *for now*. Flip the default toward open once (a) the network serves sliced/distributed models (v0.2 `ExoProxyWorker` / multi-node sharding) AND (b) the inference infra can handle open load — gated by the rate-limit + reputation end-state above. Capability-gated, not date-gated; treat the flip as an in-scope deliverable of the v0.2 sharding milestone. Until then, use `allow_unauthenticated_jobs=true` for local dev rather than flipping the production default early.
+
 **References**: `crates/lucidd/src/policy.rs`, `crates/lucidd/src/router.rs` (`make_inbound_relay_handler`), `crates/plasm/src/worker.rs`, SEC-01 task file.
 
 ---
