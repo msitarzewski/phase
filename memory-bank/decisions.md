@@ -1,7 +1,7 @@
 # Architectural Decisions: Phase Open MVP + Phase Core + LUCID
 
 **Last Updated**: 2026-05-29
-**Version**: 0.4 (security hardening — branch `security-hardening`)
+**Version**: 0.5 (security hardening + multi-workload / sharded-verification architecture notes)
 
 ---
 
@@ -848,6 +848,70 @@ Migrate to **postcard** (maintained, deterministic, compact — good for signed 
 - Negative: v1↔v2 advertisements don't interoperate (clean break) — fine at v0.1 scale; postcard transitively pulls `heapless`→`atomic-polyfill` (itself unmaintained, transitive — accepted per the cargo-deny scoping decision above).
 
 **References**: `crates/lucidd/src/registry.rs`, SEC-12 task file.
+
+---
+
+### 2026-05-29: Per-workload node implementations (diffusion is a separate node, not a LUCID mode)
+
+**Status**: Accepted (architectural direction; informs present-day LUCID + substrate discipline, implementation post-v0.1)
+
+**Context**:
+Prompted by reviewing ComfyUI PR #7063 (single-host multi-GPU work-unit splitting for diffusion sampling) and asking what it implies for LUCID. The substrate (`phase-net`/`phase-identity`/`phase-manifest`/`phase-receipt`/`phase-protocol`/`phase-artifact-server`) is workload-agnostic by design; `JobSpec` is `#[non_exhaustive]` and the `Worker` trait was built so new workload types slot in (MISSION.md lists "phase-render" / image-gen / science as future). Question: should diffusion be a LUCID feature/mode, or its own node?
+
+**Decision**:
+**Diffusion (and other non-streaming, blob-output, non-autoregressive workloads) is a SEPARATE Phase node implementation** — its own daemon + its own `JobSpec` variant(s) + its own `Worker` impl + its own native API surface — sharing the same Phase substrate crates. Not a mode inside `lucidd`. The shape differences are fundamental, not cosmetic:
+
+| Axis | LUCID (LLM inference) | Diffusion node |
+|---|---|---|
+| Client API (the compat wedge) | Ollama `/api/chat`, token streaming | ComfyUI graph / `diffusers` / A1111 `/sdapi` — different ecosystem |
+| Result shape | stream of tokens; commitment = SHA-256 chain over chunks | large image/video blob (+ optional denoise-step previews) |
+| Execution profile | autoregressive, KV-cache, latency-per-token, context length | fixed-step denoise loop, no KV-cache, batch/conditioning-parallel, VRAM = model+latents+VAE |
+| Backend wrapped | llama.cpp / MLX | ComfyUI / diffusers / sd.cpp |
+| Model format | GGUF | safetensors/checkpoints + LoRA/VAE/embedding ecosystem |
+| Substrate stress | compute protocol; barely touches artifact-server | **hammers `phase-artifact-server`** — checkpoints are GBs, outputs are large blobs |
+
+**Key observation**: diffusion is the workload that exercises the *content-addressed-blob half* of the substrate that LUCID v0.1 leaves mostly idle (LUCID's weights are out-of-band, outputs are small token streams). The substrate was designed with both halves; LUCID validates the compute half, a diffusion node validates the artifact half. This is evidence the workload-agnostic bet is sound — but only if we hold the line below.
+
+**Present-day constraint (the actionable part)**: keep `phase-protocol` (`JobSpec`, `Worker`, `JobEvent`, the commitment model) free of inference-specific assumptions, so a diffusion node slots in **without substrate changes**. Any inference-ism leaking into the protocol layer (token-shaped events as the only event type, KV-cache concepts in the trait, Ollama assumptions in `phase-*`) is a substrate-first violation to be caught in review. This is "substrate first, then product" (MISSION.md principle 1) made concrete.
+
+**Alternatives Considered**:
+1. **Diffusion as a LUCID mode** — rejected; would force two unrelated API surfaces + result shapes + scheduling models into one daemon, and bleed inference assumptions into shared code.
+2. **A generic "media" node covering inference + diffusion** — rejected; the only thing they share is the substrate, which is already the shared layer. A node's job is to be native to its ecosystem's clients.
+
+**Consequences**:
+- Positive: each node speaks its ecosystem's native protocol (compatibility-as-wedge, per-domain); the substrate stays clean; proves workload-agnosticism with a second real consumer.
+- Naming: substrate crates stay `phase-*`; node flagships get product brands (plasm, LUCID, and a third for diffusion — MISSION's working name is "phase-render"; a consumer brand TBD the way LUCID is inference's).
+- Timing: post-LUCID-v0.1, likely parallel to / after LUCID v0.2. Not now. Recording it now is to (a) confirm the substrate bet and (b) constrain what does NOT leak into `phase-protocol` during LUCID development.
+
+**References**: MISSION.md (layering + "Future" nodes), `crates/phase-protocol/` (`JobSpec` `#[non_exhaustive]`, `Worker`), ComfyUI PR #7063 (the prompt).
+
+---
+
+### 2026-05-29: Verifying sharded / partial computation is an unsolved open problem (recorded risk)
+
+**Status**: Open problem — recorded, not solved. Blocks the trust story for v0.2 `ExoProxyWorker` (LUCID sharding) and for any distributed diffusion.
+
+**Context**:
+v0.1's verifiable-compute guarantee rests on the commitment accumulator (`phase-protocol/commitment.rs`): a worker folds emitted output chunks into a SHA-256 chain, signs the terminal state, and a verifier **replays the received chunks** to confirm the worker produced exactly what it signed. This works because the verifier *has* the output and can cheaply recompute the commitment over it. SEC-05 wired this into the consumer side (receipt verify + bind).
+
+That model **breaks for sharded / partial computation**:
+- **Sharded LLM (v0.2 ExoProxyWorker)**: a peer computes an intermediate hidden-state tensor for layers N..M and hands it to the next peer. There is no cheap way for the requester to verify that tensor is correct without re-running those layers (which defeats the point of offloading them). The commitment-replay trick doesn't apply — you can't replay what you didn't run.
+- **Distributed diffusion**: same shape — a peer denoises some steps / some conditioning; verifying it did so honestly means re-doing the work. Worse, cross-hardware float nondeterminism means two *honest* GPUs produce slightly different outputs, so bitwise reproduction fails and you're into fuzzy/perceptual comparison.
+
+This is a genuinely hard, partly-open research area (verifiable/attested computation, redundant execution + voting, ZK proofs of inference — all expensive or immature). It is distinct from, and harder than, the token-commitment v0.1 ships.
+
+**Candidate directions (none chosen)**:
+1. **Redundant execution + cross-check** — run the same shard on K peers, compare (with a tolerance for float nondeterminism), trust the majority. Costs Kx compute; tolerance tuning is fiddly.
+2. **Reputation + random spot-checking** — occasionally re-run a shard yourself and ding peers that diverge. Probabilistic, cheap, pairs with the reputation system already planned for v0.2.
+3. **Trusted execution (TEE/attestation)** — strong but hardware-gated and against the "anyone's consumer GPU" ethos.
+4. **ZK proofs of inference** — cryptographically ideal, currently far too expensive for real model sizes.
+
+**Consequences / why recorded now**:
+- The v0.2 sharding milestone must treat "how do we verify a peer's partial result" as a **first-class design problem with its own decision**, not an afterthought — the v0.1 receipt/commitment machinery does not cover it.
+- This is *why* default-deny authorization (the 2026-05-28 hybrid-authz ADR) matters **more**, not less, once peers compute partial results for each other: until partial-compute verification exists, you want jobs flowing only among attributable/curated peers. Ties directly to the "flip the authz default once infra can handle it" trigger.
+- Likely landing spot: redundant-execution + reputation spot-checking (2 + 1 combined) as the pragmatic v0.2 answer, with TEE/ZK as later research. Not decided here.
+
+**References**: `crates/phase-protocol/commitment.rs`, `crates/lucidd/src/router.rs` (SEC-05 receipt verify+bind), the 2026-05-28 hybrid-authz ADR, releases/lucid (v0.2 `ExoProxyWorker`).
 
 ---
 
