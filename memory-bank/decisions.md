@@ -1,7 +1,7 @@
 # Architectural Decisions: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-05-27
-**Version**: 0.3 (phase-core + LUCID software released May 2026)
+**Last Updated**: 2026-05-29
+**Version**: 0.4 (security hardening — branch `security-hardening`)
 
 ---
 
@@ -776,6 +776,76 @@ LUCID operators need granular control over *when* this node serves inference for
 **References**:
 - `crates/lucidd/src/policy.rs`
 - MISSION.md (the auto-pause discussion in the early sprint)
+
+---
+
+### 2026-05-28: Hybrid signer-authorization policy (default-deny allowlist + PeerID-bind)
+
+**Status**: Accepted (security hardening SEC-01; the v0.1 authorization model)
+
+**Context**:
+The 2026-05-28 audit's keystone finding (C1): `SignedManifest::verify()` checks a signature against the pubkey embedded *in the object*, proving "someone signed this" but not "an authorized party signed this." The lucidd relay handler didn't even call `verify()`, and plasm ran any self-signed WASM. With no authorization, any anonymous internet peer could spend a worker node's GPU / run arbitrary sandboxed code. A policy decision was required: how does a node decide which signed jobs to execute?
+
+**Decision**:
+**Hybrid.** A job is authorized if EITHER (a) its signer pubkey is in the operator's `authorized_submitters` allowlist, OR (b) the signer pubkey derives to the libp2p `PeerId` that delivered the request (PeerID-bind). Default-deny: empty allowlist + an `allow_unauthenticated_jobs = false` escape hatch (documented insecure, for local dev/testing). Server-side resource caps (`max_memory`/`max_duration`/`max_tokens`) clamp manifest-supplied values regardless of what the manifest claims.
+
+**Alternatives Considered**:
+1. **Pure allowlist** — simplest, matches the documented soft-launch plan, but requires out-of-band key exchange for every contributor.
+2. **Pure open + rate-limit + reputation** — the eventual v0.2+ shape, but reputation infrastructure doesn't exist yet; open-without-it is the current vulnerability.
+3. **Hybrid (chosen)** — allowlist for curated soft-launch peers, PeerID-bind so a connected peer is attributable even without prior allowlisting, escape hatch for local dev. Ships the safe default now with the v0.2 relaxation path already plumbed.
+
+**Consequences**:
+- Positive: closes anonymous-execution; default-deny is safe-by-default; PeerID-bind makes every accepted job attributable to a libp2p identity; caps bound resource abuse.
+- Negative: contributors must be allowlisted (or rely on PeerID-bind semantics) — friction matching the intended soft launch.
+- The decision was delegated to the agent during the "get'r done" hardening run; recommended option taken and flagged for Michael's review. Reversible via config.
+
+**References**: `crates/lucidd/src/policy.rs`, `crates/lucidd/src/router.rs` (`make_inbound_relay_handler`), `crates/plasm/src/worker.rs`, SEC-01 task file.
+
+---
+
+### 2026-05-28: Document-and-justify unreachable advisories; cargo-deny scoped to first-party
+
+**Status**: Accepted (security hardening SEC-02/SEC-00)
+
+**Context**:
+After upgrading wasmtime (27→36) and hickory (0.24→0.26) cleared 17 of 20 advisories, three remained that cannot be fixed without forking upstream: two hickory-proto 0.25.2 advisories reachable only via `libp2p-mdns 0.48` (which hard-pins `^0.25.2`), and one `nix 0.19.1` advisory pulled by `battery` only under `cfg(freebsd/dragonfly)`. Forcing a `[patch]` to a breaking hickory line would not compile; the nix code never builds on our targets. Question: fail the gate forever, or suppress?
+
+**Decision**:
+**Document-and-justify, never blanket-suppress.** Each accepted advisory is listed in `.cargo/audit.toml` AND `deny.toml` with a per-ID reachability justification and a "clear when…" condition. For `cargo deny`, unmaintained-crate checking is scoped `unmaintained = "workspace"` (encoded in config, not a CLI flag) so the gate fails only when a *first-party/direct* dependency goes unmaintained (actionable — this is the signal SEC-12 acted on for bincode), while transitive unmaintained crates we don't control stay visible in `cargo audit` output without blocking.
+
+**Alternatives Considered**:
+1. **Force `[patch]` to patched upstream lines** — doesn't compile (breaking API in a transitively-pinned crate); rejected.
+2. **Blanket-disable advisory checking** — defeats the purpose; rejected.
+3. **Document-and-justify with reachability analysis (chosen)** — honest, keeps `cargo audit`/`cargo deny` green and meaningful, with explicit revisit triggers tied to upstream releases.
+
+**Consequences**:
+- Positive: the CI advisory gate is both green and honest; a genuinely-new vulnerability still fails; revisit conditions are written down.
+- Negative: the ignore list must be kept in sync between `.cargo/audit.toml` and `deny.toml` (noted in both files); accepted advisories require periodic re-review as upstreams release.
+
+**References**: `.cargo/audit.toml`, `deny.toml`, `.github/workflows/security.yml`, SEC-00 / SEC-02 task files.
+
+---
+
+### 2026-05-28: bincode → postcard for signed DHT records (schema v2 clean break)
+
+**Status**: Accepted (security hardening SEC-12)
+
+**Context**:
+`bincode 1.x` (unmaintained, RUSTSEC-2025-0141) was used directly in `registry.rs` both for the DHT wire envelope and for the canonical bytes that get Ed25519-signed in `SignedModelAdvertisement`. Because the encoding is part of the signed canonical bytes, swapping it changes what verifies.
+
+**Decision**:
+Migrate to **postcard** (maintained, deterministic, compact — good for signed payloads). Bump `ADVERTISEMENT_SCHEMA_VERSION` 1→2 and take a deliberate clean break: a v2 reader rejects v1 records on the schema-version check before signature verification. Acceptable because the v0.1 network is tiny. A single private helper produces both the signed canonical bytes and the wire encoding, so they cannot drift.
+
+**Alternatives Considered**:
+1. **bincode 2.x** — maintained successor but a different API and still less deterministic-by-design than postcard.
+2. **Reuse canonical-JSON** (as manifests/receipts do) — consistent, but ~2× larger over the DHT.
+3. **postcard (chosen)** — compact, stable wire format, deterministic, actively maintained.
+
+**Consequences**:
+- Positive: off the unmaintained crate; smaller records; one code path for sign + wire so no drift.
+- Negative: v1↔v2 advertisements don't interoperate (clean break) — fine at v0.1 scale; postcard transitively pulls `heapless`→`atomic-polyfill` (itself unmaintained, transitive — accepted per the cargo-deny scoping decision above).
+
+**References**: `crates/lucidd/src/registry.rs`, SEC-12 task file.
 
 ---
 

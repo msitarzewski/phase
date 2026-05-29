@@ -115,11 +115,40 @@ The full coffee-shop / NAT-traversal story (`libp2p::relay::server::Behaviour` +
 - Peer-relay batch-shaped (no token streaming across the relay).
 - No multi-peer retry on first-peer failure.
 - Cross-peer name → CID registry not built (Node B needs to know the model name string).
-- Peer-served full `SignedReceipt<JobResult>` doesn't propagate back (only commitment rides in events).
+- ~~Peer-served full `SignedReceipt<JobResult>` doesn't propagate back~~ — CLOSED by SEC-05 (security hardening): `JobRelayResponse` now carries the receipt, which is verified + bound consumer-side.
 - `/api/embeddings` and `/api/pull` not implemented.
 - Policy refuses self-traffic when on battery — needs "self-traffic always allowed" knob for laptop UX.
 
 See [memory-bank/releases/lucid/](releases/lucid/) for the full release plan.
+
+---
+
+### Security Hardening COMPLETE (2026-05-28 → 29, branch `security-hardening`)
+
+A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of file carries the per-finding remediation table) found sound crypto primitives but an **unenforced trust model**, **20 dependency advisories** (incl. wasmtime sandbox escapes), and a **PHP SDK verification bypass**. The 14-task plan (`memory-bank/plans/security-hardening/`) was executed by an agent team in 5 integration-verified waves.
+
+| Task | Finding | Fix |
+|---|---|---|
+| SEC-01 | C1 — `verify()` ≠ authorized (keystone) | allowlist + PeerID-bind gate on lucidd relay + plasm worker; verify() before dispatch; server-side cap clamp |
+| SEC-02 | C2 — 20 advisories incl. wasmtime sandbox escape | wasmtime 27→36, hickory 0.24→0.26; `cargo audit` 20→0; hello.wasm byte-identical |
+| SEC-03 | C3 — PHP SDK forgeable | removed dual-format downgrade + `local_execution` bypass; pinned key mandatory |
+| SEC-04 | H1 — model_id path traversal | confined resolve_model_path; error oracle closed; env_clear |
+| SEC-05 | H2 — receipts dropped unverified | verify + bind (job_id/worker-key/commitment); `X-Lucid-Receipt-Verified` header |
+| SEC-06 | M1 — inbound DoS | request/response size caps, concurrency semaphore, off-driver execution |
+| SEC-07 | M2 — unbounded worker load | model LRU eviction, port tracking |
+| SEC-08 | M3 — key-write race | atomic create_new+0600, exclusive publish |
+| SEC-09 | M4 — DNS bootstrap trust | cap, /p2p/ pin, fail-closed resolver fallback |
+| SEC-10 | M6 — log injection | URI sanitize + cap |
+| SEC-11 | L2/L5/L7/L9 hygiene | deny(unsafe)×8, NodeIdentity Debug redaction, streamed ranges, lock-poison recovery |
+| SEC-12 | L3/L4 dep hygiene | bincode→postcard (schema v2); transitive unmaintained tracked |
+| SEC-00 | process gap | first CI workflow + `cargo audit`/`cargo deny` gate |
+| SEC-13 | L6 — name-derived CID | DEFERRED to v0.2 (needs `/api/pull` content layer) |
+
+**Final gate:** 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulnerabilities, `cargo deny check` ok, all 8 crates `#![deny(unsafe_code)]`.
+
+Three dependency advisories documented-and-accepted (`.cargo/audit.toml` + `deny.toml`): 2 hickory-proto reachable only via libp2p-mdns (upstream-pinned, link-local path, no DNSSEC); 1 nix compiled only on freebsd/dragonfly (never built on our targets).
+
+See [memory-bank/plans/security-hardening/](plans/security-hardening/) for the full plan + per-task files.
 
 ---
 
