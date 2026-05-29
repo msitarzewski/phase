@@ -13,12 +13,12 @@
 //!
 //! ```text
 //! key   = b"phase/model/" || model_cid (32 bytes)   // 44 bytes total
-//! value = bincode(SignedModelAdvertisement)
+//! value = postcard(SignedModelAdvertisement)
 //! ```
 //!
 //! `SignedModelAdvertisement` carries the [`ModelCapabilities`], the
 //! advertising peer's Ed25519 public key, and a signature over the
-//! canonical form (`bincode(ad)` without the signature field). The schema
+//! canonical form (`postcard(ad)` without the signature field). The schema
 //! is tagged with [`ADVERTISEMENT_SCHEMA_VERSION`] so future shapes can
 //! be added without breaking old advertisers.
 //!
@@ -78,9 +78,21 @@ use tracing::{debug, warn};
 
 /// Wire schema version for [`SignedModelAdvertisement`].
 ///
-/// Bumped when fields are added/removed in a non-additive way. Readers
-/// must check this before trusting the rest of the payload.
-pub const ADVERTISEMENT_SCHEMA_VERSION: u32 = 1;
+/// Bumped when fields are added/removed in a non-additive way **or when the
+/// encoding changes** — because the signing payload is encoded and then
+/// Ed25519-signed, the encoding is part of the canonical signed bytes.
+///
+/// Readers must check this before trusting the rest of the payload.
+///
+/// ## v2 — postcard encoding (SEC-12, RUSTSEC-2025-0141)
+///
+/// v1 encoded both the `SigningPayload` (signed canonical bytes) and the
+/// wire envelope with `bincode 1.x`, which is now unmaintained. v2 switches
+/// to `postcard`. Because the signed bytes change, a v1 node and a v2 node
+/// would mis-verify each other's advertisements. The network is tiny (v0.1),
+/// so this is a deliberate clean break: a v2 reader rejects v1 records on the
+/// schema-version check before even reaching signature verification.
+pub const ADVERTISEMENT_SCHEMA_VERSION: u32 = 2;
 
 /// DHT key prefix for model advertisements. Final key shape:
 /// `b"phase/model/" || model_cid` — exactly 12 + 32 = 44 bytes.
@@ -212,7 +224,7 @@ impl ModelCapabilities {
 /// Signed envelope around [`ModelCapabilities`]. This is what actually
 /// goes onto the wire as the DHT record value.
 ///
-/// Layout (bincode):
+/// Layout (postcard):
 /// ```text
 /// schema_version: u32
 /// caps:           ModelCapabilities
@@ -220,7 +232,7 @@ impl ModelCapabilities {
 /// signature:      [u8; 64]    // signature over the canonical form
 /// ```
 ///
-/// The "canonical form" signed is bincode-encoded `SigningPayload`
+/// The "canonical form" signed is postcard-encoded `SigningPayload`
 /// (everything except `signature`). This means tampering with **any**
 /// field — including `pubkey` — invalidates the signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,7 +250,7 @@ pub struct SignedModelAdvertisement {
     /// node when they aren't.
     pub pubkey: [u8; 32],
 
-    /// Detached Ed25519 signature over `bincode(SigningPayload { .. })`.
+    /// Detached Ed25519 signature over `postcard(SigningPayload { .. })`.
     /// Stored as `Vec<u8>` rather than `[u8; 64]` only because serde's
     /// stable surface ships `Deserialize` impls for arrays up to length
     /// 32; a 64-byte array would otherwise need `serde_big_array`. The
@@ -266,7 +278,7 @@ impl SignedModelAdvertisement {
         caps: &ModelCapabilities,
         pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
-        bincode::serialize(&SigningPayload {
+        postcard::to_allocvec(&SigningPayload {
             schema_version,
             caps,
             pubkey,
@@ -321,16 +333,16 @@ impl SignedModelAdvertisement {
         Ok(())
     }
 
-    /// Bincode-encode the full signed envelope for DHT publication.
+    /// Postcard-encode the full signed envelope for DHT publication.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).context("serialize SignedModelAdvertisement")
+        postcard::to_allocvec(self).context("serialize SignedModelAdvertisement")
     }
 
     /// Decode + verify in one step. Returns the inner advertisement only
     /// after the signature checks out.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let ad: SignedModelAdvertisement =
-            bincode::deserialize(bytes).context("decode SignedModelAdvertisement")?;
+            postcard::from_bytes(bytes).context("decode SignedModelAdvertisement")?;
         ad.verify()?;
         Ok(ad)
     }
@@ -906,7 +918,7 @@ mod tests {
         let identity = NodeIdentity::generate();
         let mut ad =
             SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
-        // Flip one byte of the embedded pubkey — bincode round-trips it
+        // Flip one byte of the embedded pubkey — postcard round-trips it
         // fine, but the signature was bound to the original pubkey.
         ad.pubkey[0] ^= 0x01;
         let err = ad.verify().expect_err("tampered pubkey must fail verify");
@@ -972,7 +984,7 @@ mod tests {
 
         // Install a garbage record under the key — it must be filtered
         // out, not returned to the caller.
-        transport.install_record(cid.dht_key(), b"not-a-valid-bincode-record".to_vec());
+        transport.install_record(cid.dht_key(), b"not-a-valid-postcard-record".to_vec());
 
         let peers = registry.find_peers_for_model(&cid).await.unwrap();
         assert!(peers.is_empty(), "garbage records must be discarded");

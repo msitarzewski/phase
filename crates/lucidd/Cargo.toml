@@ -38,7 +38,11 @@ phase-receipt = { path = "../phase-receipt" }
 # (a record-lookup primitive). Real wiring is M5's job.
 phase-net = { path = "../phase-net" }
 ed25519-dalek = "2.1"
-bincode = "1.3"
+# Wire format for signed DHT advertisements. Migrated off the unmaintained
+# `bincode 1.x` (RUSTSEC-2025-0141, SEC-12) to postcard — maintained, stable
+# wire format, deterministic (critical: the SigningPayload bytes are
+# Ed25519-signed, so encode/sign and verify/decode must agree byte-for-byte).
+postcard = { version = "1", features = ["use-std"] }
 sha2 = "0.10"
 # DNS resolver for --bootstrap-dns. system-config picks up /etc/resolv.conf
 # on Linux + macOS automatically; tokio-runtime keeps us on the same
