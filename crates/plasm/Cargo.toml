@@ -49,9 +49,14 @@ phase-protocol = { path = "../phase-protocol", version = "0.1.0" }
 # of the Phase substrate.
 phase-artifact-server = { path = "../phase-artifact-server", version = "0.1.0" }
 
-# WASM Runtime (using wasmtime for better compatibility)
-wasmtime = "27"
-wasmtime-wasi = "27"
+# WASM Runtime (using wasmtime for better compatibility).
+# Pinned to the 36.x LTS line: 36.0.7+ closes the SEC-02 sandbox-escape /
+# panic / data-leak advisories (RUSTSEC-2026-0096, -0095, -0088, -0086, …)
+# and wasmtime-wasi 36.0.10+ closes the path_open TRUNCATE bypass
+# (RUSTSEC-2026-0149). 36.x is the current Wasmtime LTS, so this is the
+# minimal bump that clears every advisory without chasing the bleeding edge.
+wasmtime = "36.0.10"
+wasmtime-wasi = "36.0.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

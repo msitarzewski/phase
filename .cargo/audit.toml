@@ -1,0 +1,41 @@
+# cargo-audit configuration (SEC-02).
+#
+# `cargo audit` reads Cargo.lock, which lists EVERY resolved dependency
+# including target-gated and transitively-pinned crates that never compile
+# into any Phase binary on our supported targets (aarch64-darwin,
+# aarch64-linux, x86_64-linux). The advisories ignored below are either
+# physically unreachable on those targets or blocked behind an upstream
+# release we do not control. Each is justified inline; revisit whenever
+# libp2p / battery cut new releases.
+#
+# NOT ignored here (all genuinely fixed in SEC-02):
+#   - wasmtime 27 -> 36.0.10 cleared all 16 advisories (sandbox escapes,
+#     panics, data leaks).
+#   - lucidd's hickory-resolver 0.24 -> 0.26 cleared the resolver-path
+#     hickory-proto 0.24.4 advisories.
+#
+# Unmaintained-crate WARNINGS (bincode/fxhash/mach/paste) are intentionally
+# left visible and are tracked/handled by SEC-12 — do not ignore them here.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2 reaches us ONLY via libp2p-mdns 0.48 (the latest
+    # published libp2p, 0.56, hard-pins `hickory-proto = "^0.25.2"`, which
+    # cannot accept the patched 0.26.1 line — 0.25 -> 0.26 is a breaking API
+    # change in the crate libp2p-mdns compiles against, so it is an upstream
+    # blocker, not something SEC-02 can patch without forking libp2p).
+    # Reachability: this code path is link-local mDNS multicast peer discovery
+    # only; it does NOT perform DNSSEC validation and is not the
+    # internet-facing resolver (that path now uses hickory 0.26). Clear when a
+    # libp2p release bumps libp2p-mdns to hickory-proto 0.26.
+    "RUSTSEC-2026-0119", # O(n^2) name-compression CPU exhaustion (mdns-only path)
+    "RUSTSEC-2026-0118", # NSEC3 closest-encloser unbounded loop (DNSSEC; mdns never validates)
+
+    # nix 0.19.1 is pulled by battery 0.7.8 (latest) ONLY under
+    # `cfg(any(target_os = "dragonfly", target_os = "freebsd"))`. Phase ships
+    # to aarch64-darwin / aarch64-linux / x86_64-linux exclusively, so this
+    # crate is never compiled into any shipped binary and the getgrouplist
+    # out-of-bounds write is unreachable. battery has no newer release to bump
+    # to; clear if/when battery drops or updates the nix dep.
+    "RUSTSEC-2021-0119", # OOB write in nix::unistd::getgrouplist (freebsd/dragonfly-only, never built)
+]

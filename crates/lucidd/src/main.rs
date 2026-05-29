@@ -206,7 +206,14 @@ async fn resolve_dns_bootstrap_peers(domains: &[String], allow_fallback: bool) -
     if domains.is_empty() {
         return Vec::new();
     }
-    let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
+    // hickory-resolver 0.26 (SEC-02): the 0.24-era `TokioAsyncResolver::tokio*`
+    // free functions were replaced by a builder. `builder_tokio()` reads the
+    // system resolv.conf (same source as the old `tokio_from_system_conf`) and
+    // `.build()` finalises the resolver. Both can fail, so we collapse them and
+    // route any error through the same fail-closed / --dns-fallback gate.
+    let resolver = match hickory_resolver::TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
+    {
         Ok(r) => r,
         Err(e) => {
             // SEC-09: failing to load the system resolver config (containers
@@ -230,10 +237,17 @@ async fn resolve_dns_bootstrap_peers(domains: &[String], allow_fallback: bool) -
                  FALLING BACK TO PUBLIC RESOLVERS (Cloudflare/Google) — \
                  bootstrap records are now trust-on-first-use via a public resolver"
             );
-            hickory_resolver::TokioAsyncResolver::tokio(
-                hickory_resolver::config::ResolverConfig::cloudflare(),
-                hickory_resolver::config::ResolverOpts::default(),
+            // 0.26 dropped the `ResolverConfig::cloudflare()` preset; the
+            // equivalent is `udp_and_tcp(&config::CLOUDFLARE)` (same 1.1.1.1 /
+            // 1.0.0.1 + v6 IP set). Build via the explicit-config builder.
+            hickory_resolver::TokioResolver::builder_with_config(
+                hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                    &hickory_resolver::config::CLOUDFLARE,
+                ),
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
             )
+            .build()
+            .expect("building a static Cloudflare resolver config cannot fail")
         }
     };
     let mut out = Vec::new();
@@ -246,9 +260,20 @@ async fn resolve_dns_bootstrap_peers(domains: &[String], allow_fallback: bool) -
                 // most make us dial a host, never impersonate an identity —
                 // Noise enforces the pin), and cap per domain so an
                 // oversized TXT set can't flood us into dialing thousands.
+                // hickory 0.26 (SEC-02): `txt_lookup` now returns a plain
+                // `Lookup`; iterate `answers()` and pull TXT rdata via a match
+                // (the 0.24 `TxtLookup::iter()` + `record.txt_data()` accessor
+                // were removed). `TXT::txt_data` is now a public field. Same
+                // flattened set of UTF-8 chunks as before — pure API shape change.
+                use hickory_resolver::proto::rr::RData;
                 let candidates: Vec<String> = answers
+                    .answers()
                     .iter()
-                    .flat_map(|record| record.txt_data().to_vec())
+                    .filter_map(|record| match &record.data {
+                        RData::TXT(txt) => Some(txt.txt_data.to_vec()),
+                        _ => None,
+                    })
+                    .flatten()
                     .filter_map(|chunk| std::str::from_utf8(&chunk).ok().map(|s| s.to_string()))
                     .collect();
                 let (accepted, truncated) = collect_valid_bootstrap_addrs(
