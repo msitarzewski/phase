@@ -692,4 +692,33 @@ As patterns emerge from code reviews, add them here with examples and rationale.
 
 ---
 
+## Dependency Security Policy (SEC-00)
+
+**Context**: Every dependency change and every release.
+
+**Rules**:
+- Run `cargo audit` (and ideally `cargo deny check --warn unmaintained`) **before**
+  any dependency change or release. CI enforces both on push and pull_request
+  via `.github/workflows/security.yml`.
+- **Advisories (vulnerabilities) are denied** in CI — a known-vulnerable crate
+  fails the build. Do not merge over a red advisory gate; fix the dep or add a
+  justified ignore.
+- **Unmaintained crates are warnings, not errors.** They stay visible in CI
+  output (cargo-deny is invoked with `--warn unmaintained`) and are tracked for
+  removal under SEC-12 (currently fxhash, mach, paste, atomic-polyfill). Never
+  silence them.
+- **The advisory ignore list lives in two places that must stay in sync**:
+  `.cargo/audit.toml` (for `cargo audit`) and `deny.toml [advisories].ignore`
+  (for `cargo deny`). Every ignore carries an inline justification and a
+  "clear when…" condition. When you change one file, change the other.
+- **License policy** (`deny.toml [licenses]`): Phase crates are Apache-2.0,
+  lucidd is AGPL-3.0-or-later; permissive deps (MIT/BSD/ISC/Unicode/Zlib/MPL-2.0/
+  CC0-1.0/CDLA-Permissive-2.0/Apache-2.0-WITH-LLVM-exception) are allowed. Any
+  GPL-2.0 or proprietary license surfaces as an error — do not add it without a
+  decision recorded in `decisions.md`.
+- **Source policy**: only crates.io and path deps. Unknown registries and git
+  sources are denied (supply-chain guard).
+
+---
+
 **These rules are living documents. Update as patterns emerge.**

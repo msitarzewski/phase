@@ -54,12 +54,37 @@ const JOB_RELAY_PROTOCOL: &str = "/phase/job-relay/1.0.0";
 /// the bytes flow through unmodified. lucidd installs a handler that
 /// decodes the bincode payload, runs its local worker, and re-encodes the
 /// resulting stream as a batch.
+///
+/// SEC-06: the handler receives the **delivering peer's libp2p `PeerId`** as
+/// its first argument. lucidd's authz gate (SEC-01) uses it as an alternative
+/// acceptance path — a signer whose Ed25519 key derives to this PeerId is
+/// implicitly authorized even if absent from the operator allowlist. phase-net
+/// supplies the identity; the policy decision stays in lucidd.
 pub type JobRelayHandler = std::sync::Arc<
-    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = JobRelayResponse> + Send>>
+    dyn Fn(
+            PeerId,
+            Vec<u8>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = JobRelayResponse> + Send>>
         + Send
         + Sync
         + 'static,
 >;
+
+/// SEC-06: inbound relay request-size cap. A `SignedManifest<JobSpec>` for an
+/// inference job is a few KB (a chat history plus a signature); 256 KiB is a
+/// generous ceiling that rejects buffer-exhaustion floods at the libp2p codec
+/// before the inner JSON is ever parsed.
+const RELAY_MAX_REQUEST_BYTES: usize = 256 * 1024;
+
+/// SEC-06: relay response-size cap. A batch-shaped `Vec<JobEvent>` for a
+/// `max_tokens`-capped generation plus the signed receipt is bounded; 8 MiB
+/// covers a long completion with headroom while capping how much a malicious
+/// *serving* peer can make a requester buffer.
+const RELAY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// SEC-06: JobOffer is a tiny fixed-shape struct; 64 KiB each way is ample.
+const OFFER_MAX_BYTES: usize = 64 * 1024;
 
 /// Combined network behaviour: Kademlia DHT + mDNS local discovery +
 /// JSON-coded request/response for JobOffer.
@@ -236,8 +261,15 @@ impl Discovery {
                     key.public().to_peer_id(),
                 )?;
 
-                // JSON-coded request/response for JobOffer.
-                let job_offer = json::Behaviour::<JobOffer, JobResponse>::new(
+                // JSON-coded request/response for JobOffer. SEC-06: cap both
+                // directions — a JobOffer is a small fixed-shape struct, so an
+                // oversized frame is always abuse. The size maxima live on the
+                // codec; `with_codec` installs the configured one.
+                let offer_codec = json::codec::Codec::<JobOffer, JobResponse>::default()
+                    .set_request_size_maximum(OFFER_MAX_BYTES as u64)
+                    .set_response_size_maximum(OFFER_MAX_BYTES as u64);
+                let job_offer = json::Behaviour::<JobOffer, JobResponse>::with_codec(
+                    offer_codec,
                     [(
                         StreamProtocol::new(JOB_OFFER_PROTOCOL),
                         ProtocolSupport::Full,
@@ -248,8 +280,15 @@ impl Discovery {
                 // CBOR-coded request/response for the LUCID M5 job relay.
                 // The default per-request timeout is generous enough for a
                 // batch-shaped inference response (we set a wall-clock cap
-                // on the requesting side anyway).
-                let job_relay = cbor::Behaviour::<JobRelayRequest, JobRelayResponse>::new(
+                // on the requesting side anyway). SEC-06: cap request and
+                // response sizes so an oversized frame is rejected at the
+                // codec (`io.take(max)`) before it is ever buffered/parsed.
+                let relay_codec =
+                    cbor::codec::Codec::<JobRelayRequest, JobRelayResponse>::default()
+                        .set_request_size_maximum(RELAY_MAX_REQUEST_BYTES as u64)
+                        .set_response_size_maximum(RELAY_MAX_RESPONSE_BYTES as u64);
+                let job_relay = cbor::Behaviour::<JobRelayRequest, JobRelayResponse>::with_codec(
+                    relay_codec,
                     [(
                         StreamProtocol::new(JOB_RELAY_PROTOCOL),
                         ProtocolSupport::Full,
@@ -594,6 +633,12 @@ struct Driver {
     pending_relays: HashMap<OutboundRequestId, oneshot::Sender<Result<JobRelayResponse>>>,
     /// Inbound JobRelay handler. `None` → refuse every inbound request.
     job_relay_handler: Option<JobRelayHandler>,
+    /// SEC-06: completed inbound-relay responses flow back from the spawned
+    /// handler tasks here so the driver can call `send_response` without ever
+    /// awaiting the (slow, GPU-heavy) handler itself. Decouples relay
+    /// execution from the swarm event loop — one slow job no longer stalls
+    /// peer connectivity.
+    relay_reply_tx: mpsc::Sender<(ResponseChannel<JobRelayResponse>, JobRelayResponse)>,
 }
 
 /// Accumulator for an outstanding `GetKadRecord` query.
@@ -614,6 +659,13 @@ impl Driver {
         capabilities: PeerCapabilities,
         local_peer_id: PeerId,
     ) {
+        // SEC-06: channel for spawned relay-handler tasks to hand finished
+        // responses back to the driver. Bounded; if it fills, the spawned
+        // task awaits — which throttles inbound relay completion, never the
+        // swarm loop. Sized to a small multiple of typical concurrency.
+        let (relay_reply_tx, mut relay_reply_rx) =
+            mpsc::channel::<(ResponseChannel<JobRelayResponse>, JobRelayResponse)>(64);
+
         let mut driver = Driver {
             swarm,
             capabilities,
@@ -622,6 +674,7 @@ impl Driver {
             pending_get_records: HashMap::new(),
             pending_relays: HashMap::new(),
             job_relay_handler: None,
+            relay_reply_tx,
         };
 
         loop {
@@ -631,6 +684,10 @@ impl Driver {
                         Some(c) => driver.handle_command(c),
                         None => break, // All Discovery handles dropped.
                     }
+                }
+                // SEC-06: a spawned relay handler finished — ship its response.
+                Some((channel, response)) = relay_reply_rx.recv() => {
+                    driver.send_relay_response(channel, response);
                 }
                 event = driver.swarm.next() => {
                     match event {
@@ -794,7 +851,7 @@ impl Driver {
                 self.handle_job_offer_event(rr);
             }
             SwarmEvent::Behaviour(CombinedBehaviourEvent::JobRelay(rr)) => {
-                self.handle_job_relay_event(rr).await;
+                self.handle_job_relay_event(rr);
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on new address: {}", address);
@@ -962,33 +1019,63 @@ impl Driver {
         }
     }
 
-    async fn handle_job_relay_event(
+    /// SEC-06: ship a finished relay response over its `ResponseChannel`.
+    /// Called both inline (no-handler refusal) and from the `relay_reply_rx`
+    /// select arm (spawned handler completion).
+    fn send_relay_response(
+        &mut self,
+        channel: ResponseChannel<JobRelayResponse>,
+        response: JobRelayResponse,
+    ) {
+        if self
+            .swarm
+            .behaviour_mut()
+            .job_relay
+            .send_response(channel, response)
+            .is_err()
+        {
+            warn!("Failed to send JobRelayResponse — peer connection lost?");
+        }
+    }
+
+    /// SEC-06: handle a relay event WITHOUT blocking the swarm loop.
+    ///
+    /// The inbound `Request` branch no longer `await`s the handler inline.
+    /// Instead it `tokio::spawn`s the (potentially slow, GPU-heavy) handler
+    /// and routes the finished response back through `relay_reply_tx`, so the
+    /// driver keeps polling other peers' events while a job runs. The
+    /// delivering peer's `PeerId` is threaded into the handler for SEC-01's
+    /// PeerID-bind authz path.
+    fn handle_job_relay_event(
         &mut self,
         event: request_response::Event<JobRelayRequest, JobRelayResponse>,
     ) {
         use request_response::{Event, Message};
         match event {
-            Event::Message { message, .. } => match message {
+            Event::Message { peer, message, .. } => match message {
                 Message::Request {
                     request, channel, ..
                 } => {
-                    // Default behaviour: no handler installed → refuse
-                    // closed. Daemons that want to serve peers must call
-                    // `set_job_relay_handler`.
-                    let response = match self.job_relay_handler.clone() {
-                        Some(handler) => handler(request.payload).await,
-                        None => JobRelayResponse::Err {
-                            reason: "no job-relay handler installed".to_string(),
-                        },
-                    };
-                    if self
-                        .swarm
-                        .behaviour_mut()
-                        .job_relay
-                        .send_response(channel, response)
-                        .is_err()
-                    {
-                        warn!("Failed to send JobRelayResponse — peer connection lost?");
+                    let reply_tx = self.relay_reply_tx.clone();
+                    match self.job_relay_handler.clone() {
+                        Some(handler) => {
+                            // Off-driver: spawn the handler so a slow job
+                            // can't stall the swarm event loop.
+                            tokio::spawn(async move {
+                                let response = handler(peer, request.payload).await;
+                                let _ = reply_tx.send((channel, response)).await;
+                            });
+                        }
+                        None => {
+                            // No handler installed → refuse closed. Send
+                            // inline (cheap, no await on user code).
+                            self.send_relay_response(
+                                channel,
+                                JobRelayResponse::Err {
+                                    reason: "no job-relay handler installed".to_string(),
+                                },
+                            );
+                        }
                     }
                 }
                 Message::Response {

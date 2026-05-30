@@ -32,6 +32,12 @@ pub enum IdentityError {
         source: io::Error,
     },
 
+    /// The identity file already exists. Returned by the race-free
+    /// create-new path (`O_CREAT|O_EXCL`) so a concurrent `load_or_create`
+    /// loser can fall back to `load` instead of clobbering the winner's key.
+    #[error("identity file already exists: {0}")]
+    AlreadyExists(PathBuf),
+
     /// No platform-appropriate config directory could be resolved (typically
     /// because the user has no home directory). Returned by
     /// `default_identity_path()`.

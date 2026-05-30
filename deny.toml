@@ -1,0 +1,112 @@
+# cargo-deny configuration (SEC-00).
+#
+# This file is the CI-facing companion to `.cargo/audit.toml` (SEC-02).
+# `cargo deny check` runs in CI alongside `cargo audit`; the two must AGREE,
+# so the advisory ignore list below mirrors `.cargo/audit.toml` exactly, with
+# the same justifications. When you change one, change the other.
+#
+# Policy summary (cargo-deny 0.19.x):
+#   advisories  - vulnerabilities FAIL the check. Unmaintained checking is
+#                 SCOPED to `workspace` (`unmaintained = "workspace"` below):
+#                 we fail only when a *direct/first-party* dependency is
+#                 unmaintained (actionable — SEC-12 swapped bincode for
+#                 postcard on exactly this signal). Transitive unmaintained
+#                 crates we don't control (fxhash, mach, paste,
+#                 atomic-polyfill) stay visible in `cargo audit` output and
+#                 are tracked in SEC-12, but don't block the gate. NOTE:
+#                 0.19.x defaults unmaintained to ERROR over the whole tree,
+#                 so this scoping is required for a bare `cargo deny check`
+#                 to behave like CI — it is not a CLI-flag concern.
+#   ignore list - the 3 justified vuln advisories below mirror
+#                 `.cargo/audit.toml` (SEC-02) 1:1.
+#   licenses    - allow the Apache-2.0 / AGPL-3.0 split plus common permissive
+#                 licenses; surface any GPL-2.0 / proprietary contamination.
+#   bans        - duplicate versions WARN (we knowingly carry two hickory
+#                 lines); never a hard error.
+#   sources     - only crates.io + path deps are allowed; unknown registries
+#                 and git sources are DENIED.
+
+[graph]
+all-features = false
+
+# ---------------------------------------------------------------------------
+# `cargo deny check advisories`
+[advisories]
+# Scope unmaintained checking to direct/workspace deps only — see the policy
+# summary at the top of this file. A future first-party dependency that goes
+# unmaintained WILL fail the gate (good); the transitive tree we don't control
+# won't (tracked via cargo audit + SEC-12 instead).
+unmaintained = "workspace"
+
+# A list of advisory IDs to ignore. Ignored advisories still emit a note, so
+# they remain visible in CI output. These mirror `.cargo/audit.toml` (SEC-02)
+# 1:1 so `cargo deny check advisories` agrees with `cargo audit`.
+ignore = [
+    # hickory-proto 0.25.2 reaches us ONLY via libp2p-mdns 0.48 (the latest
+    # published libp2p, 0.56, hard-pins `hickory-proto = "^0.25.2"`, which
+    # cannot accept the patched 0.26.1 line — 0.25 -> 0.26 is a breaking API
+    # change in the crate libp2p-mdns compiles against, so it is an upstream
+    # blocker, not something SEC-02 can patch without forking libp2p).
+    # Reachability: link-local mDNS multicast peer discovery only; it does NOT
+    # perform DNSSEC validation and is not the internet-facing resolver (that
+    # path now uses hickory 0.26). Clear when a libp2p release bumps
+    # libp2p-mdns to hickory-proto 0.26.
+    { id = "RUSTSEC-2026-0119", reason = "O(n^2) name-compression CPU exhaustion; reachable only on the libp2p-mdns 0.25 path, upstream-pinned" },
+    { id = "RUSTSEC-2026-0118", reason = "NSEC3 closest-encloser unbounded loop; DNSSEC code, and the mdns path never validates DNSSEC" },
+
+    # nix 0.19.1 is pulled by battery 0.7.8 (latest) ONLY under
+    # cfg(any(target_os = "dragonfly", target_os = "freebsd")). Phase ships to
+    # aarch64-darwin / aarch64-linux / x86_64-linux exclusively, so this crate
+    # is never compiled into any shipped binary and the getgrouplist
+    # out-of-bounds write is unreachable. battery has no newer release to bump
+    # to; clear if/when battery drops or updates the nix dep.
+    { id = "RUSTSEC-2021-0119", reason = "OOB write in nix::unistd::getgrouplist; freebsd/dragonfly-only via battery, never built on our targets" },
+]
+
+# ---------------------------------------------------------------------------
+# `cargo deny check licenses`
+[licenses]
+# Require fairly high text-match confidence before accepting a detected license.
+confidence-threshold = 0.85
+# Our own crates: phase-* + plasm are Apache-2.0; lucidd is AGPL-3.0-or-later.
+# The remainder are the permissive licenses common in the Rust ecosystem.
+# GPL-2.0 / proprietary are deliberately absent so they surface as errors —
+# they would conflict with the Apache-2.0 / AGPL-3.0 split.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # wasmtime / cranelift / cap-std ecosystem; Apache + permissive LLVM exception
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",             # public-domain dedication (permissive)
+    "CDLA-Permissive-2.0", # permissive data license
+    "AGPL-3.0",            # our own (lucidd)
+    "AGPL-3.0-or-later",   # our own (lucidd)
+]
+
+# ---------------------------------------------------------------------------
+# `cargo deny check bans`
+[bans]
+# We knowingly carry duplicate versions (two hickory-proto lines, one via
+# libp2p-mdns and one via the resolver). Surface dupes as warnings, never fail.
+multiple-versions = "warn"
+wildcards = "allow"
+# Known, accepted duplicate(s). Listing them keeps the warning noise focused on
+# NEW dupes rather than the ones we've already reasoned about.
+skip = [
+    { crate = "hickory-proto", reason = "0.25.2 (libp2p-mdns 0.48) + 0.26.1 (resolver); upstream-pinned, see [advisories]" },
+]
+
+# ---------------------------------------------------------------------------
+# `cargo deny check sources`
+[sources]
+# We resolve only from crates.io and local path dependencies. Anything pulled
+# from an unknown registry or a git source is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

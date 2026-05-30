@@ -394,17 +394,18 @@ async fn serve_artifact_with_range(
                     ));
                 }
 
-                let content_length = (end - start + 1) as usize;
-                let mut buffer = vec![0u8; content_length];
-                if let Err(e) = file.read_exact(&mut buffer).await {
-                    warn!("Error reading range: {}", e);
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to read artifact",
-                    ));
-                }
+                let content_length = end - start + 1;
 
-                metrics.add_bytes_served(content_length as u64);
+                // Stream exactly `content_length` bytes from `start` instead of
+                // buffering the whole slice into RAM. `AsyncRead::take` caps the
+                // reader at `content_length`, and `ReaderStream` chunks it into
+                // the response body, so per-request memory is constant regardless
+                // of artifact or range size.
+                let limited = file.take(content_length);
+                let stream = ReaderStream::new(limited);
+                let body = Body::from_stream(stream);
+
+                metrics.add_bytes_served(content_length);
 
                 use axum::http::header::{HeaderName, HeaderValue};
                 let mut response_headers = HeaderMap::new();
@@ -426,7 +427,7 @@ async fn serve_artifact_with_range(
                     HeaderValue::from_str(&meta.hash).unwrap(),
                 );
 
-                let mut response = Response::new(Body::from(buffer));
+                let mut response = Response::new(body);
                 *response.status_mut() = StatusCode::PARTIAL_CONTENT;
                 *response.headers_mut() = response_headers;
                 Ok(response)
@@ -744,6 +745,84 @@ mod tests {
         let body = resp.bytes().await.unwrap();
         assert_eq!(body.len(), 41);
         assert_eq!(&body[..], &payload[10..=50]);
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn range_response_streams_multiple_chunks() {
+        // Regression guard for the streamed range body (SEC-11 L2). The range
+        // handler must seek + stream exactly `len` bytes via ReaderStream
+        // rather than buffering the whole slice. We use a payload large enough
+        // that the requested range spans many ReaderStream chunks, and assert
+        // the reassembled body is byte-exact with correct 206 headers. This
+        // confirms the streaming code path (not a single read_exact) is live.
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = ArtifactServerConfig {
+            bind_addr: "127.0.0.1".to_string(),
+            port: 0,
+            artifacts_dir: temp.path().to_path_buf(),
+        };
+        let server = ArtifactServer::new(config).unwrap();
+
+        // 256 KiB payload with a position-dependent byte pattern so any
+        // mis-ordering or truncation across stream chunks is detectable.
+        let total = 256 * 1024;
+        let mut payload = Vec::with_capacity(total);
+        for i in 0..total {
+            payload.push((i % 251) as u8);
+        }
+        let id = server.add_blob(&payload).await.unwrap();
+
+        let handle = server
+            .serve_on(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = handle.local_addr().port();
+
+        let url = format!(
+            "http://127.0.0.1:{}/blobs/{}/{}.bin",
+            port,
+            id.prefix(),
+            id.as_str()
+        );
+
+        // Range that starts off-zero and ends before EOF, spanning ~200 KiB.
+        let start = 1000usize;
+        let end = 210_000usize;
+        let range_hdr = format!("bytes={start}-{end}");
+
+        let client = reqwest::Client::new();
+        let mut got = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(r) = client.get(&url).header("Range", &range_hdr).send().await {
+                if r.status().as_u16() == 206 {
+                    got = Some(r);
+                    break;
+                }
+            }
+        }
+        let resp = got.expect("server did not respond 206");
+        assert_eq!(resp.status().as_u16(), 206);
+
+        let expected_len = end - start + 1;
+        assert_eq!(
+            resp.headers().get("content-length").unwrap().to_str().unwrap(),
+            expected_len.to_string()
+        );
+        assert_eq!(
+            resp.headers().get("content-range").unwrap().to_str().unwrap(),
+            format!("bytes {start}-{end}/{total}")
+        );
+        assert_eq!(
+            resp.headers().get("accept-ranges").unwrap().to_str().unwrap(),
+            "bytes"
+        );
+
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(body.len(), expected_len, "streamed body length");
+        assert_eq!(&body[..], &payload[start..=end], "streamed bytes byte-exact");
 
         handle.abort();
     }

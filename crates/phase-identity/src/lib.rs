@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![deny(unsafe_code)]
+
 //! Ed25519 keypair management with persistent on-disk storage. Provides a
 //! stable cryptographic identity that survives Phase node restarts.
 //!

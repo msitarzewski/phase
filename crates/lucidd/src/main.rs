@@ -132,6 +132,65 @@ struct Cli {
     /// fresh install can join the network with zero out-of-band setup.
     #[arg(long = "bootstrap-dns", value_name = "DOMAIN")]
     bootstrap_dns: Vec<String>,
+
+    /// Opt in to falling back to public DNS resolvers (Cloudflare 1.1.1.1
+    /// / Google 8.8.8.8) when the system resolver config can't be loaded.
+    /// SEC-09: this widens the set of resolvers you trust for bootstrap
+    /// records, so it is OFF by default — without it, a node that can't
+    /// read its resolver config fails the DNS-bootstrap step closed and
+    /// logs loudly rather than silently trusting a public resolver.
+    #[arg(long = "dns-fallback", default_value_t = false)]
+    dns_fallback: bool,
+}
+
+/// SEC-09: per-domain cap on accepted bootstrap multiaddrs. A spoofed or
+/// MITM'd TXT record set returning thousands of multiaddrs would otherwise
+/// be dialed unbounded (connection-flood / fd-exhaustion). 64 is well
+/// above the realistic relay count for the foundation record.
+const MAX_BOOTSTRAP_ADDRS_PER_DOMAIN: usize = 64;
+
+/// SEC-09: validate one TXT-derived bootstrap string. Returns `Some` only
+/// for a multiaddr that (a) starts with `/` (multiaddr shape) and (b)
+/// pins a `/p2p/<peer-id>` component. The PeerID pin is what makes a
+/// spoofed record at worst "dial this host" rather than "trust this
+/// identity" — libp2p Noise rejects the handshake if the host can't prove
+/// the pinned PeerID.
+fn validate_bootstrap_multiaddr(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if !s.starts_with('/') {
+        return None;
+    }
+    // Require a `/p2p/<non-empty>` segment. Split on `/` and look for a
+    // `p2p` token immediately followed by a non-empty value.
+    let segs: Vec<&str> = s.split('/').collect();
+    let has_pinned_peer = segs
+        .windows(2)
+        .any(|w| w[0] == "p2p" && !w[1].is_empty());
+    if !has_pinned_peer {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// SEC-09: filter candidate TXT strings down to valid, PeerID-pinned
+/// multiaddrs, capping at `cap`. Pure + testable; the async resolver feeds
+/// it the decoded TXT chunks. Returns `(accepted, truncated)`.
+fn collect_valid_bootstrap_addrs<'a, I>(candidates: I, cap: usize) -> (Vec<String>, bool)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for cand in candidates {
+        if let Some(valid) = validate_bootstrap_multiaddr(cand) {
+            if out.len() >= cap {
+                truncated = true;
+                break;
+            }
+            out.push(valid);
+        }
+    }
+    (out, truncated)
 }
 
 /// Query TXT records at each domain and return the parsed multiaddr
@@ -143,47 +202,92 @@ struct Cli {
 /// Failures are best-effort: a single domain returning NXDOMAIN, SERVFAIL,
 /// or timing out logs a warning and the function continues with whatever
 /// it did get from other domains.
-async fn resolve_dns_bootstrap_peers(domains: &[String]) -> Vec<String> {
+async fn resolve_dns_bootstrap_peers(domains: &[String], allow_fallback: bool) -> Vec<String> {
     if domains.is_empty() {
         return Vec::new();
     }
-    let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
+    // hickory-resolver 0.26 (SEC-02): the 0.24-era `TokioAsyncResolver::tokio*`
+    // free functions were replaced by a builder. `builder_tokio()` reads the
+    // system resolv.conf (same source as the old `tokio_from_system_conf`) and
+    // `.build()` finalises the resolver. Both can fail, so we collapse them and
+    // route any error through the same fail-closed / --dns-fallback gate.
+    let resolver = match hickory_resolver::TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
+    {
         Ok(r) => r,
         Err(e) => {
-            // Most failure modes here mean /etc/resolv.conf isn't
-            // readable (containers without it, locked-down sandboxes).
-            // Fall back to Cloudflare/Google defaults.
+            // SEC-09: failing to load the system resolver config (containers
+            // without /etc/resolv.conf, locked-down sandboxes) used to
+            // silently fall back to public resolvers, widening the
+            // trusted-resolver set without the operator knowing. Now that
+            // fallback is gated behind `--dns-fallback`; without it we fail
+            // closed and log loudly.
+            if !allow_fallback {
+                tracing::error!(
+                    error = %e,
+                    "could not load system DNS config and --dns-fallback not set; \
+                     SKIPPING DNS bootstrap (fail-closed). Pass --dns-fallback to \
+                     explicitly opt into Cloudflare/Google public resolvers."
+                );
+                return Vec::new();
+            }
             tracing::warn!(
                 error = %e,
-                "could not load system DNS config; falling back to Cloudflare/Google"
+                "could not load system DNS config; --dns-fallback set, \
+                 FALLING BACK TO PUBLIC RESOLVERS (Cloudflare/Google) — \
+                 bootstrap records are now trust-on-first-use via a public resolver"
             );
-            hickory_resolver::TokioAsyncResolver::tokio(
-                hickory_resolver::config::ResolverConfig::cloudflare(),
-                hickory_resolver::config::ResolverOpts::default(),
+            // 0.26 dropped the `ResolverConfig::cloudflare()` preset; the
+            // equivalent is `udp_and_tcp(&config::CLOUDFLARE)` (same 1.1.1.1 /
+            // 1.0.0.1 + v6 IP set). Build via the explicit-config builder.
+            hickory_resolver::TokioResolver::builder_with_config(
+                hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                    &hickory_resolver::config::CLOUDFLARE,
+                ),
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
             )
+            .build()
+            .expect("building a static Cloudflare resolver config cannot fail")
         }
     };
     let mut out = Vec::new();
     for domain in domains {
         match resolver.txt_lookup(domain).await {
             Ok(answers) => {
-                let mut domain_count = 0usize;
-                for record in answers.iter() {
-                    for chunk in record.txt_data() {
-                        if let Ok(s) = std::str::from_utf8(chunk) {
-                            let s = s.trim().to_string();
-                            if s.starts_with('/') {
-                                out.push(s);
-                                domain_count += 1;
-                            } else if !s.is_empty() {
-                                tracing::debug!(
-                                    domain = %domain,
-                                    value = %s,
-                                    "skipping non-multiaddr TXT record"
-                                );
-                            }
-                        }
-                    }
+                // Decode every TXT chunk to UTF-8 up front, then filter +
+                // cap via the shared helper. SEC-09: require multiaddr shape
+                // + a pinned `/p2p/<peer-id>` (a spoofed record can then at
+                // most make us dial a host, never impersonate an identity —
+                // Noise enforces the pin), and cap per domain so an
+                // oversized TXT set can't flood us into dialing thousands.
+                // hickory 0.26 (SEC-02): `txt_lookup` now returns a plain
+                // `Lookup`; iterate `answers()` and pull TXT rdata via a match
+                // (the 0.24 `TxtLookup::iter()` + `record.txt_data()` accessor
+                // were removed). `TXT::txt_data` is now a public field. Same
+                // flattened set of UTF-8 chunks as before — pure API shape change.
+                use hickory_resolver::proto::rr::RData;
+                let candidates: Vec<String> = answers
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::TXT(txt) => Some(txt.txt_data.to_vec()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|chunk| std::str::from_utf8(&chunk).ok().map(|s| s.to_string()))
+                    .collect();
+                let (accepted, truncated) = collect_valid_bootstrap_addrs(
+                    candidates.iter().map(|s| s.as_str()),
+                    MAX_BOOTSTRAP_ADDRS_PER_DOMAIN,
+                );
+                let domain_count = accepted.len();
+                out.extend(accepted);
+                if truncated {
+                    tracing::warn!(
+                        domain = %domain,
+                        cap = MAX_BOOTSTRAP_ADDRS_PER_DOMAIN,
+                        "DNS bootstrap records truncated at cap; extra records dropped"
+                    );
                 }
                 tracing::info!(domain = %domain, count = domain_count, "DNS bootstrap resolved");
             }
@@ -216,6 +320,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host: String = std::env::var("LUCIDD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
 
+    // SEC-10: the Ollama HTTP surface is UNAUTHENTICATED. Binding it to a
+    // non-loopback address exposes inference (and the log-injection / model
+    // surface) to anyone who can reach the host. Warn loudly so an operator
+    // who set LUCIDD_HOST=0.0.0.0 knows what they did.
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "SECURITY: lucidd HTTP API is bound to a NON-LOOPBACK address and is \
+             UNAUTHENTICATED — anyone who can reach {addr} can run inference and \
+             observe/inject logs. Bind to 127.0.0.1 (default) or place an \
+             authenticating reverse proxy in front.",
+        );
+    }
+
     // --mode relay collapses into --no-local-worker for the v0.1 binary.
     // The real libp2p relay::server::Behaviour wiring lands in v0.2.
     let no_local_worker = cli.no_local_worker || cli.mode == NodeMode::Relay;
@@ -242,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // because mDNS may still discover peers locally and the operator
     // may have explicit --bootstrap-peer args that work.
     let mut bootstrap_peers = cli.bootstrap_peers.clone();
-    let dns_peers = resolve_dns_bootstrap_peers(&cli.bootstrap_dns).await;
+    let dns_peers = resolve_dns_bootstrap_peers(&cli.bootstrap_dns, cli.dns_fallback).await;
     if !dns_peers.is_empty() {
         tracing::info!(
             total = dns_peers.len(),
@@ -330,6 +448,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.llama_n_gpu_layers
                 };
 
+                // SEC-04 (L8): resolve the llama-server binary to an
+                // absolute, existing path at startup. The default
+                // `--llama-server-binary llama-server` relies on the
+                // inherited `$PATH` — a binary-hijack vector. Canonicalize
+                // it (which also fails fast if it's missing) and require the
+                // result to be absolute so the spawn never PATH-resolves.
+                let server_binary_path = cli
+                    .llama_server_binary
+                    .canonicalize()
+                    .map_err(|e| {
+                        format!(
+                            "--llama-server-binary {:?} must be an existing, absolute path \
+                             (PATH-resolved defaults are rejected for security): {e}",
+                            cli.llama_server_binary
+                        )
+                    })?;
+                if !server_binary_path.is_absolute() {
+                    return Err(format!(
+                        "--llama-server-binary resolved to a non-absolute path: {}",
+                        server_binary_path.display()
+                    )
+                    .into());
+                }
+
                 // Auto-detect GGUFs and advertise them so the router's local
                 // check resolves on first request (otherwise the registry is
                 // empty until a model is loaded, causing Refused before
@@ -371,7 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let config = LlamaCppConfig {
-                    server_binary_path: cli.llama_server_binary.clone(),
+                    server_binary_path,
                     model_dir,
                     default_n_gpu_layers: n_gpu_layers,
                     default_context_size: cli.llama_ctx_size,
@@ -414,4 +556,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GOOD: &str =
+        "/dns4/bootstrap.phasebased.net/tcp/4001/p2p/12D3KooWGoodPeerIdHerePlaceholder";
+
+    #[test]
+    fn validate_accepts_pinned_multiaddr() {
+        // SEC-09: a well-formed multiaddr with /p2p/<id> is accepted.
+        assert_eq!(validate_bootstrap_multiaddr(GOOD), Some(GOOD.to_string()));
+        // Leading/trailing whitespace tolerated (TXT records often padded).
+        assert_eq!(
+            validate_bootstrap_multiaddr(&format!("  {GOOD}  ")),
+            Some(GOOD.to_string())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_p2p_pin() {
+        // SEC-09: multiaddr shape but no /p2p/<id> → rejected.
+        assert_eq!(
+            validate_bootstrap_multiaddr("/ip4/1.2.3.4/tcp/4001"),
+            None
+        );
+        // /p2p present but empty value → rejected.
+        assert_eq!(
+            validate_bootstrap_multiaddr("/ip4/1.2.3.4/tcp/4001/p2p/"),
+            None
+        );
+        // Not a multiaddr at all (no leading slash) → rejected.
+        assert_eq!(validate_bootstrap_multiaddr("evil.example.com"), None);
+        assert_eq!(validate_bootstrap_multiaddr(""), None);
+    }
+
+    #[test]
+    fn collect_caps_record_count() {
+        // SEC-09: a synthetic set well over the cap keeps only `cap`.
+        let many: Vec<String> = (0..1000).map(|_| GOOD.to_string()).collect();
+        let (kept, truncated) = collect_valid_bootstrap_addrs(
+            many.iter().map(|s| s.as_str()),
+            MAX_BOOTSTRAP_ADDRS_PER_DOMAIN,
+        );
+        assert_eq!(kept.len(), MAX_BOOTSTRAP_ADDRS_PER_DOMAIN);
+        assert!(truncated, "expected truncation flag set");
+    }
+
+    #[test]
+    fn collect_filters_invalid_and_does_not_truncate_under_cap() {
+        // SEC-09: invalid records dropped, valid kept, no false truncation.
+        let inputs = vec![GOOD, "/ip4/1.2.3.4/tcp/4001", "garbage", GOOD];
+        let (kept, truncated) =
+            collect_valid_bootstrap_addrs(inputs, MAX_BOOTSTRAP_ADDRS_PER_DOMAIN);
+        assert_eq!(kept.len(), 2);
+        assert!(!truncated);
+    }
 }

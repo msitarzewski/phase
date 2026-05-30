@@ -1,7 +1,7 @@
 # Architectural Decisions: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-05-27
-**Version**: 0.3 (phase-core + LUCID software released May 2026)
+**Last Updated**: 2026-05-29
+**Version**: 0.5 (security hardening + multi-workload / sharded-verification architecture notes)
 
 ---
 
@@ -776,6 +776,142 @@ LUCID operators need granular control over *when* this node serves inference for
 **References**:
 - `crates/lucidd/src/policy.rs`
 - MISSION.md (the auto-pause discussion in the early sprint)
+
+---
+
+### 2026-05-28: Hybrid signer-authorization policy (default-deny allowlist + PeerID-bind)
+
+**Status**: Accepted (security hardening SEC-01; the v0.1 authorization model)
+
+**Context**:
+The 2026-05-28 audit's keystone finding (C1): `SignedManifest::verify()` checks a signature against the pubkey embedded *in the object*, proving "someone signed this" but not "an authorized party signed this." The lucidd relay handler didn't even call `verify()`, and plasm ran any self-signed WASM. With no authorization, any anonymous internet peer could spend a worker node's GPU / run arbitrary sandboxed code. A policy decision was required: how does a node decide which signed jobs to execute?
+
+**Decision**:
+**Hybrid.** A job is authorized if EITHER (a) its signer pubkey is in the operator's `authorized_submitters` allowlist, OR (b) the signer pubkey derives to the libp2p `PeerId` that delivered the request (PeerID-bind). Default-deny: empty allowlist + an `allow_unauthenticated_jobs = false` escape hatch (documented insecure, for local dev/testing). Server-side resource caps (`max_memory`/`max_duration`/`max_tokens`) clamp manifest-supplied values regardless of what the manifest claims.
+
+**Alternatives Considered**:
+1. **Pure allowlist** — simplest, matches the documented soft-launch plan, but requires out-of-band key exchange for every contributor.
+2. **Pure open + rate-limit + reputation** — the eventual v0.2+ shape, but reputation infrastructure doesn't exist yet; open-without-it is the current vulnerability.
+3. **Hybrid (chosen)** — allowlist for curated soft-launch peers, PeerID-bind so a connected peer is attributable even without prior allowlisting, escape hatch for local dev. Ships the safe default now with the v0.2 relaxation path already plumbed.
+
+**Consequences**:
+- Positive: closes anonymous-execution; default-deny is safe-by-default; PeerID-bind makes every accepted job attributable to a libp2p identity; caps bound resource abuse.
+- Negative: contributors must be allowlisted (or rely on PeerID-bind semantics) — friction matching the intended soft launch.
+- The decision was delegated to the agent during the "get'r done" hardening run; recommended option taken and flagged for Michael's review. Reversible via config.
+
+**Revisit trigger** (Michael, 2026-05-29): default-deny is right *for now*. Flip the default toward open once (a) the network serves sliced/distributed models (v0.2 `ExoProxyWorker` / multi-node sharding) AND (b) the inference infra can handle open load — gated by the rate-limit + reputation end-state above. Capability-gated, not date-gated; treat the flip as an in-scope deliverable of the v0.2 sharding milestone. Until then, use `allow_unauthenticated_jobs=true` for local dev rather than flipping the production default early.
+
+**References**: `crates/lucidd/src/policy.rs`, `crates/lucidd/src/router.rs` (`make_inbound_relay_handler`), `crates/plasm/src/worker.rs`, SEC-01 task file.
+
+---
+
+### 2026-05-28: Document-and-justify unreachable advisories; cargo-deny scoped to first-party
+
+**Status**: Accepted (security hardening SEC-02/SEC-00)
+
+**Context**:
+After upgrading wasmtime (27→36) and hickory (0.24→0.26) cleared 17 of 20 advisories, three remained that cannot be fixed without forking upstream: two hickory-proto 0.25.2 advisories reachable only via `libp2p-mdns 0.48` (which hard-pins `^0.25.2`), and one `nix 0.19.1` advisory pulled by `battery` only under `cfg(freebsd/dragonfly)`. Forcing a `[patch]` to a breaking hickory line would not compile; the nix code never builds on our targets. Question: fail the gate forever, or suppress?
+
+**Decision**:
+**Document-and-justify, never blanket-suppress.** Each accepted advisory is listed in `.cargo/audit.toml` AND `deny.toml` with a per-ID reachability justification and a "clear when…" condition. For `cargo deny`, unmaintained-crate checking is scoped `unmaintained = "workspace"` (encoded in config, not a CLI flag) so the gate fails only when a *first-party/direct* dependency goes unmaintained (actionable — this is the signal SEC-12 acted on for bincode), while transitive unmaintained crates we don't control stay visible in `cargo audit` output without blocking.
+
+**Alternatives Considered**:
+1. **Force `[patch]` to patched upstream lines** — doesn't compile (breaking API in a transitively-pinned crate); rejected.
+2. **Blanket-disable advisory checking** — defeats the purpose; rejected.
+3. **Document-and-justify with reachability analysis (chosen)** — honest, keeps `cargo audit`/`cargo deny` green and meaningful, with explicit revisit triggers tied to upstream releases.
+
+**Consequences**:
+- Positive: the CI advisory gate is both green and honest; a genuinely-new vulnerability still fails; revisit conditions are written down.
+- Negative: the ignore list must be kept in sync between `.cargo/audit.toml` and `deny.toml` (noted in both files); accepted advisories require periodic re-review as upstreams release.
+
+**References**: `.cargo/audit.toml`, `deny.toml`, `.github/workflows/security.yml`, SEC-00 / SEC-02 task files.
+
+---
+
+### 2026-05-28: bincode → postcard for signed DHT records (schema v2 clean break)
+
+**Status**: Accepted (security hardening SEC-12)
+
+**Context**:
+`bincode 1.x` (unmaintained, RUSTSEC-2025-0141) was used directly in `registry.rs` both for the DHT wire envelope and for the canonical bytes that get Ed25519-signed in `SignedModelAdvertisement`. Because the encoding is part of the signed canonical bytes, swapping it changes what verifies.
+
+**Decision**:
+Migrate to **postcard** (maintained, deterministic, compact — good for signed payloads). Bump `ADVERTISEMENT_SCHEMA_VERSION` 1→2 and take a deliberate clean break: a v2 reader rejects v1 records on the schema-version check before signature verification. Acceptable because the v0.1 network is tiny. A single private helper produces both the signed canonical bytes and the wire encoding, so they cannot drift.
+
+**Alternatives Considered**:
+1. **bincode 2.x** — maintained successor but a different API and still less deterministic-by-design than postcard.
+2. **Reuse canonical-JSON** (as manifests/receipts do) — consistent, but ~2× larger over the DHT.
+3. **postcard (chosen)** — compact, stable wire format, deterministic, actively maintained.
+
+**Consequences**:
+- Positive: off the unmaintained crate; smaller records; one code path for sign + wire so no drift.
+- Negative: v1↔v2 advertisements don't interoperate (clean break) — fine at v0.1 scale; postcard transitively pulls `heapless`→`atomic-polyfill` (itself unmaintained, transitive — accepted per the cargo-deny scoping decision above).
+
+**References**: `crates/lucidd/src/registry.rs`, SEC-12 task file.
+
+---
+
+### 2026-05-29: Per-workload node implementations (diffusion is a separate node, not a LUCID mode)
+
+**Status**: Accepted (architectural direction; informs present-day LUCID + substrate discipline, implementation post-v0.1)
+
+**Context**:
+Prompted by reviewing ComfyUI PR #7063 (single-host multi-GPU work-unit splitting for diffusion sampling) and asking what it implies for LUCID. The substrate (`phase-net`/`phase-identity`/`phase-manifest`/`phase-receipt`/`phase-protocol`/`phase-artifact-server`) is workload-agnostic by design; `JobSpec` is `#[non_exhaustive]` and the `Worker` trait was built so new workload types slot in (MISSION.md lists "phase-render" / image-gen / science as future). Question: should diffusion be a LUCID feature/mode, or its own node?
+
+**Decision**:
+**Diffusion (and other non-streaming, blob-output, non-autoregressive workloads) is a SEPARATE Phase node implementation** — its own daemon + its own `JobSpec` variant(s) + its own `Worker` impl + its own native API surface — sharing the same Phase substrate crates. Not a mode inside `lucidd`. The shape differences are fundamental, not cosmetic:
+
+| Axis | LUCID (LLM inference) | Diffusion node |
+|---|---|---|
+| Client API (the compat wedge) | Ollama `/api/chat`, token streaming | ComfyUI graph / `diffusers` / A1111 `/sdapi` — different ecosystem |
+| Result shape | stream of tokens; commitment = SHA-256 chain over chunks | large image/video blob (+ optional denoise-step previews) |
+| Execution profile | autoregressive, KV-cache, latency-per-token, context length | fixed-step denoise loop, no KV-cache, batch/conditioning-parallel, VRAM = model+latents+VAE |
+| Backend wrapped | llama.cpp / MLX | ComfyUI / diffusers / sd.cpp |
+| Model format | GGUF | safetensors/checkpoints + LoRA/VAE/embedding ecosystem |
+| Substrate stress | compute protocol; barely touches artifact-server | **hammers `phase-artifact-server`** — checkpoints are GBs, outputs are large blobs |
+
+**Key observation**: diffusion is the workload that exercises the *content-addressed-blob half* of the substrate that LUCID v0.1 leaves mostly idle (LUCID's weights are out-of-band, outputs are small token streams). The substrate was designed with both halves; LUCID validates the compute half, a diffusion node validates the artifact half. This is evidence the workload-agnostic bet is sound — but only if we hold the line below.
+
+**Present-day constraint (the actionable part)**: keep `phase-protocol` (`JobSpec`, `Worker`, `JobEvent`, the commitment model) free of inference-specific assumptions, so a diffusion node slots in **without substrate changes**. Any inference-ism leaking into the protocol layer (token-shaped events as the only event type, KV-cache concepts in the trait, Ollama assumptions in `phase-*`) is a substrate-first violation to be caught in review. This is "substrate first, then product" (MISSION.md principle 1) made concrete.
+
+**Alternatives Considered**:
+1. **Diffusion as a LUCID mode** — rejected; would force two unrelated API surfaces + result shapes + scheduling models into one daemon, and bleed inference assumptions into shared code.
+2. **A generic "media" node covering inference + diffusion** — rejected; the only thing they share is the substrate, which is already the shared layer. A node's job is to be native to its ecosystem's clients.
+
+**Consequences**:
+- Positive: each node speaks its ecosystem's native protocol (compatibility-as-wedge, per-domain); the substrate stays clean; proves workload-agnosticism with a second real consumer.
+- Naming: substrate crates stay `phase-*`; node flagships get product brands. The diffusion flagship is named **LUMEN** (decided 2026-05-29). Rationale: it extends LUCID's light metaphor (Phase → LUCID → LUMEN reads as one deliberate optics/wave-physics family), the word carries an unambiguously positive meaning (luminous flux; "light" in Latin; illumination/making-visible) independent of any backronym, and it dodges two traps that killed the alternatives — **PRISM** (the name of the NSA mass-surveillance program; brand-radioactive for a credibly-neutral anti-surveillance project) and **MIRAGE** (connotes illusion/"not real" — exactly the deepfake/synthetic-misinformation anxiety a generative-image tool should not lean into). Node roster: `plasm` (WASM), LUCID (LLM inference), LUMEN (diffusion). **Trademark caveat to verify at launch**: Unreal Engine's global-illumination system is also called "Lumen" — different category (game-engine feature vs. distributed-compute product), but check before public launch. Substrate-side working name remains `phase-render` until the node exists.
+- Timing: post-LUCID-v0.1, likely parallel to / after LUCID v0.2. Not now. Recording it now is to (a) confirm the substrate bet and (b) constrain what does NOT leak into `phase-protocol` during LUCID development.
+
+**References**: MISSION.md (layering + "Future" nodes), `crates/phase-protocol/` (`JobSpec` `#[non_exhaustive]`, `Worker`), ComfyUI PR #7063 (the prompt).
+
+---
+
+### 2026-05-29: Verifying sharded / partial computation is an unsolved open problem (recorded risk)
+
+**Status**: Open problem — recorded, not solved. Blocks the trust story for v0.2 `ExoProxyWorker` (LUCID sharding) and for any distributed diffusion.
+
+**Context**:
+v0.1's verifiable-compute guarantee rests on the commitment accumulator (`phase-protocol/commitment.rs`): a worker folds emitted output chunks into a SHA-256 chain, signs the terminal state, and a verifier **replays the received chunks** to confirm the worker produced exactly what it signed. This works because the verifier *has* the output and can cheaply recompute the commitment over it. SEC-05 wired this into the consumer side (receipt verify + bind).
+
+That model **breaks for sharded / partial computation**:
+- **Sharded LLM (v0.2 ExoProxyWorker)**: a peer computes an intermediate hidden-state tensor for layers N..M and hands it to the next peer. There is no cheap way for the requester to verify that tensor is correct without re-running those layers (which defeats the point of offloading them). The commitment-replay trick doesn't apply — you can't replay what you didn't run.
+- **Distributed diffusion**: same shape — a peer denoises some steps / some conditioning; verifying it did so honestly means re-doing the work. Worse, cross-hardware float nondeterminism means two *honest* GPUs produce slightly different outputs, so bitwise reproduction fails and you're into fuzzy/perceptual comparison.
+
+This is a genuinely hard, partly-open research area (verifiable/attested computation, redundant execution + voting, ZK proofs of inference — all expensive or immature). It is distinct from, and harder than, the token-commitment v0.1 ships.
+
+**Candidate directions (none chosen)**:
+1. **Redundant execution + cross-check** — run the same shard on K peers, compare (with a tolerance for float nondeterminism), trust the majority. Costs Kx compute; tolerance tuning is fiddly.
+2. **Reputation + random spot-checking** — occasionally re-run a shard yourself and ding peers that diverge. Probabilistic, cheap, pairs with the reputation system already planned for v0.2.
+3. **Trusted execution (TEE/attestation)** — strong but hardware-gated and against the "anyone's consumer GPU" ethos.
+4. **ZK proofs of inference** — cryptographically ideal, currently far too expensive for real model sizes.
+
+**Consequences / why recorded now**:
+- The v0.2 sharding milestone must treat "how do we verify a peer's partial result" as a **first-class design problem with its own decision**, not an afterthought — the v0.1 receipt/commitment machinery does not cover it.
+- This is *why* default-deny authorization (the 2026-05-28 hybrid-authz ADR) matters **more**, not less, once peers compute partial results for each other: until partial-compute verification exists, you want jobs flowing only among attributable/curated peers. Ties directly to the "flip the authz default once infra can handle it" trigger.
+- Likely landing spot: redundant-execution + reputation spot-checking (2 + 1 combined) as the pragmatic v0.2 answer, with TEE/ZK as later research. Not decided here.
+
+**References**: `crates/phase-protocol/commitment.rs`, `crates/lucidd/src/router.rs` (SEC-05 receipt verify+bind), the 2026-05-28 hybrid-authz ADR, releases/lucid (v0.2 `ExoProxyWorker`).
 
 ---
 

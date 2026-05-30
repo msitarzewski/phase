@@ -15,6 +15,11 @@
 //! Real inference (llama.cpp / MLX) and the full Ollama API surface are
 //! LUCID M2 / M4 territory.
 
+// SEC-11 (L7): forbid `unsafe` in lucidd's own code. Per-crate — wasmtime /
+// libp2p pulled transitively still use `unsafe` internally; this only guards
+// lucidd's source against an `unsafe` regression.
+#![deny(unsafe_code)]
+
 pub mod dht_transport;
 pub mod echo;
 pub mod ollama;
@@ -54,5 +59,6 @@ pub use policy::{
 // `/phase/job-relay/1.0.0`, or refuse.
 pub use dht_transport::PhaseNetDhtTransport;
 pub use router::{
-    make_inbound_relay_handler, RouteDecision, RouteVia, Router, RouterError, RELAY_TIMEOUT,
+    make_inbound_relay_handler, ReceiptVerification, RouteDecision, RouteVia, Router, RouterError,
+    RELAY_TIMEOUT,
 };

@@ -36,12 +36,31 @@ pub struct JobRelayRequest {
 /// the serving peer drains the local worker's stream and ships every
 /// `JobEvent` in one shot. Token-by-token streaming over the relay is
 /// scheduled for v0.2 — see `releases/lucid/index.yaml`.
+///
+/// ## SEC-05 schema v2: `Ok.receipt`
+///
+/// v1 of `Ok` carried only `events`; the worker's `SignedReceipt<JobResult>`
+/// stayed local and the requesting side had no cryptographic proof that a
+/// *specific* worker ran a *specific* job. SEC-05 adds the `receipt` field so
+/// the requester can `verify()` the signature, bind `job_id` →
+/// dispatched-manifest-hash, bind `worker_pubkey` → dispatched-PeerId, and
+/// recompute the output commitment over the received chunks.
+///
+/// The field is `#[serde(default)]` so a v1 serving peer (no receipt) still
+/// deserializes — the requesting side treats an empty receipt as
+/// "unverifiable" rather than failing the round-trip, preserving
+/// wire-compatibility with pre-SEC-05 nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobRelayResponse {
-    /// bincode(Vec<JobEvent>).
+    /// bincode(Vec<JobEvent>) plus the worker's signed receipt.
     Ok {
         #[serde(with = "serde_bytes")]
         events: Vec<u8>,
+        /// JSON(`SignedReceipt<JobResult>`), owned by lucidd. Empty on a
+        /// v1 (pre-SEC-05) serving peer. phase-net stays receipt-agnostic
+        /// and only ferries the bytes.
+        #[serde(with = "serde_bytes", default)]
+        receipt: Vec<u8>,
     },
     /// Serving peer refused or hit an in-flight error.
     Err { reason: String },

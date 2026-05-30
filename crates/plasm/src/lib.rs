@@ -30,6 +30,11 @@
 //! // `worker` impls `phase_protocol::Worker`.
 //! ```
 
+// SEC-11 (L7): forbid `unsafe` in plasm's own code. This is per-crate — it
+// does not affect wasmtime/libp2p, which use `unsafe` internally; it only
+// prevents `unsafe` from regressing into plasm itself.
+#![deny(unsafe_code)]
+
 pub mod config;
 pub mod network;
 pub mod provider;

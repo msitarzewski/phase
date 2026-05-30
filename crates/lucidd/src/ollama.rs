@@ -170,6 +170,11 @@ pub const HEADER_LOCAL_ONLY: &str = "x-lucid-local-only";
 /// served. `local` or `peer:<short>`; omitted on Refused.
 pub const HEADER_ROUTED_VIA: &str = "x-lucid-routed-via";
 
+/// SEC-05: HTTP response header reporting whether a peer-served job's signed
+/// receipt verified and bound to the dispatched job + peer. `true` / `false` /
+/// `unverifiable`; omitted on the local path (no peer receipt to assert).
+pub const HEADER_RECEIPT_VERIFIED: &str = "x-lucid-receipt-verified";
+
 /// Parse `X-Lucid-Local-Only`. Anything that looks truthy ("1", "true",
 /// "yes", case-insensitive) flips the flag. Absent / empty → false.
 fn parse_local_only(headers: &HeaderMap) -> bool {
@@ -209,8 +214,42 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Max length of a sanitized log field (SEC-10). A 10 KB request path
+/// shouldn't be able to blow up a log line.
+const LOG_FIELD_CAP: usize = 256;
+
+/// SEC-10: sanitize an attacker-controlled string before it goes into a
+/// log line. Defends against log forging (embedded CR/LF spawning fake log
+/// entries) and ANSI/terminal-escape abuse against anyone tailing logs.
+///
+/// - Drops C0 control bytes (`< 0x20`, includes CR/LF/TAB/NUL) and DEL
+///   (`0x7f`).
+/// - Replaces the ESC introducer (`0x1b`) — already covered by the C0
+///   rule, but called out for clarity — so CSI/OSC sequences can't form.
+/// - Caps the result at [`LOG_FIELD_CAP`] chars, appending an ellipsis
+///   marker when truncated so the cap is visible in the log.
+fn sanitize_for_log(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(LOG_FIELD_CAP));
+    for ch in input.chars() {
+        // Strip C0 controls (< 0x20) and DEL (0x7f). This covers \r, \n,
+        // \t, NUL, and the ESC (0x1b) that introduces ANSI sequences.
+        if (ch as u32) < 0x20 || ch == '\u{7f}' {
+            continue;
+        }
+        if out.chars().count() >= LOG_FIELD_CAP {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 async fn unknown(req: axum::http::Request<Body>) -> impl IntoResponse {
-    tracing::warn!(method = %req.method(), uri = %req.uri(), "unimplemented endpoint");
+    // SEC-10: log only the path (not query/fragment), sanitized + capped.
+    // The method is from a fixed HTTP enum, not attacker-shaped free text.
+    let path = sanitize_for_log(req.uri().path());
+    tracing::warn!(method = %req.method(), path = %path, "unimplemented endpoint");
     StatusCode::NOT_FOUND
 }
 
@@ -304,7 +343,8 @@ async fn handle_generate(
     // touching the worker.
     let decision = state.router.route(&model, local_only).await;
     if let RouteVia::Refused { reason } = &decision.via {
-        tracing::info!(model = %model, reason = %reason, "router refused /api/generate");
+        // SEC-10: model is attacker-controlled (request body); sanitize.
+        tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/generate");
         return refused_response(reason);
     }
     let routed_via = decision.header_value();
@@ -334,18 +374,19 @@ async fn handle_generate(
         }
     };
 
-    let (handle, mut job_stream) = match state.router.execute(&decision, manifest).await {
-        Ok(t) => t,
-        Err(RouterError::Refused { reason }) => return refused_response(&reason),
-        Err(e) => {
-            tracing::error!(error = %e, "router dispatch failed (/api/generate)");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("router dispatch failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+    let (handle, mut job_stream, receipt_verification) =
+        match state.router.execute(&decision, manifest).await {
+            Ok(t) => t,
+            Err(RouterError::Refused { reason }) => return refused_response(&reason),
+            Err(e) => {
+                tracing::error!(error = %e, "router dispatch failed (/api/generate)");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("router dispatch failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let job_id = handle.job_id().clone();
     let started_at = std::time::Instant::now();
@@ -405,6 +446,12 @@ async fn handle_generate(
         if let Some(rv) = routed_via.as_deref() {
             if let Ok(hv) = rv.parse() {
                 resp.headers_mut().insert(HEADER_ROUTED_VIA, hv);
+            }
+        }
+        // SEC-05: surface peer-receipt verification status.
+        if let Some(v) = receipt_verification.header_value() {
+            if let Ok(hv) = v.parse() {
+                resp.headers_mut().insert(HEADER_RECEIPT_VERIFIED, hv);
             }
         }
         tracing::info!(%job_id, "non-streaming generate complete");
@@ -495,6 +542,11 @@ async fn handle_generate(
     if let Some(rv) = routed_via.as_deref() {
         builder = builder.header(HEADER_ROUTED_VIA, rv);
     }
+    // SEC-05: the relay batch (and its receipt) is fully verified inside the
+    // router before streaming starts, so the verdict is known here.
+    if let Some(v) = receipt_verification.header_value() {
+        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
+    }
     builder
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response())
@@ -514,7 +566,8 @@ async fn handle_chat(
     // build a manifest or touch a worker.
     let decision: RouteDecision = state.router.route(&model, local_only).await;
     if let RouteVia::Refused { reason } = &decision.via {
-        tracing::info!(model = %model, reason = %reason, "router refused /api/chat");
+        // SEC-10: model is attacker-controlled (request body); sanitize.
+        tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/chat");
         return refused_response(reason);
     }
     let routed_via = decision.header_value();
@@ -555,7 +608,8 @@ async fn handle_chat(
         }
     };
 
-    let (handle, mut job_stream) = match state.router.execute(&decision, manifest).await {
+    let (handle, mut job_stream, receipt_verification) =
+        match state.router.execute(&decision, manifest).await {
         Ok(t) => t,
         Err(RouterError::Refused { reason }) => return refused_response(&reason),
         Err(e) => {
@@ -630,6 +684,12 @@ async fn handle_chat(
         if let Some(rv) = routed_via.as_deref() {
             if let Ok(hv) = rv.parse() {
                 resp.headers_mut().insert(HEADER_ROUTED_VIA, hv);
+            }
+        }
+        // SEC-05: surface peer-receipt verification status.
+        if let Some(v) = receipt_verification.header_value() {
+            if let Ok(hv) = v.parse() {
+                resp.headers_mut().insert(HEADER_RECEIPT_VERIFIED, hv);
             }
         }
         tracing::info!(%job_id, "non-streaming chat complete");
@@ -738,6 +798,10 @@ async fn handle_chat(
     if let Some(rv) = routed_via.as_deref() {
         builder = builder.header(HEADER_ROUTED_VIA, rv);
     }
+    // SEC-05: peer-receipt verdict is known before streaming starts.
+    if let Some(v) = receipt_verification.header_value() {
+        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
+    }
     builder
         .body(body)
         .unwrap_or_else(|e| {
@@ -809,4 +873,43 @@ fn hex32(b: &[u8; 32]) -> String {
         s.push_str(&format!("{:02x}", byte));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_crlf_and_ansi() {
+        // SEC-10: CRLF (log forging) and ESC/CSI (ANSI abuse) are dropped,
+        // yielding a single-line, escape-free string.
+        let evil = "/api/\r\nFAKE-LOG-LINE\x1b[31mred\x1b[0m\x00\x7f";
+        let s = sanitize_for_log(evil);
+        assert!(!s.contains('\r'));
+        assert!(!s.contains('\n'));
+        assert!(!s.contains('\x1b'));
+        assert!(!s.contains('\x00'));
+        assert!(!s.contains('\x7f'));
+        // Visible content survives.
+        assert!(s.contains("/api/"));
+        assert!(s.contains("FAKE-LOG-LINE"));
+        assert!(s.contains("red"));
+    }
+
+    #[test]
+    fn sanitize_caps_length() {
+        // SEC-10: a 10 KB path is capped at LOG_FIELD_CAP (+ ellipsis).
+        let huge = "/".to_string() + &"a".repeat(10_000);
+        let s = sanitize_for_log(&huge);
+        // chars(): cap content chars plus the trailing ellipsis marker.
+        assert!(s.chars().count() <= LOG_FIELD_CAP + 1);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_passes_clean_path_through() {
+        // SEC-10: a normal path is unchanged.
+        let clean = "/api/chat";
+        assert_eq!(sanitize_for_log(clean), clean);
+    }
 }

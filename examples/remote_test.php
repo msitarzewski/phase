@@ -11,8 +11,14 @@
 
 require __DIR__ . '/../php-sdk/vendor/autoload.php';
 
-use PhaseBased\Plasm\Client;
-use PhaseBased\Plasm\Manifest;
+use Plasm\Client;
+use Plasm\Manifest;
+
+// SECURITY: the public key of the worker(s) we trust. In a real deployment
+// this comes from an operator allowlist, a libp2p PeerId binding, or a
+// pre-shared/published key — NEVER from the receipt itself. Replace this with
+// the hex Ed25519 public key of the node you trust before running.
+$EXPECTED_WORKER_PUBKEY = getenv('PHASE_EXPECTED_WORKER_PUBKEY') ?: '';
 
 // Output helpers
 function section($title) {
@@ -91,19 +97,31 @@ section("Receipt Verification");
 try {
     $receipt = $result->getReceipt();
 
-    if ($receipt->verify()) {
-        success("Signature valid");
-        success("Module hash matches");
-        success("Receipt verified");
-    } else {
-        error("Receipt verification failed");
+    if ($EXPECTED_WORKER_PUBKEY === '') {
+        error(
+            "Refusing to verify without a pinned worker public key. Set "
+            . "PHASE_EXPECTED_WORKER_PUBKEY to the hex Ed25519 key of the "
+            . "worker you trust. The key inside the receipt is attacker-"
+            . "controlled and must never be used to decide trust."
+        );
     }
 
-    // Display receipt details
+    // SECURE PATTERN: verify against the PINNED key we already trust. The key
+    // embedded in the receipt is shown only for display (`getNodeId()`), never
+    // used for the trust decision. A forged or downgraded receipt fails here.
+    if ($receipt->verify($EXPECTED_WORKER_PUBKEY)) {
+        success("Signature valid (verified against pinned worker key)");
+        success("Receipt verified");
+    } else {
+        error("Receipt verification failed — signature does not match the pinned key, or receipt is not a trusted v1 signed envelope.");
+    }
+
+    // Display receipt details. getNodeId()/getNodePubkey() are DISPLAY ONLY:
+    // they report who *claims* to have signed, not who we trust.
     echo "\nReceipt Details:\n";
     info("Job ID: " . $receipt->getJobId());
     info("Module Hash: " . substr($receipt->getModuleHash(), 0, 16) . "...");
-    info("Node ID: " . substr($receipt->getNodeId(), 0, 16) . "...");
+    info("Claimed signer (display only): " . substr($receipt->getNodeId(), 0, 16) . "...");
     info("Timestamp: " . date('Y-m-d H:i:s', $receipt->getTimestamp()));
 } catch (Exception $e) {
     error("Verification failed: " . $e->getMessage());

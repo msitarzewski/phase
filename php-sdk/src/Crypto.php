@@ -17,9 +17,13 @@ namespace Plasm;
  * Canonical JSON = serde_json's value re-serialized with object keys sorted
  * lexicographically at every nesting level, no whitespace, no trailing
  * commas. This matches the Rust algorithm in
- * `crates/phase-receipt/src/canonical.rs`. The legacy pipe-separated format
- * `version|module_hash|exit_code|wall_time_ms|timestamp` is retained as a
- * fallback for receipts that arrive in the November 2025 wire shape.
+ * `crates/phase-receipt/src/canonical.rs`.
+ *
+ * SEC-03 / audit C3: the legacy pipe-separated SHA-256 format that earlier
+ * versions accepted as a fallback has been REMOVED from the trust path. It
+ * was a downgrade vector — an attacker could omit `schema_version`/`result`
+ * to force the weak path and forge any field. Only the `phase-receipt:v1:`
+ * Ed25519-over-canonical-JSON path is trusted now.
  */
 class Crypto
 {
@@ -27,78 +31,39 @@ class Crypto
     public const SIGNING_DOMAIN = 'phase-receipt:v1:';
 
     /**
-     * Verify a Phase receipt.
-     *
-     * Dispatches to whichever signing-format the receipt is carrying:
-     * - If `Receipt::isSignedEnvelope()` returns true (M7 SignedReceipt<JobResult>)
-     *   we verify against the canonical-JSON signing message.
-     * - Otherwise we fall back to the legacy pipe-separated message, which
-     *   keeps unit fixtures + legacy plasmd receipts verifiable.
-     *
-     * @throws \RuntimeException if verification fails
+     * Highest envelope schema version this SDK understands. Mirrors
+     * `phase-receipt::SCHEMA_VERSION` on the Rust side.
      */
-    public static function verifyReceipt(Receipt $receipt): bool
-    {
-        $pubkeyHex = $receipt->getWorkerPubkey() ?: $receipt->getNodePubkey();
-        $signatureHex = $receipt->getSignature();
-
-        if (empty($pubkeyHex)) {
-            throw new \RuntimeException('Receipt has no public key');
-        }
-        if (empty($signatureHex)) {
-            throw new \RuntimeException('Receipt has no signature');
-        }
-
-        $pubkeyBin = hex2bin($pubkeyHex);
-        $signatureBin = hex2bin($signatureHex);
-
-        if ($pubkeyBin === false
-            || strlen($pubkeyBin) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES) {
-            throw new \RuntimeException('Invalid public key format');
-        }
-        if ($signatureBin === false
-            || strlen($signatureBin) !== SODIUM_CRYPTO_SIGN_BYTES) {
-            throw new \RuntimeException('Invalid signature format');
-        }
-
-        $message = self::getCanonicalMessage($receipt);
-
-        return sodium_crypto_sign_verify_detached($signatureBin, $message, $pubkeyBin);
-    }
+    public const SCHEMA_VERSION = 1;
 
     /**
-     * Build the canonical signing message for a receipt.
+     * Build the canonical signing message for an M7 signed receipt.
      *
-     * For M7 SignedReceipt<JobResult> envelopes this is:
+     * The message is:
      *     "phase-receipt:v1:" || canonical_json(SigningEnvelope)
      * where SigningEnvelope has fields {completed_at, job_id, result, schema_version}.
      *
-     * For legacy receipts this falls back to:
-     *     SHA256(version|module_hash|exit_code|wall_time_ms|timestamp)
-     * to preserve compatibility with the November 2025 daemon receipts.
+     * There is no legacy fallback: callers must only invoke this for a v1
+     * signed envelope (`Receipt::isSignedEnvelope()` true).
+     *
+     * @throws \RuntimeException if the receipt is not a v1 signed envelope.
      */
     public static function getCanonicalMessage(Receipt $receipt): string
     {
-        if ($receipt->isSignedEnvelope()) {
-            $envelope = [
-                'completed_at'   => $receipt->getCompletedAt(),
-                'job_id'         => $receipt->getJobId(),
-                'result'         => $receipt->getResult(),
-                'schema_version' => $receipt->getSchemaVersion(),
-            ];
-            return self::SIGNING_DOMAIN . self::canonicalJsonEncode($envelope);
+        if (!$receipt->isSignedEnvelope()) {
+            throw new \RuntimeException(
+                'Refusing to build a signing message for a non-v1 receipt: '
+                . 'legacy receipts are not trusted (SEC-03).'
+            );
         }
 
-        // Legacy path: SHA-256 over pipe-separated fields.
-        $message = sprintf(
-            '%s|%s|%d|%d|%d',
-            $receipt->getVersion(),
-            $receipt->getModuleHash(),
-            $receipt->getExitCode(),
-            $receipt->getWallTimeMs(),
-            $receipt->getTimestamp()
-        );
-        return hash('sha256', $message, true);
+        $envelope = [
+            'completed_at'   => $receipt->getCompletedAt(),
+            'job_id'         => $receipt->getJobId(),
+            'result'         => $receipt->getResult(),
+            'schema_version' => $receipt->getSchemaVersion(),
+        ];
+        return self::SIGNING_DOMAIN . self::canonicalJsonEncode($envelope);
     }
 
     /**

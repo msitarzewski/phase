@@ -1,0 +1,101 @@
+# SEC-00 — first CI workflow for the Phase repo.
+#
+# Three jobs:
+#   advisories  - cargo-audit + cargo-deny dependency-advisory / license /
+#                 source gate. Vulnerabilities FAIL the build; unmaintained
+#                 crates are warnings (tracked in SEC-12). Ignore list lives in
+#                 `.cargo/audit.toml` and `deny.toml`.
+#   test        - cargo test across the workspace.
+#   clippy      - cargo clippy with warnings denied + rustfmt check.
+#
+# This is the repo's first CI; it is intentionally a sensible baseline, not
+# only a security gate.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # --- Dependency advisory / license / source gate ----------------------
+  advisories:
+    name: cargo audit + cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # RustSec advisory scan. Reads Cargo.lock and `.cargo/audit.toml`
+      # (the SEC-02 ignore list). Vulnerabilities fail; the 4 unmaintained
+      # crates are allowed warnings and exit 0.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # cargo-deny: advisories (mirrors audit), licenses, bans, sources.
+      # `--warn unmaintained` downgrades unmaintained-crate findings from the
+      # cargo-deny default (error) to warnings so they stay visible without
+      # blocking the build — matching `cargo audit` behavior. The ignore list
+      # in deny.toml [advisories] mirrors `.cargo/audit.toml` 1:1.
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Runs all four checks (advisories, bans, licenses, sources).
+          command: check
+          # `--warn unmaintained` must follow the `check` subcommand; it
+          # downgrades unmaintained findings from error to warning so they
+          # stay visible without failing CI (matches `cargo audit`).
+          command-arguments: --warn unmaintained
+
+  # --- Workspace tests --------------------------------------------------
+  test:
+    name: test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  # --- Lint -------------------------------------------------------------
+  clippy:
+    name: clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

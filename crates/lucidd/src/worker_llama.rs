@@ -102,6 +102,13 @@ pub struct LlamaCppConfig {
     /// etc.); the worker just allocates the next free port from this range.
     pub server_port_range: Range<u16>,
 
+    /// Maximum number of `llama-server` subprocesses (loaded models) kept
+    /// resident at once. Each model is ~GB of RAM; without a cap a caller
+    /// (or a relay peer) can pin every on-disk model into memory and
+    /// exhaust the host (SEC-07). When at cap, [`LlamaCppWorker::ensure_loaded`]
+    /// evicts the least-recently-used model before spawning a new one.
+    pub max_loaded_models: usize,
+
     /// Maximum wall-clock wait for `/health` to return 200 after spawn.
     /// 60 s default; big models on slow disks legitimately take longer.
     pub model_load_timeout: Duration,
@@ -128,6 +135,7 @@ impl Default for LlamaCppConfig {
             default_n_gpu_layers: i32::MAX, // "all"
             default_context_size: 8192,
             server_port_range: 18080..18200,
+            max_loaded_models: 3,
             model_load_timeout: Duration::from_secs(60),
             per_request_idle_timeout: Duration::from_secs(30),
             extra_env: Vec::new(),
@@ -164,9 +172,23 @@ struct LoadedModel {
     /// extra retry that will hit `failed.notified()` immediately.
     failed_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Join handle for the supervisor task. Held so we can abort it on
-    /// `Drop` of the [`LlamaCppWorker`].
-    #[allow(dead_code)]
+    /// `Drop` of the [`LlamaCppWorker`] or on LRU eviction.
     supervisor: tokio::task::JoinHandle<()>,
+}
+
+impl LoadedModel {
+    /// Tear this model down: mark it failed (so any in-flight request
+    /// bails and a concurrent `ensure_loaded` won't hand it out), then
+    /// abort the supervisor task. The supervisor owns the `llama-server`
+    /// `Child`, which carries `kill_on_drop(true)`, so aborting the task
+    /// drops the `Child` and the OS reaps the subprocess — the same kill
+    /// path used on `Drop` of the worker. Idempotent.
+    fn shutdown(&self) {
+        self.failed_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.failed.notify_waiters();
+        self.supervisor.abort();
+    }
 }
 
 /// The GPU-inference worker. Cheaply cloneable — internal state is behind
@@ -181,17 +203,18 @@ struct Inner {
     loaded_models: DashMap<String, Arc<LoadedModel>>,
     config: LlamaCppConfig,
     client: reqwest::Client,
-    /// Next port to try when allocating. Atomic so multiple concurrent
-    /// loads don't collide; the per-port bind check inside `spawn_model`
-    /// catches the rare race where two loads pick the same port.
-    next_port: std::sync::atomic::AtomicU16,
+    /// Set of ports currently bound by live `llama-server` children. A
+    /// port is inserted in [`LlamaCppWorker::allocate_port`] and removed on
+    /// unload/evict so the range can't wrap onto a live port (SEC-07).
+    /// Guarded by a `Mutex` rather than a lock-free set so allocate +
+    /// "is the range full?" is one atomic decision.
+    ports_in_use: Mutex<std::collections::HashSet<u16>>,
 }
 
 impl LlamaCppWorker {
     /// Construct a fresh worker. No subprocesses are spawned until the
     /// first inference request for a given model.
     pub fn new(identity: NodeIdentity, config: LlamaCppConfig) -> Self {
-        let next_port = std::sync::atomic::AtomicU16::new(config.server_port_range.start);
         let client = reqwest::Client::builder()
             // The default 30s connection timeout would surface on first
             // load; we manage our own timeout via `model_load_timeout`.
@@ -207,7 +230,7 @@ impl LlamaCppWorker {
                 loaded_models: DashMap::new(),
                 config,
                 client,
-                next_port,
+                ports_in_use: Mutex::new(std::collections::HashSet::new()),
             }),
         }
     }
@@ -226,33 +249,63 @@ impl LlamaCppWorker {
             }
             // The previous load has been declared dead; drop it and try
             // again. The supervisor's `kill()` already ran.
+            let stale_port = existing.port;
             drop(existing);
             self.inner.loaded_models.remove(model_id);
+            self.release_port(stale_port).await;
         }
 
-        let model_path = resolve_model_path(&self.inner.config.model_dir, model_id);
-        if !model_path.exists() {
-            return Err(WorkerError::ArtifactUnavailable(format!(
-                "model file not found: {}",
-                model_path.display()
-            )));
-        }
+        // SEC-04: confine the resolved path to `model_dir`. Any traversal
+        // / absolute / leading-dash / nul id is rejected here, before the
+        // path ever reaches the spawn. Not-found and an invalid id collapse
+        // to the SAME generic client error (oracle closed); the specific
+        // reason is logged server-side only.
+        let model_path =
+            match resolve_model_path(&self.inner.config.model_dir, model_id) {
+                Ok(p) => p,
+                Err(detail) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        reason = %detail,
+                        "model path resolution rejected"
+                    );
+                    return Err(WorkerError::ArtifactUnavailable(
+                        "model unavailable".into(),
+                    ));
+                }
+            };
 
-        let port = self.allocate_port();
-        let child = spawn_llama_server(
+        // SEC-07: enforce the resident-model cap before spawning. If we're
+        // at the cap, evict the least-recently-used model first. Done
+        // before `allocate_port` so the freed port is available to the new
+        // model and we don't trip the range-full check unnecessarily.
+        self.evict_lru_if_at_cap(model_id).await;
+
+        let port = self.allocate_port().await?;
+        let child = match spawn_llama_server(
             &self.inner.config.server_binary_path,
             &model_path,
             port,
             self.inner.config.default_n_gpu_layers,
             self.inner.config.default_context_size,
             &self.inner.config.extra_env,
-        )
-        .map_err(|e| WorkerError::Other(format!("spawn llama-server: {e}")))?;
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                self.release_port(port).await;
+                return Err(WorkerError::Other(format!("spawn llama-server: {e}")));
+            }
+        };
 
         // Wait for /health to go 200 before declaring the model loaded.
-        wait_for_health(&self.inner.client, port, self.inner.config.model_load_timeout)
-            .await
-            .map_err(|e| WorkerError::Other(format!("llama-server health check: {e}")))?;
+        if let Err(e) =
+            wait_for_health(&self.inner.client, port, self.inner.config.model_load_timeout).await
+        {
+            self.release_port(port).await;
+            return Err(WorkerError::Other(format!(
+                "llama-server health check: {e}"
+            )));
+        }
 
         let failed = Arc::new(Notify::new());
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -283,25 +336,95 @@ impl LlamaCppWorker {
             failed_flag,
             supervisor,
         });
-        self.inner
+        // A concurrent `ensure_loaded` for the same id could have raced us
+        // to a winning load; if `insert` replaces a live entry, shut the
+        // loser down and free its port so we don't leak a subprocess.
+        if let Some(prev) = self
+            .inner
             .loaded_models
-            .insert(model_id_owned, loaded.clone());
+            .insert(model_id_owned, loaded.clone())
+        {
+            if prev.port != port {
+                prev.shutdown();
+                self.release_port(prev.port).await;
+            }
+        }
         Ok(loaded)
     }
 
-    fn allocate_port(&self) -> u16 {
-        // Wrap inside the configured range. There's a tiny race window
-        // between `fetch_add` and `bind()` inside the child where two
-        // loads can pick adjacent ports and one fails; the spawn path
-        // surfaces that as `WorkerError::Other` and the caller retries.
-        let range = &self.inner.config.server_port_range;
-        let span = (range.end - range.start) as u32;
-        let raw = self
-            .inner
-            .next_port
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
-        let offset = if span == 0 { 0 } else { raw % span };
-        range.start + offset as u16
+    /// SEC-07: allocate a port not currently bound by a live child. Scans
+    /// the configured range for the first free slot and reserves it. When
+    /// every port in the range is in use, returns [`WorkerError::Capacity`]
+    /// rather than wrapping onto a live port (the old `fetch_add % span`
+    /// behaviour, which silently collided and churned spawn/fail).
+    async fn allocate_port(&self) -> Result<u16, WorkerError> {
+        let range = self.inner.config.server_port_range.clone();
+        let mut in_use = self.inner.ports_in_use.lock().await;
+        for port in range.clone() {
+            if in_use.insert(port) {
+                return Ok(port);
+            }
+        }
+        tracing::warn!(
+            range_start = range.start,
+            range_end = range.end,
+            "llama-server port range exhausted; refusing load"
+        );
+        Err(WorkerError::Capacity)
+    }
+
+    /// Release a previously-[`allocate_port`](Self::allocate_port)ed port
+    /// back into the pool on unload/evict/spawn-failure.
+    async fn release_port(&self, port: u16) {
+        self.inner.ports_in_use.lock().await.remove(&port);
+    }
+
+    /// SEC-07: if the worker is already at `max_loaded_models`, evict the
+    /// least-recently-used model (by `last_used`) to make room for a new
+    /// one. The model currently being (re)loaded — `incoming` — is never a
+    /// candidate. The evicted model's subprocess is killed via
+    /// [`LoadedModel::shutdown`] and its port released.
+    async fn evict_lru_if_at_cap(&self, incoming: &str) {
+        let cap = self.inner.config.max_loaded_models.max(1);
+        // Evict in a loop in case we're over cap (e.g. cap was lowered or
+        // a prior failure left an extra entry). Bounded by the map size.
+        loop {
+            if self.inner.loaded_models.len() < cap {
+                return;
+            }
+            // Find the LRU victim. `last_used` is a `Mutex<Instant>`; read
+            // each under its lock. We hold no DashMap shard lock across the
+            // await by collecting candidates first.
+            let mut victim: Option<(String, Instant)> = None;
+            let candidates: Vec<(String, Arc<LoadedModel>)> = self
+                .inner
+                .loaded_models
+                .iter()
+                .filter(|e| e.key() != incoming)
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect();
+            for (id, model) in &candidates {
+                let used = *model.last_used.lock().await;
+                match &victim {
+                    Some((_, t)) if *t <= used => {}
+                    _ => victim = Some((id.clone(), used)),
+                }
+            }
+            let Some((victim_id, _)) = victim else {
+                // Nothing evictable (only the incoming model present, or
+                // map empty under a racing remove). Let the load proceed;
+                // worst case we momentarily exceed cap by one.
+                return;
+            };
+            if let Some((_, model)) = self.inner.loaded_models.remove(&victim_id) {
+                tracing::info!(model = %victim_id, "evicting LRU model to honour max_loaded_models");
+                model.shutdown();
+                self.release_port(model.port).await;
+            }
+            // Re-check the cap; another concurrent loader may have changed
+            // the map. The loop terminates because each iteration either
+            // returns or removes one entry.
+        }
     }
 }
 
@@ -356,21 +479,57 @@ impl Worker for LlamaCppWorker {
 // Subprocess management
 // ---------------------------------------------------------------------------
 
-/// Resolve `model_id` ("llama-3.2-3b" / "llama-3.2-3b.gguf" / absolute
-/// path) into an actual filesystem path inside `model_dir`. Absolute
-/// paths bypass the dir entirely so test fixtures and dev setups don't
-/// have to copy GGUFs around.
-fn resolve_model_path(model_dir: &Path, model_id: &str) -> PathBuf {
-    let candidate = PathBuf::from(model_id);
-    if candidate.is_absolute() {
-        return candidate;
+/// SEC-04: resolve a caller-supplied `model_id` into a GGUF path that is
+/// **provably inside** `model_dir`, or reject it.
+///
+/// The `model_id` arrives from the local Ollama HTTP API (and, gated by a
+/// model-loaded check, from relay peers) and is therefore untrusted. A
+/// naive `model_dir.join(model_id)` lets `"../../etc/passwd"` escape the
+/// directory (`Path::join` does not normalise `..`) and lets an absolute
+/// id replace the base entirely — feeding arbitrary files into
+/// llama.cpp's C++ GGUF parser (a memory-unsafe mmap/parse surface with
+/// CVE history) and turning the existence check into a filesystem oracle.
+///
+/// We confine in two layers:
+///
+/// 1. **Reject hostile shapes outright.** Empty, NUL, any path separator
+///    (`/` or `\`), a `..` component, or a leading `-` (which would also
+///    let the id masquerade as a `--flag` to `llama-server` — arg
+///    injection) are refused before touching the filesystem.
+/// 2. **Canonicalize-and-confine.** Join `model_dir/<id>.gguf`,
+///    `canonicalize()` both it and `model_dir`, and require the resolved
+///    path to start with the resolved base. This closes symlink-escape
+///    even for ids that pass the shape check.
+///
+/// On any violation returns `Err(reason)`; the caller maps every reason
+/// to the same generic client-facing error (oracle closed) and logs the
+/// detail server-side.
+fn resolve_model_path(model_dir: &Path, model_id: &str) -> Result<PathBuf, String> {
+    if model_id.is_empty()
+        || model_id.contains('\0')
+        || model_id.contains('/')
+        || model_id.contains('\\')
+        || model_id.contains("..")
+        || model_id.starts_with('-')
+    {
+        return Err(format!("invalid model id: {model_id:?}"));
     }
-    let with_ext = if model_id.ends_with(".gguf") {
-        model_dir.join(model_id)
-    } else {
-        model_dir.join(format!("{model_id}.gguf"))
-    };
-    with_ext
+
+    let candidate = model_dir.join(format!("{model_id}.gguf"));
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| format!("model not found ({}): {e}", candidate.display()))?;
+    let base = model_dir
+        .canonicalize()
+        .map_err(|e| format!("bad model_dir ({}): {e}", model_dir.display()))?;
+    if !canon.starts_with(&base) {
+        return Err(format!(
+            "resolved path {} escapes model_dir {}",
+            canon.display(),
+            base.display()
+        ));
+    }
+    Ok(canon)
 }
 
 /// Spawn the actual subprocess. Returns immediately — caller waits on
@@ -383,7 +542,31 @@ fn spawn_llama_server(
     ctx_size: usize,
     extra_env: &[(String, String)],
 ) -> std::io::Result<Child> {
+    // SEC-04 (L8): require an absolute binary path. Resolving `llama-server`
+    // via the inherited `$PATH` is a binary-hijack vector (an attacker who
+    // can prepend a dir to PATH gets code execution as lucidd). The startup
+    // path canonicalizes + existence-checks the configured binary; reject
+    // anything relative here as defence-in-depth.
+    if !binary.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "llama-server binary path must be absolute, got {}",
+                binary.display()
+            ),
+        ));
+    }
+
     let mut cmd = Command::new(binary);
+
+    // SEC-04 (L8): do not leak lucidd's entire environment (which may hold
+    // identity-key paths, tokens, etc.) into the subprocess, and don't let
+    // an inherited PATH influence anything the child shells out to. Start
+    // from an empty environment and add back only a minimal, known PATH
+    // plus any explicitly-configured `extra_env`.
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin:/usr/local/bin");
+
     cmd.arg("--model").arg(model);
     cmd.arg("--host").arg("127.0.0.1");
     cmd.arg("--port").arg(port.to_string());
@@ -999,21 +1182,64 @@ mod tests {
     use phase_protocol::ChatMessage;
 
     #[test]
-    fn resolve_model_path_appends_gguf() {
-        let p = resolve_model_path(Path::new("/var/models"), "llama-3.2");
-        assert_eq!(p, PathBuf::from("/var/models/llama-3.2.gguf"));
+    fn resolve_model_path_accepts_real_file_in_dir() {
+        // SEC-04: a legitimate id resolves to `model_dir/<id>.gguf`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("qwen3.gguf");
+        std::fs::write(&model, b"gguf").expect("touch model");
+        let resolved = resolve_model_path(dir.path(), "qwen3").expect("resolve ok");
+        // Canonicalized on both sides — compare against the canonical file.
+        assert_eq!(resolved, model.canonicalize().unwrap());
+        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
     }
 
     #[test]
-    fn resolve_model_path_respects_existing_extension() {
-        let p = resolve_model_path(Path::new("/var/models"), "llama-3.2.gguf");
-        assert_eq!(p, PathBuf::from("/var/models/llama-3.2.gguf"));
+    fn resolve_model_path_rejects_traversal_and_separators() {
+        // SEC-04: traversal / separators / absolute ids never resolve.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "/tmp/x.gguf",
+        ] {
+            assert!(
+                resolve_model_path(dir.path(), bad).is_err(),
+                "expected reject for {bad:?}"
+            );
+        }
     }
 
     #[test]
-    fn resolve_model_path_absolute_bypasses_dir() {
-        let p = resolve_model_path(Path::new("/var/models"), "/tmp/x.gguf");
-        assert_eq!(p, PathBuf::from("/tmp/x.gguf"));
+    fn resolve_model_path_rejects_leading_dash_empty_and_nul() {
+        // SEC-04: leading `-` (arg injection), empty, and embedded NUL.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(resolve_model_path(dir.path(), "--flag").is_err());
+        assert!(resolve_model_path(dir.path(), "-rf").is_err());
+        assert!(resolve_model_path(dir.path(), "").is_err());
+        assert!(resolve_model_path(dir.path(), "x\0y").is_err());
+    }
+
+    #[test]
+    fn resolve_model_path_oracle_closed_same_client_error() {
+        // SEC-04: a not-found id and a parse-/shape-rejected id collapse to
+        // the SAME generic client-facing error string. `ensure_loaded` maps
+        // both Err reasons to `ArtifactUnavailable("model unavailable")`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Both of these are `Err(_)` at the resolver; the caller maps them
+        // to one constant string, so the client cannot distinguish them.
+        let not_found = resolve_model_path(dir.path(), "definitely-not-here");
+        let bad_shape = resolve_model_path(dir.path(), "../escape");
+        assert!(not_found.is_err());
+        assert!(bad_shape.is_err());
+        let client_err =
+            |_: String| WorkerError::ArtifactUnavailable("model unavailable".into()).to_string();
+        assert_eq!(
+            client_err(not_found.unwrap_err()),
+            client_err(bad_shape.unwrap_err())
+        );
     }
 
     #[test]

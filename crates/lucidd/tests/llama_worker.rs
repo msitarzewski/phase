@@ -76,6 +76,7 @@ fn setup(model_id: &str) -> TestModel {
         default_n_gpu_layers: 0,
         default_context_size: 2048,
         server_port_range: port..(port + 1),
+        max_loaded_models: 3,
         model_load_timeout: Duration::from_secs(10),
         per_request_idle_timeout: Duration::from_secs(5),
         extra_env: Vec::new(),
@@ -84,6 +85,95 @@ fn setup(model_id: &str) -> TestModel {
         _dir: dir,
         config,
         model_id: model_id.to_string(),
+    }
+}
+
+/// Drive one full inference to its `Final` event so the model ends up
+/// resident in the worker. Returns the terminal completion + any error.
+async fn run_to_final(
+    worker: &LlamaCppWorker,
+    model_id: &str,
+) -> Result<(Completion, Option<String>), String> {
+    let manifest = make_manifest(model_id, "Hello.");
+    let (_handle, mut stream) = worker.execute(manifest).await.map_err(|e| e.to_string())?;
+    while let Some(ev) = stream.next().await {
+        if let JobEvent::Final { result, error } = ev {
+            return Ok((result.completion, error));
+        }
+    }
+    Err("stream ended without Final".to_string())
+}
+
+/// SEC-07: build a worker whose model_dir holds several distinct GGUFs and
+/// whose port range / cap can be tuned per test. Tokens emit fast so each
+/// `execute` finishes promptly.
+fn multi_model_worker(
+    model_ids: &[&str],
+    max_loaded_models: usize,
+    port_range_span: u16,
+) -> (tempfile::TempDir, LlamaCppWorker) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for id in model_ids {
+        std::fs::write(dir.path().join(format!("{id}.gguf")), b"fake").expect("touch model");
+    }
+    let base = free_port();
+    let config = LlamaCppConfig {
+        server_binary_path: fake_binary(),
+        model_dir: dir.path().to_path_buf(),
+        default_n_gpu_layers: 0,
+        default_context_size: 2048,
+        server_port_range: base..(base + port_range_span),
+        max_loaded_models,
+        model_load_timeout: Duration::from_secs(10),
+        per_request_idle_timeout: Duration::from_secs(5),
+        extra_env: vec![
+            ("FAKE_LLAMA_TOKENS".to_string(), "a,b".to_string()),
+            ("FAKE_LLAMA_DELAY_MS".to_string(), "1".to_string()),
+        ],
+    };
+    let worker = LlamaCppWorker::new(NodeIdentity::generate(), config);
+    (dir, worker)
+}
+
+#[tokio::test]
+async fn lru_eviction_at_cap_and_port_reused_on_reload() {
+    // SEC-07: cap = 2, three distinct models, three ports available.
+    // Loading the third evicts the LRU (the first). Reloading the evicted
+    // model then succeeds — its port was freed and is reacquired cleanly.
+    let (_dir, worker) = multi_model_worker(&["m-a", "m-b", "m-c"], 2, 3);
+
+    let (c, e) = run_to_final(&worker, "m-a").await.expect("load m-a");
+    assert_eq!(c, Completion::Stop, "m-a error: {e:?}");
+    let (c, _) = run_to_final(&worker, "m-b").await.expect("load m-b");
+    assert_eq!(c, Completion::Stop);
+    // Third load is at cap → LRU (m-a) evicted, its child killed + port freed.
+    let (c, _) = run_to_final(&worker, "m-c").await.expect("load m-c");
+    assert_eq!(c, Completion::Stop);
+
+    // Reload the evicted model. If its port had leaked, the range (3 ports,
+    // 2 live) would still have room — but eviction frees the port so this
+    // is a clean re-spawn either way.
+    let (c, e) = run_to_final(&worker, "m-a").await.expect("reload m-a");
+    assert_eq!(c, Completion::Stop, "reload m-a error: {e:?}");
+}
+
+#[tokio::test]
+async fn port_range_exhaustion_returns_capacity() {
+    // SEC-07: a single-port range with a cap of 2 lets the first model
+    // bind the only port; loading a SECOND distinct model (still resident,
+    // not evicted because we're under the model cap) finds no free port and
+    // must return Capacity rather than wrapping onto the live port.
+    let (_dir, worker) = multi_model_worker(&["only-a", "only-b"], 2, 1);
+
+    let (c, e) = run_to_final(&worker, "only-a").await.expect("load only-a");
+    assert_eq!(c, Completion::Stop, "only-a error: {e:?}");
+
+    // only-b: under the model cap, so no eviction; the one port is taken.
+    let manifest = make_manifest("only-b", "Hello.");
+    match worker.execute(manifest).await {
+        Err(phase_protocol::WorkerError::Capacity) => {}
+        Err(other) => panic!("expected WorkerError::Capacity, got {other:?}"),
+        Ok(_) => panic!("expected Capacity when port range exhausted, got Ok"),
     }
 }
 
@@ -275,6 +365,7 @@ async fn real_llama_server_smoke_test_when_env_set() {
         default_n_gpu_layers: i32::MAX,
         default_context_size: 2048,
         server_port_range: port..(port + 1),
+        max_loaded_models: 3,
         model_load_timeout: Duration::from_secs(120),
         per_request_idle_timeout: Duration::from_secs(60),
         extra_env: Vec::new(),
