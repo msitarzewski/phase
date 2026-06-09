@@ -1313,11 +1313,25 @@ fn parse_embedding_response(raw: &[u8]) -> Option<Vec<f32>> {
     None
 }
 
-/// Decode a JSON value that should be an array of numbers into `Vec<f32>`.
-/// Returns `None` for anything that isn't a numeric array.
+/// Decode a JSON value that should be an embedding vector into `Vec<f32>`.
+///
+/// Handles both shapes llama.cpp emits: the OpenAI `/v1/embeddings` form is a
+/// flat `[f, f, ...]`, while the native `/embedding` endpoint wraps the
+/// (mean-pooled) vector in an OUTER array — `[[f, f, ...]]` — even for a single
+/// `content`. We descend one level when the first element is itself an array
+/// (taking row 0, the pooled vector). Returns `None` for an empty or
+/// non-numeric array.
 fn json_to_vec_f32(value: &serde_json::Value) -> Option<Vec<f32>> {
     let arr = value.as_array()?;
-    arr.iter()
+    let row: &[serde_json::Value] = match arr.first() {
+        // Native /embedding: `[[...]]` — descend into the first (pooled) row.
+        Some(v) if v.is_array() => v.as_array()?,
+        // Flat `[...]` — already a vector.
+        Some(_) => arr,
+        // Empty array carries no vector.
+        None => return None,
+    };
+    row.iter()
         .map(|n| n.as_f64().map(|f| f as f32))
         .collect::<Option<Vec<f32>>>()
 }
@@ -1571,9 +1585,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_embedding_accepts_nested_array_of_objects() {
+        // The REAL llama.cpp native /embedding endpoint wraps the pooled
+        // vector in an OUTER array: `[{"index":0,"embedding":[[...]]}]`. The
+        // fake-stub test above used a flat array and missed this; a live
+        // nomic-embed run returned zero vectors until the parser descended one
+        // level. Take row 0 (the pooled vector).
+        let raw = br#"[{"index":0,"embedding":[[7.0,8.0,9.0]]}]"#;
+        let v = parse_embedding_response(raw).expect("parse");
+        assert_eq!(v, vec![7.0f32, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn parse_embedding_accepts_nested_top_level_object() {
+        // Same nesting under the top-level `{"embedding":[[...]]}` shape.
+        let raw = br#"{"embedding":[[1.5,2.5]]}"#;
+        let v = parse_embedding_response(raw).expect("parse");
+        assert_eq!(v, vec![1.5f32, 2.5]);
+    }
+
+    #[test]
     fn parse_embedding_rejects_non_numeric_and_missing() {
         assert!(parse_embedding_response(br#"{"nope":1}"#).is_none());
         assert!(parse_embedding_response(br#"{"embedding":["x"]}"#).is_none());
+        assert!(parse_embedding_response(br#"{"embedding":[]}"#).is_none());
         assert!(parse_embedding_response(b"not json").is_none());
     }
 
