@@ -61,8 +61,8 @@ use tracing::{debug, info, warn};
 /// request frame cap (SEC-06, discovery.rs).
 const MAX_PROMPT_CHARS: usize = 256 * 1024;
 
-use crate::registry::ModelRegistry;
 use crate::policy::{PauseReason, PolicyDecision, PolicyEngine};
+use crate::registry::ModelRegistry;
 
 /// How long the requesting side will wait for a relay response. CBOR is
 /// cheap; the real time is the serving peer's inference. Five minutes
@@ -137,7 +137,14 @@ impl RouteDecision {
             RouteVia::Local => Some("local".to_string()),
             RouteVia::Peer { peer_id } => {
                 let s = peer_id.to_string();
-                let short: String = s.chars().rev().take(8).collect::<String>().chars().rev().collect();
+                let short: String = s
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
                 Some(format!("peer:{short}"))
             }
             RouteVia::Refused { .. } => None,
@@ -321,7 +328,9 @@ impl Router {
                             warn!(failed_peer = %peer_id, next = %fb, "relay failed; failing over to next peer");
                             match self.execute_via_peer(*fb, job.clone()).await {
                                 Ok(t) => return Ok(t),
-                                Err(e) => warn!(peer = %fb, error = %e, "fallback peer also failed"),
+                                Err(e) => {
+                                    warn!(peer = %fb, error = %e, "fallback peer also failed")
+                                }
                             }
                         }
                         Err(first_err)
@@ -403,8 +412,7 @@ impl Router {
         // the local path) instead of `WorkerError::Dropped`.
         let (handle, mut producer) = JobHandle::new(job_id);
         if !receipt_bytes.is_empty() {
-            if let Ok(receipt) =
-                serde_json::from_slice::<SignedReceipt<JobResult>>(&receipt_bytes)
+            if let Ok(receipt) = serde_json::from_slice::<SignedReceipt<JobResult>>(&receipt_bytes)
             {
                 producer.deliver_receipt(receipt);
             }
@@ -513,7 +521,8 @@ fn verify_peer_receipt(
         warn!(peer = %peer_id, "relay: event batch carried no Final result to bind commitment");
         return ReceiptVerification::Failed;
     };
-    if replayed_commitment != result.output_commitment || replayed_count != result.output_chunk_count
+    if replayed_commitment != result.output_commitment
+        || replayed_count != result.output_chunk_count
     {
         warn!(
             peer = %peer_id,
@@ -704,9 +713,7 @@ pub fn make_inbound_relay_handler(
                     spec.prompt.as_ref().map(|p| p.len()).unwrap_or(0)
                         + spec.messages.iter().map(|m| m.content.len()).sum::<usize>(),
                 ),
-                JobSpec::Embedding(spec) => {
-                    Some(spec.input.iter().map(|s| s.len()).sum::<usize>())
-                }
+                JobSpec::Embedding(spec) => Some(spec.input.iter().map(|s| s.len()).sum::<usize>()),
                 _ => None,
             };
             if let Some(prompt_chars) = prompt_chars {
@@ -850,7 +857,13 @@ mod tests {
             Ok(())
         }
         async fn get_record(&self, key: Vec<u8>) -> Result<Vec<Vec<u8>>> {
-            Ok(self.store.lock().unwrap().get(&key).cloned().unwrap_or_default())
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -890,13 +903,7 @@ mod tests {
         let worker: Arc<dyn DynWorker> = Arc::new(EchoWorker::new());
 
         let phase_net = build_test_discovery();
-        let router = Router::new(
-            Some(worker),
-            registry.clone(),
-            policy,
-            identity,
-            phase_net,
-        );
+        let router = Router::new(Some(worker), registry.clone(), policy, identity, phase_net);
         (router, registry)
     }
 
@@ -1009,10 +1016,7 @@ mod tests {
         // test we load "qwen3-big" locally under the same CID so the
         // name resolves, and we explicitly DON'T configure a local
         // worker — that's what consume-only mode looks like.
-        let registry = Arc::new(ModelRegistry::new(
-            identity.clone(),
-            transport.clone() as _,
-        ));
+        let registry = Arc::new(ModelRegistry::new(identity.clone(), transport.clone() as _));
         let mut caps_for_local = sample_caps("qwen3-big", 9);
         caps_for_local.model_cid = cid;
         registry.advertise_loaded(caps_for_local).await.unwrap();
@@ -1024,13 +1028,7 @@ mod tests {
         // No local worker — consume-only daemon. This forces the router
         // through the peer branch even though the registry knows about
         // the model.
-        let router = Router::new(
-            None,
-            registry,
-            policy,
-            identity,
-            build_test_discovery(),
-        );
+        let router = Router::new(None, registry, policy, identity, build_test_discovery());
 
         let decision = router.route("qwen3-big", false).await;
         match &decision.via {
@@ -1038,10 +1036,8 @@ mod tests {
                 // Re-derive the expected peer-id from the foreign
                 // identity to assert we picked the right one.
                 use phase_net::libp2p_identity::{ed25519, PublicKey};
-                let ed = ed25519::PublicKey::try_from_bytes(
-                    &foreign.verifying_key().to_bytes(),
-                )
-                .unwrap();
+                let ed = ed25519::PublicKey::try_from_bytes(&foreign.verifying_key().to_bytes())
+                    .unwrap();
                 let pk: PublicKey = ed.into();
                 let expected = PeerId::from(pk);
                 assert_eq!(*peer_id, expected);
@@ -1119,13 +1115,7 @@ mod tests {
             PolicyConfig::default(),
             PolicyState::default(),
         ));
-        let router = Router::new(
-            None,
-            registry,
-            policy,
-            identity,
-            build_test_discovery(),
-        );
+        let router = Router::new(None, registry, policy, identity, build_test_discovery());
         let decision = router.route("unknown-model", false).await;
         match &decision.via {
             RouteVia::Refused { reason } => {
@@ -1140,9 +1130,7 @@ mod tests {
         // Integration-style: route + execute against the EchoWorker and
         // make sure we see Output frames and a Final.
         use phase_manifest::ManifestBuilder;
-        use phase_protocol::{
-            ChatMessage, ChatRole, InferenceJobSpec, JobSpec, SamplingParams,
-        };
+        use phase_protocol::{ChatMessage, ChatRole, InferenceJobSpec, JobSpec, SamplingParams};
 
         let (router, _reg) = make_router_with_local_model().await;
         let decision = router.route("qwen3-mini", false).await;
@@ -1458,8 +1446,7 @@ mod tests {
     /// the "dispatched-to" PeerId for the bind check.
     fn peer_id_of(identity: &NodeIdentity) -> PeerId {
         use phase_net::libp2p_identity::{ed25519, PublicKey};
-        let ed =
-            ed25519::PublicKey::try_from_bytes(&identity.verifying_key().to_bytes()).unwrap();
+        let ed = ed25519::PublicKey::try_from_bytes(&identity.verifying_key().to_bytes()).unwrap();
         let pk: PublicKey = ed.into();
         PeerId::from(pk)
     }
@@ -1505,7 +1492,11 @@ mod tests {
 
         let dispatched_peer = peer_id_of(&worker_id);
         let v = verify_peer_receipt(&receipt_b, &events, manifest_hash, dispatched_peer);
-        assert_eq!(v, ReceiptVerification::Verified, "honest round-trip must verify");
+        assert_eq!(
+            v,
+            ReceiptVerification::Verified,
+            "honest round-trip must verify"
+        );
     }
 
     #[tokio::test]
@@ -1520,7 +1511,11 @@ mod tests {
         // over → must fail.
         let wrong_hash = [0x42u8; 32];
         let v = verify_peer_receipt(&receipt_b, &events, wrong_hash, peer_id_of(&worker_id));
-        assert_eq!(v, ReceiptVerification::Failed, "job_id mismatch must be detected");
+        assert_eq!(
+            v,
+            ReceiptVerification::Failed,
+            "job_id mismatch must be detected"
+        );
     }
 
     #[tokio::test]
@@ -1560,7 +1555,10 @@ mod tests {
                 break;
             }
         }
-        assert!(tampered, "round-trip should have produced at least one Output chunk");
+        assert!(
+            tampered,
+            "round-trip should have produced at least one Output chunk"
+        );
 
         let v = verify_peer_receipt(&receipt_b, &events, manifest_hash, peer_id_of(&worker_id));
         assert_eq!(
@@ -1664,7 +1662,11 @@ mod tests {
             JobRelayResponse::Err { reason } => assert!(reason.contains("prompt too large")),
             other => panic!("expected Err, got {other:?}"),
         }
-        assert_eq!(spy.call_count(), 0, "oversized prompt must not reach the worker");
+        assert_eq!(
+            spy.call_count(),
+            0,
+            "oversized prompt must not reach the worker"
+        );
     }
 
     #[tokio::test]
@@ -1728,7 +1730,10 @@ mod tests {
         // Release the gate so job1 can finish (and the test doesn't leak).
         gate.add_permits(1);
         let resp1 = job1.await.unwrap();
-        assert!(matches!(resp1, JobRelayResponse::Ok { .. }), "job1 should complete");
+        assert!(
+            matches!(resp1, JobRelayResponse::Ok { .. }),
+            "job1 should complete"
+        );
     }
 
     #[test]

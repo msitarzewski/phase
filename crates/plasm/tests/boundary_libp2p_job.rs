@@ -15,12 +15,11 @@
 //! test for the rejection contract, since that path tests the matching logic
 //! without burning libp2p time on the same assertion twice.
 
-use plasm::network::{
-    Discovery, DiscoveryConfig,
-    protocol::{JobOffer, JobRequirements, JobResponse, RejectionReason},
-    PeerCapabilities,
-};
 use phase_protocol::JobSpecKind;
+use plasm::network::{
+    protocol::{JobOffer, JobRequirements, JobResponse, RejectionReason},
+    Discovery, DiscoveryConfig, PeerCapabilities,
+};
 use std::time::Duration;
 
 fn x86_capabilities() -> PeerCapabilities {
@@ -117,9 +116,8 @@ async fn two_node_libp2p_job_roundtrip() {
         let offer = JobOffer {
             job_id: "boundary-job-1".to_string(),
             nonce: "nonce-xyz".to_string(),
-            module_hash:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
+            module_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             requirements: JobRequirements {
                 cpu_cores: 1,
                 memory_mb: 128,
@@ -177,9 +175,8 @@ async fn two_node_libp2p_job_roundtrip() {
         let bad_offer = JobOffer {
             job_id: "boundary-job-2".to_string(),
             nonce: "nonce-xyz-2".to_string(),
-            module_hash:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
+            module_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             requirements: JobRequirements {
                 cpu_cores: 1,
                 memory_mb: 128,
@@ -203,4 +200,3 @@ async fn two_node_libp2p_job_roundtrip() {
         "two_node_libp2p_job_roundtrip exceeded the 15s boundary"
     );
 }
-

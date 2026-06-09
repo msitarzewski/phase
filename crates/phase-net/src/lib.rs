@@ -17,9 +17,7 @@ pub mod peer;
 pub mod protocol;
 
 pub use discovery::{Discovery, DiscoveryConfig, JobRelayHandler};
-pub use peer::{
-    BandwidthBucket, LatencyBucket, PeerCapabilities, PeerInfo,
-};
+pub use peer::{BandwidthBucket, LatencyBucket, PeerCapabilities, PeerInfo};
 pub use protocol::{
     JobOffer, JobRelayRequest, JobRelayResponse, JobRequest, JobRequirements, JobResponse,
     JobResult, RejectionReason,

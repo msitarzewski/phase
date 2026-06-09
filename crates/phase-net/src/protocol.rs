@@ -186,8 +186,8 @@ pub struct JobResult {
 
 /// Helper module for base64 encoding of bytes (for JSON compatibility)
 mod serde_bytes_base64 {
-    use serde::{Deserialize, Deserializer, Serializer};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where

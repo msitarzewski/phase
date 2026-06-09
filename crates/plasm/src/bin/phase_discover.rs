@@ -14,18 +14,18 @@
 // already long state machine. Keep the explicit nested form.
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
-use std::time::Duration;
 use clap::Parser;
-use tracing::{info, warn, error, Level};
+use std::time::Duration;
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use libp2p::{
-    kad::{self, store::MemoryStore, Mode, QueryResult, GetRecordOk, RecordKey},
-    noise, yamux,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, Multiaddr, PeerId,
-};
 use futures::StreamExt;
+use libp2p::{
+    kad::{self, store::MemoryStore, GetRecordOk, Mode, QueryResult, RecordKey},
+    noise,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId,
+};
 
 /// Phase Discover - Boot-time manifest discovery
 #[derive(Parser, Debug)]
@@ -148,7 +148,10 @@ async fn main() -> anyhow::Result<()> {
     for addr_str in &bootstrap_nodes {
         if let Ok(addr) = addr_str.parse::<Multiaddr>() {
             if let Some(peer_id) = extract_peer_id(&addr) {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
                 if !args.quiet {
                     info!("Added bootstrap node: {}", peer_id);
                 }
@@ -165,7 +168,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the DHT query
     let record_key = RecordKey::new(&manifest_key);
-    let query_id = swarm.behaviour_mut().kademlia.get_record(record_key.clone());
+    let query_id = swarm
+        .behaviour_mut()
+        .kademlia
+        .get_record(record_key.clone());
 
     if !args.quiet {
         info!("Started DHT query: {:?}", query_id);

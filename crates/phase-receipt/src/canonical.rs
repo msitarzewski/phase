@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 use crate::error::ReceiptError;
 
 pub(crate) fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ReceiptError> {
-    let v = serde_json::to_value(value)
-        .map_err(|e| ReceiptError::Canonicalization(e.to_string()))?;
+    let v =
+        serde_json::to_value(value).map_err(|e| ReceiptError::Canonicalization(e.to_string()))?;
     let sorted = sort_value(v);
     serde_json::to_vec(&sorted).map_err(|e| ReceiptError::Canonicalization(e.to_string()))
 }

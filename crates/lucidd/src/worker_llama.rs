@@ -285,20 +285,17 @@ impl LlamaCppWorker {
         // reason is logged server-side only. Resolution uses the BARE
         // `model_id`, never the composite key, so the embedding flavour
         // loads the same GGUF as the chat flavour.
-        let model_path =
-            match resolve_model_path(&self.inner.config.model_dir, model_id) {
-                Ok(p) => p,
-                Err(detail) => {
-                    tracing::warn!(
-                        model = %model_id,
-                        reason = %detail,
-                        "model path resolution rejected"
-                    );
-                    return Err(WorkerError::ArtifactUnavailable(
-                        "model unavailable".into(),
-                    ));
-                }
-            };
+        let model_path = match resolve_model_path(&self.inner.config.model_dir, model_id) {
+            Ok(p) => p,
+            Err(detail) => {
+                tracing::warn!(
+                    model = %model_id,
+                    reason = %detail,
+                    "model path resolution rejected"
+                );
+                return Err(WorkerError::ArtifactUnavailable("model unavailable".into()));
+            }
+        };
 
         // SEC-07: enforce the resident-model cap before spawning. If we're
         // at the cap, evict the least-recently-used model first. Done
@@ -326,8 +323,12 @@ impl LlamaCppWorker {
         };
 
         // Wait for /health to go 200 before declaring the model loaded.
-        if let Err(e) =
-            wait_for_health(&self.inner.client, port, self.inner.config.model_load_timeout).await
+        if let Err(e) = wait_for_health(
+            &self.inner.client,
+            port,
+            self.inner.config.model_load_timeout,
+        )
+        .await
         {
             self.release_port(port).await;
             return Err(WorkerError::Other(format!(
@@ -526,9 +527,7 @@ impl Worker for LlamaCppWorker {
                 ));
                 Ok((handle, stream))
             }
-            other => Err(WorkerError::Unsupported {
-                kind: other.kind(),
-            }),
+            other => Err(WorkerError::Unsupported { kind: other.kind() }),
         }
     }
 }
@@ -849,16 +848,14 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                             }
                             crash_times.push(Instant::now());
                             if crash_times.len() >= 3 {
-                                failed_flag
-                                    .store(true, std::sync::atomic::Ordering::Release);
+                                failed_flag.store(true, std::sync::atomic::Ordering::Release);
                                 failed.notify_waiters();
                                 return;
                             }
                             // Loop will fall through to the next iteration;
                             // `current_child` is None, so we break out of
                             // the outer loop and stop supervising.
-                            failed_flag
-                                .store(true, std::sync::atomic::Ordering::Release);
+                            failed_flag.store(true, std::sync::atomic::Ordering::Release);
                             failed.notify_waiters();
                             return;
                         }
@@ -1298,7 +1295,11 @@ fn parse_embedding_response(raw: &[u8]) -> Option<Vec<f32>> {
         return Some(v);
     }
     // Shape 3: {"data": [{"embedding": [...]}, ...]} — take the first entry.
-    if let Some(first) = value.get("data").and_then(|d| d.as_array()).and_then(|a| a.first()) {
+    if let Some(first) = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+    {
         if let Some(v) = first.get("embedding").and_then(json_to_vec_f32) {
             return Some(v);
         }

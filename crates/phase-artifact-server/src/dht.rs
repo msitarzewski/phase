@@ -43,16 +43,8 @@ pub const MANIFEST_REFRESH_INTERVAL: u64 = DEFAULT_MANIFEST_TTL / 2;
 
 impl ManifestRecord {
     /// Build a fresh manifest record for the given channel/arch.
-    pub fn new(
-        channel: String,
-        arch: String,
-        http_addr: String,
-        manifest_version: String,
-    ) -> Self {
-        let manifest_url = format!(
-            "http://{}/{}/{}/manifest.json",
-            http_addr, channel, arch
-        );
+    pub fn new(channel: String, arch: String, http_addr: String, manifest_version: String) -> Self {
+        let manifest_url = format!("http://{}/{}/{}/manifest.json", http_addr, channel, arch);
         Self {
             channel,
             arch,
@@ -168,9 +160,7 @@ mod tests {
 
     #[test]
     fn test_blob_dht_key_format() {
-        let key = blob_dht_key(
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-        );
+        let key = blob_dht_key("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
         let key_str = String::from_utf8_lossy(key.as_ref());
         assert!(key_str.starts_with("/phase/blob/"));
         assert!(key_str.contains("b94d27b9"));

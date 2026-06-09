@@ -84,7 +84,12 @@ pub fn perform_health_check(artifacts_dir: &Path) -> HealthCheck {
     let disk_space_ok = artifacts_dir.exists(); // Simplified check
 
     HealthCheck {
-        status: if artifacts_readable && disk_space_ok { "healthy" } else { "unhealthy" }.to_string(),
+        status: if artifacts_readable && disk_space_ok {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+        .to_string(),
         checks: HealthChecks {
             artifacts_readable,
             disk_space_ok,

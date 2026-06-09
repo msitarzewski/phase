@@ -112,9 +112,10 @@ impl BootManifest {
 
         // Validate manifest version
         if self.manifest_version != 1 {
-            return Err(ManifestError::MissingField(
-                format!("manifest_version must be 1, got {}", self.manifest_version)
-            ));
+            return Err(ManifestError::MissingField(format!(
+                "manifest_version must be 1, got {}",
+                self.manifest_version
+            )));
         }
 
         // Check required artifacts
@@ -124,22 +125,23 @@ impl BootManifest {
 
         // Validate each artifact
         for (name, artifact) in &self.artifacts {
-            artifact.validate()
-                .map_err(|e| ManifestError::InvalidArtifact(
-                    format!("{}: {}", name, e)
-                ))?;
+            artifact
+                .validate()
+                .map_err(|e| ManifestError::InvalidArtifact(format!("{}: {}", name, e)))?;
         }
 
         // Validate timestamps (basic ISO 8601 check)
         if !is_valid_iso8601(&self.created_at) {
-            return Err(ManifestError::InvalidTimestamp(
-                format!("created_at: {}", self.created_at)
-            ));
+            return Err(ManifestError::InvalidTimestamp(format!(
+                "created_at: {}",
+                self.created_at
+            )));
         }
         if !is_valid_iso8601(&self.expires_at) {
-            return Err(ManifestError::InvalidTimestamp(
-                format!("expires_at: {}", self.expires_at)
-            ));
+            return Err(ManifestError::InvalidTimestamp(format!(
+                "expires_at: {}",
+                self.expires_at
+            )));
         }
 
         Ok(())
@@ -181,44 +183,48 @@ impl ArtifactInfo {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.filename.is_empty() {
             return Err(ManifestError::InvalidArtifact(
-                "filename cannot be empty".to_string()
+                "filename cannot be empty".to_string(),
             ));
         }
 
         if self.size_bytes == 0 {
             return Err(ManifestError::InvalidArtifact(
-                "size_bytes must be greater than zero".to_string()
+                "size_bytes must be greater than zero".to_string(),
             ));
         }
 
         // Validate hash format: "algorithm:hexdigest"
         if !self.hash.contains(':') {
-            return Err(ManifestError::InvalidHash(
-                format!("expected 'algorithm:hexdigest', got '{}'", self.hash)
-            ));
+            return Err(ManifestError::InvalidHash(format!(
+                "expected 'algorithm:hexdigest', got '{}'",
+                self.hash
+            )));
         }
 
         let parts: Vec<&str> = self.hash.split(':').collect();
         if parts.len() != 2 {
-            return Err(ManifestError::InvalidHash(
-                format!("expected exactly one ':', got '{}'", self.hash)
-            ));
+            return Err(ManifestError::InvalidHash(format!(
+                "expected exactly one ':', got '{}'",
+                self.hash
+            )));
         }
 
         let algorithm = parts[0];
         let digest = parts[1];
 
         if algorithm.is_empty() || digest.is_empty() {
-            return Err(ManifestError::InvalidHash(
-                format!("algorithm and digest cannot be empty: '{}'", self.hash)
-            ));
+            return Err(ManifestError::InvalidHash(format!(
+                "algorithm and digest cannot be empty: '{}'",
+                self.hash
+            )));
         }
 
         // Validate hex digest
         if !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ManifestError::InvalidHash(
-                format!("digest must be hexadecimal: '{}'", digest)
-            ));
+            return Err(ManifestError::InvalidHash(format!(
+                "digest must be hexadecimal: '{}'",
+                digest
+            )));
         }
 
         Ok(())
@@ -341,13 +347,14 @@ impl ManifestBuilder {
     ///
     /// Returns an error if required fields are missing or validation fails.
     pub fn build(self) -> Result<BootManifest, ManifestError> {
-        let version = self.version
+        let version = self
+            .version
             .ok_or_else(|| ManifestError::MissingField("version".to_string()))?;
 
         // Default timestamps if not provided
-        let created_at = self.created_at.unwrap_or_else(|| {
-            chrono::Utc::now().to_rfc3339()
-        });
+        let created_at = self
+            .created_at
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
         let expires_at = self.expires_at.unwrap_or_else(|| {
             // Default: 30 days from now
@@ -482,8 +489,8 @@ mod tests {
         let json = serde_json::to_string(&manifest).expect("Failed to serialize");
 
         // Deserialize back
-        let deserialized: BootManifest = serde_json::from_str(&json)
-            .expect("Failed to deserialize");
+        let deserialized: BootManifest =
+            serde_json::from_str(&json).expect("Failed to deserialize");
 
         assert_eq!(manifest, deserialized);
     }

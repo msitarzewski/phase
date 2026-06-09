@@ -342,10 +342,7 @@ impl PolicyEngine {
 
     /// Snapshot of the current state. Cheap (`Clone`).
     pub fn state(&self) -> PolicyState {
-        self.state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The actual decision function. `current_concurrency` is supplied by
@@ -353,7 +350,11 @@ impl PolicyEngine {
     /// because the router's bookkeeping is per-request and lives closer to
     /// the dispatch path.
     pub fn should_serve(&self, model_id: &str, current_concurrency: u32) -> PolicyDecision {
-        let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let state = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         let decision = decide(&config, &state, model_id, current_concurrency);
         // Best-effort record of the last decision. We try a non-blocking
@@ -373,7 +374,11 @@ impl PolicyEngine {
     /// themselves. It still respects manual_pause: an explicit operator
     /// "this node is off" wins. No new config knob; this is correct semantics.
     pub fn should_serve_self(&self, model_id: &str) -> PolicyDecision {
-        let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         decide_self(&config, model_id)
     }
 
@@ -458,9 +463,10 @@ fn decide(
     // 3. Thermal threshold. If the threshold is set and we have a reading
     //    above it, pause. A missing sensor is "fine to serve" — operators
     //    on hardware without sensors can pause manually.
-    if let (Some(threshold), Some(current)) =
-        (config.auto_pause_on_thermal_threshold_c, state.temperature_c)
-    {
+    if let (Some(threshold), Some(current)) = (
+        config.auto_pause_on_thermal_threshold_c,
+        state.temperature_c,
+    ) {
         if current > threshold {
             return PolicyDecision::Pause {
                 reason: PauseReason::ThermalLimit {
@@ -529,10 +535,10 @@ fn matches_any_glob(patterns: &[String], model_id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn read_config(path: &Path) -> Result<PolicyConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: PolicyConfig = toml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: PolicyConfig =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
 }
 
@@ -1095,7 +1101,10 @@ mod tests {
         // Operators wanting "always on" should set None, not start==end.
         // start==end is treated as "never" so the type is total.
         for h in 0..24 {
-            assert!(!w.contains_hour(h), "hour {h} unexpectedly inside empty window");
+            assert!(
+                !w.contains_hour(h),
+                "hour {h} unexpectedly inside empty window"
+            );
         }
     }
 
@@ -1103,8 +1112,8 @@ mod tests {
 
     #[test]
     fn default_toml_round_trips() {
-        let parsed: PolicyConfig = toml::from_str(DEFAULT_CONFIG_TOML)
-            .expect("default TOML should parse");
+        let parsed: PolicyConfig =
+            toml::from_str(DEFAULT_CONFIG_TOML).expect("default TOML should parse");
         assert_eq!(parsed, PolicyConfig::default());
     }
 

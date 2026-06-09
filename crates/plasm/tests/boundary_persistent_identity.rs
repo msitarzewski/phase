@@ -31,7 +31,10 @@ fn fresh_temp() -> (TempDir, PathBuf) {
 fn persistent_identity_simulated_restart() {
     // (b) Loading from a nonexistent path must generate AND persist a key.
     let (temp_b, path_b) = fresh_temp();
-    assert!(!path_b.exists(), "precondition: identity file must not exist");
+    assert!(
+        !path_b.exists(),
+        "precondition: identity file must not exist"
+    );
     let created = NodeIdentity::load_or_create(&path_b).expect("create new identity");
     assert!(
         path_b.exists(),

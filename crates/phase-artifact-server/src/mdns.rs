@@ -147,12 +147,8 @@ impl MdnsAdvertiser {
             config.service_name, config.http_port, config.channel, config.arch
         );
 
-        warn!(
-            "mDNS service advertisement not yet implemented - requires 'mdns-sd' crate"
-        );
-        warn!(
-            "To enable: add 'mdns-sd = \"0.11\"' to Cargo.toml and implement ServiceDaemon"
-        );
+        warn!("mDNS service advertisement not yet implemented - requires 'mdns-sd' crate");
+        warn!("To enable: add 'mdns-sd = \"0.11\"' to Cargo.toml and implement ServiceDaemon");
 
         info!(
             "Clients can discover via: avahi-browse {} or dns-sd -B {}",

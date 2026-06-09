@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use anyhow::{Result, Context};
 
 /// Daemon configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ pub struct ExecutionLimits {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addrs: vec![],  // Empty = use default /ip4/0.0.0.0/tcp/0
+            listen_addrs: vec![], // Empty = use default /ip4/0.0.0.0/tcp/0
             peer_addrs: vec![],
             bootstrap_peers: vec![],
             max_concurrent_jobs: 4,
@@ -110,24 +110,25 @@ impl Config {
         // If path specified, try loading it
         if let Some(p) = path {
             if Path::new(p).exists() {
-                return Self::load(p)
-                    .with_context(|| format!("Failed to load config from: {}", p));
+                return Self::load(p).with_context(|| format!("Failed to load config from: {}", p));
             }
         }
 
         // Try user config
         if let Some(user_path) = Self::default_user_config_path() {
             if user_path.exists() {
-                return Self::load(&user_path)
-                    .with_context(|| format!("Failed to load user config from: {}", user_path.display()));
+                return Self::load(&user_path).with_context(|| {
+                    format!("Failed to load user config from: {}", user_path.display())
+                });
             }
         }
 
         // Try system config
         let sys_path = Self::system_config_path();
         if sys_path.exists() {
-            return Self::load(&sys_path)
-                .with_context(|| format!("Failed to load system config from: {}", sys_path.display()));
+            return Self::load(&sys_path).with_context(|| {
+                format!("Failed to load system config from: {}", sys_path.display())
+            });
         }
 
         // Return default config
@@ -194,6 +195,9 @@ mod tests {
         let loaded = Config::load(temp_file.path()).unwrap();
 
         assert_eq!(config.max_concurrent_jobs, loaded.max_concurrent_jobs);
-        assert_eq!(config.limits.max_memory_bytes, loaded.limits.max_memory_bytes);
+        assert_eq!(
+            config.limits.max_memory_bytes,
+            loaded.limits.max_memory_bytes
+        );
     }
 }

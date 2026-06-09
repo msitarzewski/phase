@@ -25,6 +25,9 @@ fn main() {
     let second_peer = peer_id_for(&second);
     println!("second peer-id: {}", second_peer);
 
-    assert_eq!(first_peer, second_peer, "peer-id must be stable across restarts");
+    assert_eq!(
+        first_peer, second_peer,
+        "peer-id must be stable across restarts"
+    );
     println!("OK: peer-id stable across simulated restart");
 }

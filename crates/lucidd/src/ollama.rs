@@ -615,9 +615,9 @@ async fn handle_generate(
     if let Some(v) = receipt_verification.header_value() {
         builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
     }
-    builder
-        .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response())
+    builder.body(body).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
+    })
 }
 
 async fn handle_chat(
@@ -678,17 +678,17 @@ async fn handle_chat(
 
     let (handle, mut job_stream, receipt_verification) =
         match state.router.execute(&decision, manifest).await {
-        Ok(t) => t,
-        Err(RouterError::Refused { reason }) => return refused_response(&reason),
-        Err(e) => {
-            tracing::error!(error = %e, "router dispatch failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("router dispatch failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+            Ok(t) => t,
+            Err(RouterError::Refused { reason }) => return refused_response(&reason),
+            Err(e) => {
+                tracing::error!(error = %e, "router dispatch failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("router dispatch failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let job_id = handle.job_id().clone();
     let started_at = std::time::Instant::now();
@@ -870,12 +870,10 @@ async fn handle_chat(
     if let Some(v) = receipt_verification.header_value() {
         builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
     }
-    builder
-        .body(body)
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to build streaming response");
-            (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
-        })
+    builder.body(body).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to build streaming response");
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,10 +1111,7 @@ fn pull_name_is_safe(name: &str) -> bool {
 /// `stream:false` returns a single JSON object. On a not-found in streaming
 /// mode we can't change the status code mid-NDJSON, so we emit an error status
 /// line and end the stream; non-streaming returns 404.
-async fn handle_pull(
-    State(state): State<AppState>,
-    Json(req): Json<PullRequest>,
-) -> Response {
+async fn handle_pull(State(state): State<AppState>, Json(req): Json<PullRequest>) -> Response {
     let stream_mode = req.stream.unwrap_or(true);
     let name = match req.model.or(req.name) {
         Some(n) => n,
@@ -1176,7 +1171,11 @@ fn pull_success_response(stream_mode: bool) -> Response {
             serde_json::json!({ "status": "success" }),
         ])
     } else {
-        (StatusCode::OK, Json(serde_json::json!({ "status": "success" }))).into_response()
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "success" })),
+        )
+            .into_response()
     }
 }
 
@@ -1336,8 +1335,8 @@ mod tests {
     fn embed_input_accepts_array_of_strings() {
         // …and as an array; the same enum should pick `Many` and pass it
         // through unchanged, preserving order.
-        let req: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":["x","y"]}"#)
-            .expect("parse array");
+        let req: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":["x","y"]}"#).expect("parse array");
         let inputs = req.input.expect("input present").into_vec();
         assert_eq!(inputs, vec!["x".to_string(), "y".to_string()]);
     }
@@ -1346,10 +1345,9 @@ mod tests {
     fn embed_input_ignores_unknown_fields() {
         // Extra fields Ollama may send (options, truncate, dimensions, …) are
         // accepted-and-ignored, not a deserialization error.
-        let req: EmbedRequest = serde_json::from_str(
-            r#"{"model":"m","input":"z","truncate":true,"options":{"x":1}}"#,
-        )
-        .expect("parse with extras");
+        let req: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":"z","truncate":true,"options":{"x":1}}"#)
+                .expect("parse with extras");
         assert_eq!(req.model, "m");
         assert_eq!(req.input.expect("input").into_vec(), vec!["z".to_string()]);
     }
@@ -1378,10 +1376,7 @@ mod tests {
             "--flag",
             "a/../b",
         ] {
-            assert!(
-                !pull_name_is_safe(name),
-                "expected {name:?} to be rejected"
-            );
+            assert!(!pull_name_is_safe(name), "expected {name:?} to be rejected");
         }
     }
 }

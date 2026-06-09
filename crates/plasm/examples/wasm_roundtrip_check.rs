@@ -62,8 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     assert_eq!(out, "dlroW ,olleH", "WASM round-trip output mismatch");
     assert_eq!(
-        module_hash,
-        "sha256:11bfd18c60e980ed9375a91d9e9de49b1a75cbac66781ae34ff148e2008b769c",
+        module_hash, "sha256:11bfd18c60e980ed9375a91d9e9de49b1a75cbac66781ae34ff148e2008b769c",
         "module hash changed"
     );
     println!("OK: hello.wasm round-trip byte-identical, module hash unchanged");

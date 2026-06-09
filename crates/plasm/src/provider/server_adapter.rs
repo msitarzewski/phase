@@ -11,9 +11,7 @@
 //! boundary tests against `plasm::provider::ProviderServer` keep passing.
 
 use anyhow::Result;
-use phase_artifact_server::{
-    ArtifactServer, ArtifactServerConfig, ManifestProvider,
-};
+use phase_artifact_server::{ArtifactServer, ArtifactServerConfig, ManifestProvider};
 use std::sync::Arc;
 
 use super::config::ProviderConfig;

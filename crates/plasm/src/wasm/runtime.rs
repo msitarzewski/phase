@@ -117,8 +117,8 @@ impl Wasm3Runtime {
         let mut config = Config::new();
         config.consume_fuel(true); // Enable fuel for timeout control
 
-        let engine = Engine::new(&config)
-            .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
+        let engine =
+            Engine::new(&config).map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
         // Create WASI preview1 context with stdio
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
@@ -129,7 +129,8 @@ impl Wasm3Runtime {
 
         // Set fuel limit based on timeout (rough heuristic: 1M instructions per second)
         let fuel_limit = timeout.as_secs() * 1_000_000;
-        store.set_fuel(fuel_limit)
+        store
+            .set_fuel(fuel_limit)
             .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
         // Load module
@@ -187,7 +188,8 @@ impl Wasm3Runtime {
 impl WasmRuntime for Wasm3Runtime {
     async fn execute(&self, wasm_bytes: &[u8], args: &[&str]) -> Result<ExecutionResult> {
         // Default timeout: 5 minutes
-        self.execute_with_timeout(wasm_bytes, args, Duration::from_secs(300)).await
+        self.execute_with_timeout(wasm_bytes, args, Duration::from_secs(300))
+            .await
     }
 
     async fn execute_with_timeout(
@@ -203,7 +205,8 @@ impl WasmRuntime for Wasm3Runtime {
         // Run blocking WASM execution in blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
             Self::execute_sync(&wasm_bytes, timeout, max_memory)
-        }).await?;
+        })
+        .await?;
 
         result
     }

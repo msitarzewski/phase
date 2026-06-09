@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
-use phase_artifact_server::ArtifactStore;
 use super::manifest::{ArtifactInfo, BootManifest, ManifestBuilder};
 use super::signing::sign_manifest;
+use phase_artifact_server::ArtifactStore;
 
 /// Generates boot manifests from available artifacts
 #[derive(Debug)]
@@ -77,9 +77,7 @@ impl ManifestGenerator {
             builder = builder.artifact(artifact_name, artifact_info);
         }
 
-        builder
-            .build()
-            .context("Failed to build manifest")
+        builder.build().context("Failed to build manifest")
     }
 
     /// Generate and sign manifest
@@ -95,8 +93,7 @@ impl ManifestGenerator {
         let mut manifest = self.generate(channel, arch)?;
 
         if let Some(ref key) = self.signing_key {
-            sign_manifest(&mut manifest, key)
-                .context("Failed to sign manifest")?;
+            sign_manifest(&mut manifest, key).context("Failed to sign manifest")?;
         }
 
         Ok(manifest)
@@ -110,7 +107,10 @@ impl ManifestGenerator {
     /// - "rootfs*" -> "rootfs"
     /// - Others remain unchanged
     fn normalize_artifact_name(filename: &str) -> String {
-        if filename.starts_with("vmlinuz") || filename.starts_with("bzImage") || filename == "kernel" {
+        if filename.starts_with("vmlinuz")
+            || filename.starts_with("bzImage")
+            || filename == "kernel"
+        {
             "kernel".to_string()
         } else if filename.starts_with("initramfs") || filename.starts_with("initrd") {
             "initramfs".to_string()
@@ -184,16 +184,46 @@ mod tests {
 
     #[test]
     fn test_normalize_artifact_name() {
-        assert_eq!(ManifestGenerator::normalize_artifact_name("vmlinuz"), "kernel");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("vmlinuz-arm64"), "kernel");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("bzImage"), "kernel");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("kernel"), "kernel");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("initramfs"), "initramfs");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("initramfs.img"), "initramfs");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("initrd"), "initramfs");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("rootfs.img"), "rootfs");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("dtb-rpi4"), "dtb-rpi4");
-        assert_eq!(ManifestGenerator::normalize_artifact_name("custom-file"), "custom-file");
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("vmlinuz"),
+            "kernel"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("vmlinuz-arm64"),
+            "kernel"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("bzImage"),
+            "kernel"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("kernel"),
+            "kernel"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("initramfs"),
+            "initramfs"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("initramfs.img"),
+            "initramfs"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("initrd"),
+            "initramfs"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("rootfs.img"),
+            "rootfs"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("dtb-rpi4"),
+            "dtb-rpi4"
+        );
+        assert_eq!(
+            ManifestGenerator::normalize_artifact_name("custom-file"),
+            "custom-file"
+        );
     }
 
     #[test]
@@ -204,17 +234,22 @@ mod tests {
         let manifest = generator.generate("stable", "arm64").unwrap();
 
         let kernel = manifest.artifacts.get("kernel").unwrap();
-        assert_eq!(kernel.download_url, Some("/stable/arm64/kernel".to_string()));
+        assert_eq!(
+            kernel.download_url,
+            Some("/stable/arm64/kernel".to_string())
+        );
 
         let initramfs = manifest.artifacts.get("initramfs").unwrap();
-        assert_eq!(initramfs.download_url, Some("/stable/arm64/initramfs".to_string()));
+        assert_eq!(
+            initramfs.download_url,
+            Some("/stable/arm64/initramfs".to_string())
+        );
     }
 
     #[test]
     fn test_with_version() {
         let (_temp, store) = setup_test_artifacts();
-        let generator = ManifestGenerator::new(store, None)
-            .with_version("1.2.3".to_string());
+        let generator = ManifestGenerator::new(store, None).with_version("1.2.3".to_string());
 
         let manifest = generator.generate("stable", "arm64").unwrap();
         assert_eq!(manifest.version, "1.2.3");

@@ -345,12 +345,7 @@ mod tests {
     }
 
     fn build_job(identity: &NodeIdentity, wasm_bytes: Vec<u8>) -> SignedManifest<JobSpec> {
-        build_job_with_caps(
-            identity,
-            wasm_bytes,
-            Some(5_000),
-            Some(64 * 1024 * 1024),
-        )
+        build_job_with_caps(identity, wasm_bytes, Some(5_000), Some(64 * 1024 * 1024))
     }
 
     fn build_job_with_caps(
@@ -473,7 +468,10 @@ mod tests {
             .execute(job)
             .await
             .expect("allowlisted signer must be accepted");
-        assert!(stream.next().await.is_some(), "stream should produce events");
+        assert!(
+            stream.next().await.is_some(),
+            "stream should produce events"
+        );
     }
 
     #[tokio::test]

@@ -100,10 +100,9 @@ where
         }
 
         // Decode pubkey + signature.
-        let pubkey_bytes = decode_hex32(&self.signer_pubkey)
-            .ok_or(ManifestError::BadPublicKey)?;
-        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
-            .map_err(|_| ManifestError::BadPublicKey)?;
+        let pubkey_bytes = decode_hex32(&self.signer_pubkey).ok_or(ManifestError::BadPublicKey)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| ManifestError::BadPublicKey)?;
 
         let sig_bytes = decode_hex64(&self.signature).ok_or(ManifestError::BadSignature)?;
         let signature = Signature::from_bytes(&sig_bytes);
@@ -399,7 +398,10 @@ mod tests {
             .expires_at(past)
             .sign_with(&id)
             .expect("sign");
-        assert!(matches!(signed.verify(), Err(ManifestError::Expired { .. })));
+        assert!(matches!(
+            signed.verify(),
+            Err(ManifestError::Expired { .. })
+        ));
     }
 
     #[test]
@@ -424,20 +426,26 @@ mod tests {
         let bytes_a = signing_message(SCHEMA_VERSION, &p, Utc::now(), None).unwrap();
         // Round-trip via JSON Value to lose any field-order information.
         let as_value: serde_json::Value = serde_json::to_value(&p).unwrap();
-        let bytes_b = signing_message(SCHEMA_VERSION, &as_value, {
-            // Both messages must share the same timestamp for the comparison.
-            // Tie them with the same input.
-            let parsed = bytes_a.clone();
-            // Extract created_at from canonical bytes: skip the domain
-            // prefix and locate the substring after `"created_at":`.
-            let s = std::str::from_utf8(&parsed[SIGNING_DOMAIN.len()..]).unwrap();
-            let needle = "\"created_at\":\"";
-            let i = s.find(needle).unwrap() + needle.len();
-            let end = s[i..].find('"').unwrap();
-            DateTime::parse_from_rfc3339(&s[i..i + end])
-                .unwrap()
-                .with_timezone(&Utc)
-        }, None).unwrap();
+        let bytes_b = signing_message(
+            SCHEMA_VERSION,
+            &as_value,
+            {
+                // Both messages must share the same timestamp for the comparison.
+                // Tie them with the same input.
+                let parsed = bytes_a.clone();
+                // Extract created_at from canonical bytes: skip the domain
+                // prefix and locate the substring after `"created_at":`.
+                let s = std::str::from_utf8(&parsed[SIGNING_DOMAIN.len()..]).unwrap();
+                let needle = "\"created_at\":\"";
+                let i = s.find(needle).unwrap() + needle.len();
+                let end = s[i..].find('"').unwrap();
+                DateTime::parse_from_rfc3339(&s[i..i + end])
+                    .unwrap()
+                    .with_timezone(&Utc)
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(bytes_a, bytes_b);
     }
 }

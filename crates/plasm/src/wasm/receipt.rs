@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Execution receipt proving work was done
@@ -44,7 +44,7 @@ impl Receipt {
             wall_time_ms,
             timestamp,
             node_pubkey: String::new(), // Set when signing
-            signature: String::new(),    // Set when signing
+            signature: String::new(),   // Set when signing
         }
     }
 
@@ -52,11 +52,7 @@ impl Receipt {
     fn canonical_message(&self) -> String {
         format!(
             "{}|{}|{}|{}|{}",
-            self.version,
-            self.module_hash,
-            self.exit_code,
-            self.wall_time_ms,
-            self.timestamp
+            self.version, self.module_hash, self.exit_code, self.wall_time_ms, self.timestamp
         )
     }
 
@@ -84,12 +80,14 @@ impl Receipt {
     /// Verify the receipt signature
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<bool, String> {
         // Decode signature
-        let signature_bytes = hex::decode(&self.signature)
-            .map_err(|e| format!("Invalid signature hex: {}", e))?;
+        let signature_bytes =
+            hex::decode(&self.signature).map_err(|e| format!("Invalid signature hex: {}", e))?;
 
         let signature = Signature::from_bytes(
-            signature_bytes.as_slice().try_into()
-                .map_err(|_| "Invalid signature length".to_string())?
+            signature_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Invalid signature length".to_string())?,
         );
 
         // Recreate canonical message
@@ -101,20 +99,24 @@ impl Receipt {
         let message_hash = hasher.finalize();
 
         // Verify signature
-        verifying_key.verify(&message_hash, &signature)
+        verifying_key
+            .verify(&message_hash, &signature)
             .map(|_| true)
             .map_err(|e| format!("Signature verification failed: {}", e))
     }
 
     /// Verify using hex-encoded public key
     pub fn verify_with_pubkey_hex(&self, pubkey_hex: &str) -> Result<bool, String> {
-        let pubkey_bytes = hex::decode(pubkey_hex)
-            .map_err(|e| format!("Invalid pubkey hex: {}", e))?;
+        let pubkey_bytes =
+            hex::decode(pubkey_hex).map_err(|e| format!("Invalid pubkey hex: {}", e))?;
 
         let verifying_key = VerifyingKey::from_bytes(
-            pubkey_bytes.as_slice().try_into()
-                .map_err(|_| "Invalid pubkey length".to_string())?
-        ).map_err(|e| format!("Invalid verifying key: {}", e))?;
+            pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Invalid pubkey length".to_string())?,
+        )
+        .map_err(|e| format!("Invalid verifying key: {}", e))?;
 
         self.verify(&verifying_key)
     }
@@ -127,22 +129,20 @@ impl Receipt {
 
     /// Deserialize from JSON
     pub fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json)
-            .map_err(|e| format!("Failed to deserialize receipt: {}", e))
+        serde_json::from_str(json).map_err(|e| format!("Failed to deserialize receipt: {}", e))
     }
 
     /// Load from JSON file
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
         Self::from_json(&content)
     }
 
     /// Save to JSON file
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), String> {
         let json = self.to_json()?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("Failed to write file: {}", e))
+        std::fs::write(path, json).map_err(|e| format!("Failed to write file: {}", e))
     }
 }
 
@@ -210,7 +210,9 @@ mod tests {
         assert!(receipt.verify(&verifying_key).unwrap());
 
         // Verify with hex pubkey
-        assert!(receipt.verify_with_pubkey_hex(&receipt.node_pubkey).unwrap());
+        assert!(receipt
+            .verify_with_pubkey_hex(&receipt.node_pubkey)
+            .unwrap());
 
         // Verification should fail with wrong key
         let mut wrong_secret = [0u8; 32];

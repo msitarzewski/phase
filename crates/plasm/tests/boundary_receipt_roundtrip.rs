@@ -32,8 +32,8 @@ fn produce_signed_receipt() -> (Vec<u8>, String) {
 /// Consumer side: takes only the JSON bytes and the hex pubkey. This is
 /// what the seam looks like once `Receipt` moves into `phase-receipt`.
 fn verify_opaque_receipt_bytes(json_bytes: &[u8], pubkey_hex: &str) -> Result<Receipt, String> {
-    let json_str = std::str::from_utf8(json_bytes)
-        .map_err(|e| format!("receipt bytes not utf-8: {}", e))?;
+    let json_str =
+        std::str::from_utf8(json_bytes).map_err(|e| format!("receipt bytes not utf-8: {}", e))?;
     let receipt = Receipt::from_json(json_str)?;
     let ok = receipt.verify_with_pubkey_hex(pubkey_hex)?;
     if !ok {
@@ -47,8 +47,8 @@ fn receipt_roundtrip_opaque_json() {
     let (json_bytes, pubkey_hex) = produce_signed_receipt();
 
     // Consumer has only bytes + pubkey -- no shared in-memory Receipt instance.
-    let recovered = verify_opaque_receipt_bytes(&json_bytes, &pubkey_hex)
-        .expect("verify recovered receipt");
+    let recovered =
+        verify_opaque_receipt_bytes(&json_bytes, &pubkey_hex).expect("verify recovered receipt");
 
     assert_eq!(recovered.exit_code, 0);
     assert_eq!(recovered.wall_time_ms, 4242);
@@ -57,7 +57,10 @@ fn receipt_roundtrip_opaque_json() {
         "sha256:cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
     );
     assert_eq!(recovered.node_pubkey, pubkey_hex);
-    assert!(!recovered.signature.is_empty(), "signature must survive round-trip");
+    assert!(
+        !recovered.signature.is_empty(),
+        "signature must survive round-trip"
+    );
 
     // Negative: tampering a signed field of the JSON must break verification.
     // `Receipt::canonical_message` signs (version, module_hash, exit_code,

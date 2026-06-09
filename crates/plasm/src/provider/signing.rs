@@ -12,8 +12,7 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     use std::fs::File;
     use std::io::Read;
 
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open file: {:?}", path))?;
+    let mut file = File::open(path).with_context(|| format!("Failed to open file: {:?}", path))?;
 
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -94,8 +93,7 @@ pub fn verify_manifest_signature(
         .context("Invalid hash format")?;
 
     // Decode and verify signature
-    let sig_bytes = hex::decode(&sig.signature)
-        .context("Invalid signature hex encoding")?;
+    let sig_bytes = hex::decode(&sig.signature).context("Invalid signature hex encoding")?;
 
     let signature = Ed25519Sig::from_slice(&sig_bytes)
         .map_err(|e| anyhow!("Invalid signature format: {}", e))?;
@@ -105,8 +103,8 @@ pub fn verify_manifest_signature(
 
 /// Generate a new random signing key
 pub fn generate_signing_key() -> SigningKey {
-    use rand::RngCore;
     use rand::rngs::OsRng;
+    use rand::RngCore;
 
     // Generate 32 random bytes for the secret key
     let mut secret_bytes = [0u8; 32];
@@ -120,8 +118,8 @@ pub fn generate_signing_key() -> SigningKey {
 mod tests {
     use super::*;
     use crate::provider::manifest::{ArtifactInfo, ManifestBuilder};
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_compute_file_hash() {
@@ -130,7 +128,10 @@ mod tests {
         fs::write(&file_path, b"hello world").unwrap();
 
         let hash = compute_file_hash(&file_path).unwrap();
-        assert_eq!(hash, "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            hash,
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]

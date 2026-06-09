@@ -16,9 +16,9 @@ use async_stream::stream;
 use bytes::Bytes;
 use phase_identity::NodeIdentity;
 use phase_protocol::{
-    ChatMessage, ChatRole, CommitmentAccumulator, Completion, EmbeddingJobSpec, JobEvent, JobHandle,
-    JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream, OutputChunk,
-    SignedManifest, Worker, WorkerError,
+    ChatMessage, ChatRole, CommitmentAccumulator, Completion, EmbeddingJobSpec, JobEvent,
+    JobHandle, JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream,
+    OutputChunk, SignedManifest, Worker, WorkerError,
 };
 use phase_receipt::ReceiptBuilder;
 
@@ -91,9 +91,7 @@ impl Worker for EchoWorker {
                 identity,
             )),
             other => {
-                return Err(WorkerError::Unsupported {
-                    kind: other.kind(),
-                });
+                return Err(WorkerError::Unsupported { kind: other.kind() });
             }
         };
         Ok((handle, stream))
@@ -399,8 +397,7 @@ mod tests {
         let mut hello_again: Option<Vec<f32>> = None;
         while let Some(ev) = stream2.next().await {
             if let JobEvent::Output(chunk) = ev {
-                hello_again =
-                    Some(serde_json::from_slice(&chunk.data).expect("decode Vec<f32>"));
+                hello_again = Some(serde_json::from_slice(&chunk.data).expect("decode Vec<f32>"));
             }
         }
         assert_eq!(

@@ -25,8 +25,8 @@ use crate::error::ManifestError;
 ///   - numbers in the form `serde_json` emits (which is shortest-roundtrip
 ///     for finite f64 and exact for integers — sufficient for Phase use).
 pub(crate) fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ManifestError> {
-    let v = serde_json::to_value(value)
-        .map_err(|e| ManifestError::Canonicalization(e.to_string()))?;
+    let v =
+        serde_json::to_value(value).map_err(|e| ManifestError::Canonicalization(e.to_string()))?;
     let sorted = sort_value(v);
     serde_json::to_vec(&sorted).map_err(|e| ManifestError::Canonicalization(e.to_string()))
 }
@@ -86,7 +86,10 @@ mod tests {
         // Outer keys sorted: alpha, beta, zeta.
         // Inner keys sorted: x, y.
         // Array order preserved.
-        assert_eq!(s, r#"{"alpha":{"x":"hi","y":true},"beta":[3,2,1],"zeta":1}"#);
+        assert_eq!(
+            s,
+            r#"{"alpha":{"x":"hi","y":true},"beta":[3,2,1],"zeta":1}"#
+        );
     }
 
     #[test]
