@@ -1,7 +1,7 @@
 # Architectural Decisions: Phase Open MVP + Phase Core + LUCID
 
 **Last Updated**: 2026-05-29
-**Version**: 0.5 (security hardening + multi-workload / sharded-verification architecture notes)
+**Version**: 0.6 (LUCID v0.1.1 — embeddings-on-OutputChunk + self-traffic policy decisions)
 
 ---
 
@@ -951,6 +951,59 @@ Evaluated Apple's two 2026 on-device AI frameworks for a possible Apple-native L
 - Strategic: Apple's on-device + PCC push *validates* the on-device thesis while contrasting with LUCID's un-captured model (open weights, cross-vendor, no single cloud). Launch-narrative asset.
 
 **References**: the research report above; `releases/lucid/index.yaml` (backends); LUCID M3 MlxWorker (deferred).
+
+---
+
+### 2026-06-09: Embeddings ride the existing OutputChunk commitment/receipt machinery
+
+**Status**: Accepted. Implemented in PR #10 (`tasks/2026-06/260609_lucid-v0.1.1-gaps.md`).
+
+**Context**:
+LUCID needed `/api/embed` (+ legacy `/api/embeddings`). An embedding returns a vector, not a token stream, so the naive move would be a new `JobResult` shape and a separate verification path. `JobResult` already commits over the `OutputChunk` stream (SHA-256 fold) and SEC-05 already verifies+binds peer receipts against that commitment.
+
+**Decision**:
+Add `JobSpec::Embedding(EmbeddingJobSpec { model_cid, input })` and `JobSpecKind::Embedding` (`#[non_exhaustive]` minor bump), but **do not** add a new result type. A worker emits one `OutputChunk { kind: "embedding", data: serde_json::to_vec(&Vec<f32>), seq: <input index> }` per input, then a normal terminal `Final`. The HTTP layer collects `"embedding"`-kind chunks, decodes each `Vec<f32>`, and orders by `seq`.
+
+**Consequences**:
+- The entire commitment/receipt path — including SEC-05 `verify_peer_receipt` (signature, job_id bind, worker-pubkey→PeerId bind, commitment replay) — covers embedding relays **unchanged**. Relay accept + the `MAX_PROMPT_CHARS` input cap simply learned the `Embedding` arm.
+- Wire convention is shared by every backend: EchoWorker (deterministic SHA-256-seeded vector) and LlamaCppWorker (real, via a separate `--embeddings` instance) both follow it, so the collector is backend-agnostic.
+- A pre-v0.1.1 node refuses an `Embedding` job cleanly (decode/verify fail) — same clean-break posture as the postcard schema bump.
+
+### 2026-06-09: Self-traffic bypasses donation-protection gates (honors only manual_pause)
+
+**Status**: Accepted. Implemented in PR #10.
+
+**Context**:
+The M5 router reused `PolicyEngine::should_serve` for the operator's OWN requests, so a laptop on battery returned 503 to its owner's `curl` — the auto-pause gates (battery/thermal/time-window/concurrency/model-allowlist) exist to protect a contributor from the *network's* load, not from themselves.
+
+**Decision**:
+Add `should_serve_self(model_id)` → `decide_self`, which honors **only** `manual_pause` (the operator's explicit "this node is off"). The router's self-initiated path (`route()`) uses it; the inbound relay handler keeps the full `should_serve` gate (sovereignty there is donation-protection by definition).
+
+**Consequences**:
+- The operator can always use their own GPU (on battery, off-hours, for a model not in the network allowlist); only an explicit manual pause stops them.
+- Alternatives considered and rejected for v0.1.1: also gating self-traffic on thermal/system-pause (hardware protection) — deferred as a tunable; llama.cpp/OS thermal throttling apply underneath, and a single self-query while warm is the operator's call. Revisit if it becomes a real "cooked my GPU" problem.
+
+---
+
+### 2026-06-09: Workers sign receipts with the node identity; echo model CID consistency
+
+**Status**: Accepted. Found + fixed during the post-PR-#10 two-node authz demo (`tasks/2026-06/260609_lucid-v0.1.1-gaps.md`); branch `lucid-sec05-receipt-binding`.
+
+**Context**:
+The two-node authz demo (default-deny reject → escape-hatch accept) exposed two latent bugs that made it impossible without code changes:
+1. `main.rs` advertised the echo model under a hardcoded `ModelCid([0u8; 32])`, but every name→CID resolver (`registry::find_peers_by_model_id`, the llama-cpp auto-advertise loop) uses `ModelCid::from_model_id(name)`. A consume-only peer looking up "echo" computed a different CID and never matched → echo was undiscoverable cross-peer.
+2. Both workers were built with a **random** identity (`EchoWorker::new()`, `NodeIdentity::generate()` for llama). SEC-05's `verify_peer_receipt` binds `worker_pubkey → delivering PeerId`; with a random worker key that bind ALWAYS failed, so a peer-served job's `x-lucid-receipt-verified` could never be `true` — the SEC-05 receipt-binding feature was effectively dead on the peer path.
+
+**Decision**:
+1. Advertise the echo model under `ModelCid::from_model_id("echo")` — consistent with every other CID derivation.
+2. Construct both workers with the node's identity (`node_identity.clone()`) so a peer can bind a relayed receipt to the serving node's PeerId. The client-submission identity stays SEPARATE from the node identity on purpose — that separation is what makes a node's own routed job require allowlisting (it is not auto-authorized by the SEC-06 PeerID-bind), which is exactly what the default-deny demo relies on.
+
+**Consequences**:
+- `x-lucid-receipt-verified: true` now actually achievable for peer-served jobs (demo-confirmed). SEC-05 binding is real on the peer path.
+- Echo nodes are discoverable cross-peer (the demo's node B found node A in ~1s).
+- **Related deferred bug (NOT fixed):** the policy notify-watcher watches the config file's parent directory and reload-loops on any file change there (e.g. a co-located log). Harmless in prod (policy in `~/.config/lucidd`, logs in journald); scope the watch to the file in a future change.
+
+**References**: `tasks/2026-06/260609_lucid-v0.1.1-gaps.md`; SEC-05 (`router.rs::verify_peer_receipt`); the 2026-06-09 embeddings ADR above.
 
 ---
 
