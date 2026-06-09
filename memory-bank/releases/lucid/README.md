@@ -51,7 +51,7 @@ M1 (scaffold + spike), M2 (LlamaCppWorker), M5 (router), M6 (model registry), M7
    ║  │   worker/   │         │  registry/         │  ║
    ║  │ LlamaCpp    │         │  model_cid →       │  ║
    ║  │ MLX         │         │  [peer_id, …]      │  ║
-   ║  │ ExoProxy v2 │         │  (via Phase DHT)   │  ║
+   ║  │ ShardWorker │         │  (via Phase DHT)   │  ║
    ║  └──────┬──────┘         └────────────────────┘  ║
    ║         │                                         ║
    ║         ▼                                         ║
@@ -132,7 +132,7 @@ The user's existing client (Open WebUI / Cursor / Zed / Continue / opencode / et
 
 ## Out of Scope (v0.1)
 
-- **Multi-node sharding for big MoE models.** That is v0.2 (`ExoProxyWorker`); depends on Phase MoE-aware routing extensions.
+- **Multi-node sharding for big MoE models.** That is v0.2 (`ShardWorker`); depends on Phase MoE-aware routing extensions.
 - **Onion-routing of prompts.** Privacy v0.1 is "local-only mode." Real cryptographic prompt privacy (split-prompt, onion-routing) is v0.3 — committed, not aspirational.
 - **Payment rails, KYC, marketplace logic.** Never. See [MISSION.md](../../MISSION.md).
 - **OpenAI / llama.cpp-server API compatibility.** Ollama API only in v0.1. Other surfaces follow once routing logic is stable.

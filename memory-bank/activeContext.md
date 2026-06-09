@@ -1,8 +1,8 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2026-05-27
-**Sprint**: LUCID inference flagship — software complete, demo hardware-blocked
-**Status**: Phase Core M1-M8 complete; LUCID M1, M2, M4 (demo-sufficient), M5, M6, M7 complete; M8 hardware-blocked.
+**Last Updated**: 2026-05-31
+**Sprint**: Security hardening SHIPPED TO PRODUCTION; next thread open
+**Status**: Phase Core + LUCID software complete + two-node demo proven; security hardening (PR #9) merged to `main` and deployed live to the umbp relay. `scratch` clean-room build VM standing. Next focus undecided (options at bottom).
 
 ---
 
@@ -37,7 +37,21 @@ crates/
 
 ---
 
-## Security Hardening COMPLETE (2026-05-28, branch `security-hardening`)
+## Security Hardening SHIPPED TO PRODUCTION (PR #9 merged 2026-05-29/31)
+
+**Merged to `main` (commit `73fa907`, PR #9) and deployed live.** Three-environment validation before merge: Mac native arm64, Docker cross (amd64 + arm64), and a vanilla Ubuntu 26.04 ARM64 box (`scratch`) — build + 246 tests + clippy `-D warnings` green on all three. `cargo audit` 0 vulnerabilities; `cargo deny check` ok.
+
+**Live deploy:** umbp foundation relay (`michael@100.98.187.7`, public `/ip4/76.191.195.7/tcp/4001`) swapped from the pre-hardening binary to the hardened build via `lucidd-relay.service`. Critical success: **peer id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB` preserved across the swap** (SEC-08 persistent identity), so `bootstrap.phasebased.net` TXT still resolves. Listening v4+v6 on 4001, healthy. The entire audit surface (signer authz, DoS caps, receipt verify+bind, patched wasmtime/hickory, postcard) is now the production substrate.
+
+**Operational note:** the relay is now on postcard/schema-v2 model advertisements (SEC-12). It's the only foundation node, so no live mismatch — but any other node joining now needs the hardened binary (v1 bincode ↔ v2 postcard advertisements don't interop, by clean-break design).
+
+### Standing infrastructure (machines)
+- **umbp** — `michael@100.98.187.7` (Tailscale) / public `76.191.195.7`. Ubuntu x86_64, 10Gb fiber, always-on. Runs the live foundation relay under user-systemd (`lucidd-relay.service`, linger on). Hosts other day-job services behind Caddy on 80/443 — don't disturb those.
+- **scratch** — `michael@10.211.55.6` (Parallels, may need starting after a host reboot). Ubuntu 26.04 ARM64, 8 vCPU / 16 GB / 86 GB. Dedicated Phase clean-room build/test box, repo at `~/phase`, Rust 1.96 via rustup, full toolchain. Scoped passwordless sudo for apt only (`/etc/sudoers.d/michael-apt`). All-us, no day-job entanglement.
+- **tandem-dev-team** — `ttadmin@10.211.55.5` (key `~/.ssh/ttadmin`). Parallels VM crossed with the Tandem day job — keep Phase work OFF it.
+- SSH note: after a Mac reboot the agent may offer too many keys → "too many authentication failures." Use `-o IdentitiesOnly=yes -i <key>` if it recurs.
+
+### Original hardening detail (for reference)
 
 A 5-agent security audit (`SECURITY-AUDIT-2026-05-28.md`) found sound crypto primitives but an unenforced trust model, 20 dependency advisories (incl. wasmtime sandbox escapes), and a PHP SDK verification bypass. The 14-task remediation plan (`memory-bank/plans/security-hardening/`) was executed in 5 agent-team waves, all on branch `security-hardening`:
 
@@ -51,7 +65,21 @@ A 5-agent security audit (`SECURITY-AUDIT-2026-05-28.md`) found sound crypto pri
 
 Three dependency advisories documented-and-accepted (upstream-pinned hickory via libp2p-mdns; BSD-only nix). v0.1 content-CID hardening (SEC-13/L6) deferred to v0.2.
 
-**Final gate:** 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns, `cargo deny check` ok. Branch not yet merged to main — pending review + a decision on redeploying the umbp relay from the hardened binary.
+**Final gate:** 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns, `cargo deny check` ok. **MERGED (PR #9, `73fa907`) and deployed live — see the "SHIPPED TO PRODUCTION" header above.**
+
+## Next Thread (OPEN — undecided as of 2026-05-31)
+
+Security is shipped and live; no forced next step. Candidate threads, roughly by leverage:
+
+- **LUCID v0.1.1 feature gaps:** `/api/embeddings`, `/api/pull`, multi-peer retry on first-peer failure, cross-peer name→CID registry (today a consume-only node can only route a model it knows the name of). `scratch` is the clean test target; Mac M5 Max for GPU/inference.
+- **Reach / "anyone, anywhere":** make `--bootstrap-dns` the default for fresh installs; stand up 2-3 more geographically-distributed foundation relays (Hetzner CAX11s ~$4/mo); the consumer install page at `phasebased.com` (mom-language one-liner).
+- **v0.2 frontier:** `ShardWorker` sharded inference (was `ExoProxyWorker` — renamed off the "exo" trademark, can still *proxy to* exo clusters per nominative fair use) — gated on the **partial-compute verification open problem** (recorded in `decisions.md` 2026-05-29; redundant-execution + reputation spot-checking is the likely answer). Flipping the authz default to open is in-scope for this milestone (see [[authz-default-flip-trigger]]).
+- **LUMEN:** stand up the diffusion-node skeleton against the substrate — proves the second flagship compiles, validates the workload-agnostic bet. Post-v0.1.
+- **MLX worker (LUCID M3, deferred):** Apple Silicon native inference (GPU/Metal, via turnkey `mlx-lm`) — the M5 Max can validate it. Faster path to an Apple backend.
+- **`CoreAIWorker` (Apple Neural Engine backend, candidate):** license-clean path to run *our own* converted open-weights models on the ANE — the efficiency play for always-on contributor Macs (pairs with M7 battery/thermal auto-pause). After MLX; more harness work (you supply tokenizer/KV-cache/sampling); **gated on verifying the public Core AI API exposes KV-cache / stateful decode.** Full analysis: `research/2026-06-09-apple-coreai-foundation-models.md`. NOTE: Apple **Foundation Models** is a hard no for a LUCID backend (ToS + unenforceable-AUP-for-a-relay) — see `decisions.md` 2026-06-09.
+- **Offered-but-not-run demo:** the authz-gate-in-action three-curl demo (default-deny rejects an unauthorized routed job → escape-hatch accepts it with `X-Lucid-Receipt-Verified: true`). Needs a small two-node setup on scratch + a workaround for the echo-worker CID-mismatch quirk.
+
+---
 
 ## LUCID Software COMPLETE (May 2026)
 

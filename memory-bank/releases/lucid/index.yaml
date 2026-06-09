@@ -33,7 +33,7 @@ backends:
     - LlamaCppWorker      # Cross-vendor GPU via llama-server subprocess
     - MlxWorker           # Apple Silicon native (subprocess to mlx-lm in v0.1)
   v0_2:
-    - ExoProxyWorker      # Multi-node sharded inference for big MoE models
+    - ShardWorker         # Multi-node sharded inference for big MoE models (may proxy to exo clusters; renamed off the "exo" trademark)
 
 api_surfaces:
   v0_1:

@@ -123,9 +123,9 @@ See [memory-bank/releases/lucid/](releases/lucid/) for the full release plan.
 
 ---
 
-### Security Hardening COMPLETE (2026-05-28 → 29, branch `security-hardening`)
+### Security Hardening SHIPPED (2026-05-28 → 31; PR #9 merged to `main` `73fa907`, deployed live)
 
-A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of file carries the per-finding remediation table) found sound crypto primitives but an **unenforced trust model**, **20 dependency advisories** (incl. wasmtime sandbox escapes), and a **PHP SDK verification bypass**. The 14-task plan (`memory-bank/plans/security-hardening/`) was executed by an agent team in 5 integration-verified waves.
+A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of file carries the per-finding remediation table) found sound crypto primitives but an **unenforced trust model**, **20 dependency advisories** (incl. wasmtime sandbox escapes), and a **PHP SDK verification bypass**. The 14-task plan (`memory-bank/plans/security-hardening/`) was executed by an agent team in 5 integration-verified waves, **merged to `main` (PR #9), and deployed to the live umbp foundation relay** (hardened binary, peer id preserved, DNS intact). Validated green on three independent environments (Mac native, Docker cross, vanilla Ubuntu 26.04 ARM64 `scratch` box). New standing infra: `scratch` clean-room build/test VM (see `activeContext.md`).
 
 | Task | Finding | Fix |
 |---|---|---|

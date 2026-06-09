@@ -799,7 +799,7 @@ The 2026-05-28 audit's keystone finding (C1): `SignedManifest::verify()` checks 
 - Negative: contributors must be allowlisted (or rely on PeerID-bind semantics) — friction matching the intended soft launch.
 - The decision was delegated to the agent during the "get'r done" hardening run; recommended option taken and flagged for Michael's review. Reversible via config.
 
-**Revisit trigger** (Michael, 2026-05-29): default-deny is right *for now*. Flip the default toward open once (a) the network serves sliced/distributed models (v0.2 `ExoProxyWorker` / multi-node sharding) AND (b) the inference infra can handle open load — gated by the rate-limit + reputation end-state above. Capability-gated, not date-gated; treat the flip as an in-scope deliverable of the v0.2 sharding milestone. Until then, use `allow_unauthenticated_jobs=true` for local dev rather than flipping the production default early.
+**Revisit trigger** (Michael, 2026-05-29): default-deny is right *for now*. Flip the default toward open once (a) the network serves sliced/distributed models (v0.2 `ShardWorker` / multi-node sharding) AND (b) the inference infra can handle open load — gated by the rate-limit + reputation end-state above. Capability-gated, not date-gated; treat the flip as an in-scope deliverable of the v0.2 sharding milestone. Until then, use `allow_unauthenticated_jobs=true` for local dev rather than flipping the production default early.
 
 **References**: `crates/lucidd/src/policy.rs`, `crates/lucidd/src/router.rs` (`make_inbound_relay_handler`), `crates/plasm/src/worker.rs`, SEC-01 task file.
 
@@ -889,13 +889,13 @@ Prompted by reviewing ComfyUI PR #7063 (single-host multi-GPU work-unit splittin
 
 ### 2026-05-29: Verifying sharded / partial computation is an unsolved open problem (recorded risk)
 
-**Status**: Open problem — recorded, not solved. Blocks the trust story for v0.2 `ExoProxyWorker` (LUCID sharding) and for any distributed diffusion.
+**Status**: Open problem — recorded, not solved. Blocks the trust story for v0.2 `ShardWorker` (LUCID sharding) and for any distributed diffusion.
 
 **Context**:
 v0.1's verifiable-compute guarantee rests on the commitment accumulator (`phase-protocol/commitment.rs`): a worker folds emitted output chunks into a SHA-256 chain, signs the terminal state, and a verifier **replays the received chunks** to confirm the worker produced exactly what it signed. This works because the verifier *has* the output and can cheaply recompute the commitment over it. SEC-05 wired this into the consumer side (receipt verify + bind).
 
 That model **breaks for sharded / partial computation**:
-- **Sharded LLM (v0.2 ExoProxyWorker)**: a peer computes an intermediate hidden-state tensor for layers N..M and hands it to the next peer. There is no cheap way for the requester to verify that tensor is correct without re-running those layers (which defeats the point of offloading them). The commitment-replay trick doesn't apply — you can't replay what you didn't run.
+- **Sharded LLM (v0.2 ShardWorker)**: a peer computes an intermediate hidden-state tensor for layers N..M and hands it to the next peer. There is no cheap way for the requester to verify that tensor is correct without re-running those layers (which defeats the point of offloading them). The commitment-replay trick doesn't apply — you can't replay what you didn't run.
 - **Distributed diffusion**: same shape — a peer denoises some steps / some conditioning; verifying it did so honestly means re-doing the work. Worse, cross-hardware float nondeterminism means two *honest* GPUs produce slightly different outputs, so bitwise reproduction fails and you're into fuzzy/perceptual comparison.
 
 This is a genuinely hard, partly-open research area (verifiable/attested computation, redundant execution + voting, ZK proofs of inference — all expensive or immature). It is distinct from, and harder than, the token-commitment v0.1 ships.
@@ -911,7 +911,46 @@ This is a genuinely hard, partly-open research area (verifiable/attested computa
 - This is *why* default-deny authorization (the 2026-05-28 hybrid-authz ADR) matters **more**, not less, once peers compute partial results for each other: until partial-compute verification exists, you want jobs flowing only among attributable/curated peers. Ties directly to the "flip the authz default once infra can handle it" trigger.
 - Likely landing spot: redundant-execution + reputation spot-checking (2 + 1 combined) as the pragmatic v0.2 answer, with TEE/ZK as later research. Not decided here.
 
-**References**: `crates/phase-protocol/commitment.rs`, `crates/lucidd/src/router.rs` (SEC-05 receipt verify+bind), the 2026-05-28 hybrid-authz ADR, releases/lucid (v0.2 `ExoProxyWorker`).
+**References**: `crates/phase-protocol/commitment.rs`, `crates/lucidd/src/router.rs` (SEC-05 receipt verify+bind), the 2026-05-28 hybrid-authz ADR, releases/lucid (v0.2 `ShardWorker`).
+
+---
+
+### 2026-05-31: Rename `ExoProxyWorker` → `ShardWorker` (trademark hygiene)
+
+**Status**: Accepted
+
+**Context**:
+The v0.2 sharded-inference worker was provisionally named `ExoProxyWorker` after [exo](https://github.com/exo-explore/exo) (exo-explore), the open-source distributed-inference project whose approach it would proxy/wrap. Flagged before the name calcified into public type names / `JobSpec` / docs.
+
+**Decision**:
+Rename to **`ShardWorker`** (descriptive: multi-node sharded inference). Two-axis reasoning:
+- **License axis (fine):** exo is reported **Apache-2.0** — permissive, compatible with both the Apache-2.0 substrate and lucidd's AGPL-3.0, no copyleft contamination. Wrapping/deriving exo code is fine with attribution. *(Verify exo's actual LICENSE file before integrating.)*
+- **Trademark axis (the reason for the rename):** Apache-2.0 **§6 explicitly does NOT grant trademark rights** — the permissive code license gives zero right to use the *name* "exo." And exo Labs operates in LUCID's exact market (distributed inference on heterogeneous consumer hardware), so baking "Exo" into our own component name creates a real likelihood-of-confusion / implied-affiliation problem. Nominative fair use still allows *referring* to exo in prose ("ShardWorker can proxy to an exo cluster", "exo-compatible") — that's lawful and accurate; what's dropped is "Exo" as part of *our* name.
+
+**Alternatives Considered**: `PipelineWorker` (names the parallelism style), `MeshWorker` (device-mesh framing). `ShardWorker` chosen as the plainest/most unambiguous.
+
+**Consequences**: pure-docs rename (v0.2 unbuilt, no code yet) across MISSION.md, this file, and `releases/lucid/{index.yaml,README.md}`. The MISSION.md reference to "exo's partitioning" as upstream prior art is intentionally **kept** — that's nominative reference to the external project, not our naming. Same naming discipline as PRISM→LUMEN (2026-05-29): pick names with no baggage.
+
+**References**: `releases/lucid/index.yaml` (v0_2 backends), the 2026-05-29 per-workload-node ADR, [exo-explore/exo](https://github.com/exo-explore/exo).
+
+---
+
+### 2026-06-09: Apple on-device AI — no Foundation Models backend; Core AI is the license-clean path
+
+**Status**: Accepted (constraint + backlog direction). Full investigation: [`research/2026-06-09-apple-coreai-foundation-models.md`](research/2026-06-09-apple-coreai-foundation-models.md).
+
+**Context**:
+Evaluated Apple's two 2026 on-device AI frameworks for a possible Apple-native LUCID worker. *Core AI* (Core ML successor) is a bring-your-own-model on-device runtime; *Foundation Models* is Apple's own LLM with Private Cloud Compute routing. They're easy to conflate; the distinction is load-bearing.
+
+**Decision**:
+1. **Never build a Foundation Models backend for LUCID.** Two independent reasons: (a) it's licensed for use within your app for your user, not to relay/resell compute to network peers, and its "more reasoning" path routes to Apple's Private Cloud Compute (the centralized off-switch we exist to avoid); (b) its acceptable-use policy is **structurally unenforceable for a neutral relay** — LUCID serves uninspectable peer prompts, so the operator can't guarantee compliance and is in violation the instant a peer requests anything on Apple's prohibited list. Guardrail, not roadmap.
+2. **Core AI is the legitimate Apple-native path** for running *our own* converted open-weights models on device — license-clean (the `.aimodel` is our weights; the framework imposes no model license), and LLM-purpose-built (`coreai-torch` ships attention/RoPE/RMSNorm/MoE conversion composites; targets the Neural Engine).
+
+**Consequences**:
+- A future `CoreAIWorker` is an **ANE efficiency backend** — the "donate your idle Mac overnight" profile (pairs with the M7 battery/thermal auto-pause), distinct from MLX (GPU, peak throughput). More integration work than MLX (you supply the tokenizer/KV-cache/sampling harness; both need a Swift bridge to the Rust daemon). **Sequenced after MLX; gated on confirming the public API exposes KV-cache / stateful decode.**
+- Strategic: Apple's on-device + PCC push *validates* the on-device thesis while contrasting with LUCID's un-captured model (open weights, cross-vendor, no single cloud). Launch-narrative asset.
+
+**References**: the research report above; `releases/lucid/index.yaml` (backends); LUCID M3 MlxWorker (deferred).
 
 ---
 

@@ -83,7 +83,7 @@ PhaseBased  ──  foundation umbrella (eventually 501(c)(3))
     │   "Open inference on the public's hardware"   AGPL-3.0
     │
     └── crates/lucidd/
-        ├── worker/                    LlamaCpp · MLX · ExoProxy (v2)
+        ├── worker/                    LlamaCpp · MLX · ShardWorker (v2)
         ├── api/                       Ollama :11434 · OpenAI :8000 (later)
         ├── router/                    local-fits? else DHT lookup
         └── registry/                  DHT model_cid → peer_id mapping
