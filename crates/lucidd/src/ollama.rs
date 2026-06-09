@@ -10,9 +10,15 @@
 //!   client model pickers don't 404.
 //! - `GET /api/version` — clients capability-sniff here on startup.
 //! - `POST /api/show` — minimal stub so `ollama show echo` doesn't barf.
+//! - `POST /api/embed` / `POST /api/embeddings` — embedding vectors over the
+//!   same router/manifest/receipt pipeline as `/api/chat` (the legacy
+//!   `/api/embeddings` is the singular-`prompt` shape Ollama shipped first).
+//! - `POST /api/pull` — v0.1.1 stub: registers an already-present local GGUF
+//!   into the M6 registry. No network download; real content-hashed CIDs are
+//!   v0.2.
 //! - Anything else under `/api/*` returns 404 — not in spike scope.
 //!
-//! The full Ollama surface (generate, embed, pull, ps, etc.) is LUCID M4.
+//! The remaining Ollama surface (ps, copy, delete, etc.) is later LUCID work.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -145,6 +151,58 @@ struct ShowResponse {
     capabilities: Vec<&'static str>,
 }
 
+/// `/api/embed` request. Ollama accepts `input` as either a single string or
+/// an array of strings; everything else (`options`, `keep_alive`, `truncate`,
+/// `dimensions`, …) is accepted-and-ignored for the v0.1.1 surface.
+#[derive(Debug, Deserialize)]
+struct EmbedRequest {
+    model: String,
+    #[serde(default)]
+    input: Option<EmbedInput>,
+}
+
+/// The two shapes Ollama allows for `input`. `untagged` tries `One` (a bare
+/// string) first, then `Many` (an array), so `"x"` and `["x","y"]` both
+/// deserialize without the caller declaring which.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbedInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl EmbedInput {
+    /// Normalize either shape to the worker's `Vec<String>` input.
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            EmbedInput::One(s) => vec![s],
+            EmbedInput::Many(v) => v,
+        }
+    }
+}
+
+/// Legacy `/api/embeddings` request — the singular-`prompt` shape Ollama
+/// shipped before `/api/embed`. Exactly one input, returned as a single
+/// `embedding` field rather than an `embeddings` array.
+#[derive(Debug, Deserialize)]
+struct EmbeddingsRequest {
+    model: String,
+    #[serde(default)]
+    prompt: String,
+}
+
+/// `/api/pull` request. Ollama clients send the model name under either
+/// `model` or `name` depending on version; `stream` defaults to true.
+#[derive(Debug, Deserialize)]
+struct PullRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    stream: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -159,6 +217,10 @@ pub struct AppState {
     /// `phase-core M5`, manifests are real `SignedManifest<JobSpec>` values
     /// rather than the previous unsigned placeholders.
     pub client_identity: NodeIdentity,
+    /// M6 registry — needed by /api/pull to advertise a locally-present model.
+    pub registry: std::sync::Arc<crate::registry::ModelRegistry>,
+    /// Model directory (llama-cpp mode), for /api/pull to confirm a GGUF is present. None in echo mode.
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 /// HTTP header that flips this request to local-only mode. Honored on
@@ -206,6 +268,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
         .route("/api/show", post(handle_show))
+        // Embeddings — non-streaming; both the current (`/api/embed`) and the
+        // legacy singular-prompt (`/api/embeddings`) request shapes.
+        .route("/api/embed", post(handle_embed))
+        .route("/api/embeddings", post(handle_embeddings))
+        // v0.1.1 stub: register an already-present local GGUF (no download).
+        .route("/api/pull", post(handle_pull))
         // Health check for liveness probes.
         .route("/", get(|| async { "lucidd echo spike: see /api/chat" }))
         // Log everything else so we can see what real clients ask for that
@@ -811,6 +879,347 @@ async fn handle_chat(
 }
 
 // ---------------------------------------------------------------------------
+// Embeddings
+// ---------------------------------------------------------------------------
+
+/// Outcome of running the embedding pipeline: the ordered vectors plus the
+/// header values that `handle_chat`'s non-streaming branch also sets. Kept as
+/// a small struct so both embedding handlers share the route → sign → execute
+/// → drain machinery without duplicating it.
+struct EmbedOutcome {
+    /// Per-input embedding vectors, ordered by `OutputChunk::seq`.
+    vectors: Vec<Vec<f32>>,
+    /// `X-Lucid-Routed-Via` value (`local` / `peer:<short>`), if any.
+    routed_via: Option<String>,
+    /// `X-Lucid-Receipt-Verified` value (peer path only), if any.
+    receipt_verified: Option<&'static str>,
+    /// `X-Phase-Receipt` value (commitment) once `finish()` surfaced it.
+    receipt: Option<String>,
+}
+
+/// Run an embedding job through the SAME pipeline as `handle_chat`:
+/// `router.route()` → refused-check → `ManifestBuilder.sign_with` →
+/// `router.execute()` → drain the `JobStream`. Embeddings are never streamed
+/// to the client (Ollama returns them in one JSON body), so we always collect.
+///
+/// Per the shared embedding wire convention, every `JobEvent::Output` with
+/// `kind == "embedding"` carries `serde_json::to_vec(&Vec<f32>)`; we key each
+/// by `chunk.seq` and sort so the result order matches the input order
+/// regardless of the order chunks arrived in. `Err` is a `Response` ready to
+/// return (router refusal → 503, signing / dispatch failure → 500).
+async fn run_embedding(
+    state: &AppState,
+    headers: &HeaderMap,
+    model: &str,
+    input: Vec<String>,
+) -> Result<EmbedOutcome, Response> {
+    let local_only = parse_local_only(headers);
+
+    // Route decision. Refusals short-circuit to 503 before we build a
+    // manifest or touch a worker — identical to handle_chat.
+    let decision: RouteDecision = state.router.route(model, local_only).await;
+    if let RouteVia::Refused { reason } = &decision.via {
+        // SEC-10: model is attacker-controlled (request body); sanitize.
+        tracing::info!(model = %sanitize_for_log(model), reason = %reason, "router refused /api/embed");
+        return Err(refused_response(reason));
+    }
+    let routed_via = decision.header_value();
+
+    let job_spec = JobSpec::Embedding(phase_protocol::EmbeddingJobSpec {
+        model_cid: model.to_string(),
+        input,
+    });
+
+    let manifest = match ManifestBuilder::new(job_spec).sign_with(&state.client_identity) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "manifest signing failed (/api/embed)");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("manifest signing failed: {e}"),
+            )
+                .into_response());
+        }
+    };
+
+    let (handle, mut job_stream, receipt_verification) =
+        match state.router.execute(&decision, manifest).await {
+            Ok(t) => t,
+            Err(RouterError::Refused { reason }) => return Err(refused_response(&reason)),
+            Err(e) => {
+                tracing::error!(error = %e, "router dispatch failed (/api/embed)");
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("router dispatch failed: {e}"),
+                )
+                    .into_response());
+            }
+        };
+
+    let job_id = handle.job_id().clone();
+
+    // Collect every "embedding"-kind Output chunk keyed by seq, then sort so
+    // the output order matches the input order. Non-embedding chunks (none are
+    // expected on this path) are ignored.
+    let mut keyed: Vec<(u64, Vec<f32>)> = Vec::new();
+    while let Some(ev) = job_stream.next().await {
+        match ev {
+            JobEvent::Output(chunk) => {
+                if chunk.kind != "embedding" {
+                    continue;
+                }
+                match serde_json::from_slice::<Vec<f32>>(&chunk.data) {
+                    Ok(vector) => keyed.push((chunk.seq, vector)),
+                    Err(e) => {
+                        tracing::error!(%job_id, error = %e, seq = chunk.seq, "embedding chunk failed to decode");
+                    }
+                }
+            }
+            JobEvent::Progress(_) | JobEvent::Final { .. } => {}
+            _ => {}
+        }
+    }
+    keyed.sort_by_key(|(seq, _)| *seq);
+    let vectors: Vec<Vec<f32>> = keyed.into_iter().map(|(_, v)| v).collect();
+
+    // Surface the signed receipt (commitment) the same way handle_chat does.
+    let receipt = match handle.finish().await {
+        Ok(r) => Some(receipt_header_value(&r.result.output_commitment)),
+        Err(_) => None,
+    };
+
+    tracing::info!(%job_id, count = vectors.len(), "embedding job complete");
+
+    Ok(EmbedOutcome {
+        vectors,
+        routed_via,
+        receipt_verified: receipt_verification.header_value(),
+        receipt,
+    })
+}
+
+/// Attach the standard LUCID headers to an embedding response, mirroring the
+/// header-setting logic in `handle_chat`'s non-streaming branch.
+fn apply_embed_headers(resp: &mut Response, outcome: &EmbedOutcome) {
+    if let Some(v) = outcome.receipt.as_deref() {
+        if let Ok(hv) = v.parse() {
+            resp.headers_mut().insert("X-Phase-Receipt", hv);
+        }
+    }
+    if let Some(rv) = outcome.routed_via.as_deref() {
+        if let Ok(hv) = rv.parse() {
+            resp.headers_mut().insert(HEADER_ROUTED_VIA, hv);
+        }
+    }
+    // SEC-05: surface peer-receipt verification status.
+    if let Some(v) = outcome.receipt_verified {
+        if let Ok(hv) = v.parse() {
+            resp.headers_mut().insert(HEADER_RECEIPT_VERIFIED, hv);
+        }
+    }
+}
+
+/// `/api/embed` — current Ollama embedding endpoint. Accepts `input` as a
+/// single string or an array; returns an `embeddings` array (one vector per
+/// input). Non-streaming: Ollama never streams embeddings.
+async fn handle_embed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<EmbedRequest>,
+) -> Response {
+    let model = req.model.clone();
+    let input = req.input.map(EmbedInput::into_vec).unwrap_or_default();
+
+    let outcome = match run_embedding(&state, &headers, &model, input).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+
+    let body = serde_json::json!({
+        "model": model,
+        "embeddings": outcome.vectors,
+    });
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    apply_embed_headers(&mut resp, &outcome);
+    resp
+}
+
+/// `/api/embeddings` — LEGACY singular-prompt endpoint. Takes one `prompt`
+/// string and returns a single `embedding` vector. An empty prompt sends no
+/// input (and yields `[]`).
+async fn handle_embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Response {
+    let model = req.model.clone();
+    // Empty prompt → no input → empty result, rather than embedding "".
+    let input = if req.prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![req.prompt.clone()]
+    };
+
+    let outcome = match run_embedding(&state, &headers, &model, input).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+
+    // Legacy shape: a single `embedding` (the first vector, or `[]` if none).
+    let first: Vec<f32> = outcome.vectors.first().cloned().unwrap_or_default();
+    let body = serde_json::json!({
+        "model": model,
+        "embedding": first,
+    });
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    apply_embed_headers(&mut resp, &outcome);
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Pull (v0.1.1 stub)
+// ---------------------------------------------------------------------------
+
+/// SEC-04-style name hygiene for `/api/pull`: reject anything that could
+/// escape `model_dir` or be mistaken for a flag, matching `worker_llama`'s
+/// `resolve_model_path` guard (separators, `..`, leading `-`, empty). We keep
+/// the simple `dir.join("<name>.gguf").is_file()` shape the task calls for
+/// rather than the full canonicalize-and-confine resolver, but the *name*
+/// hygiene is identical so a hostile name never reaches the filesystem.
+fn pull_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.starts_with('-')
+}
+
+/// `/api/pull` — **v0.1.1 stub**. This does NOT download anything over the
+/// network. It registers an *already-present* local GGUF into the M6 registry
+/// so the router's "local has model" check resolves for it. Pulling from a
+/// network with real content-hashed CIDs (SHA-256 of the weights blob) is
+/// v0.2; until then the deterministic `ModelCid::from_model_id` placeholder
+/// stands in (see `registry.rs`).
+///
+/// Behavior by mode:
+/// - llama-cpp mode (`model_dir` is `Some`): succeed iff `<name>.gguf` exists
+///   in the directory; advertise it (idempotent) and report success. A missing
+///   file is an error.
+/// - echo mode (`model_dir` is `None`): nothing to pull, so succeed without
+///   advertising.
+///
+/// Respects Ollama's `stream` flag (default true): streaming emits NDJSON
+/// status lines (`{"status":"pulling manifest"}` → `{"status":"success"}`);
+/// `stream:false` returns a single JSON object. On a not-found in streaming
+/// mode we can't change the status code mid-NDJSON, so we emit an error status
+/// line and end the stream; non-streaming returns 404.
+async fn handle_pull(
+    State(state): State<AppState>,
+    Json(req): Json<PullRequest>,
+) -> Response {
+    let stream_mode = req.stream.unwrap_or(true);
+    let name = match req.model.or(req.name) {
+        Some(n) => n,
+        None => {
+            // No name at all — treat like a not-found so clients get a clear
+            // signal rather than a silent success.
+            return pull_not_found_response("", stream_mode);
+        }
+    };
+
+    // Decide success/failure up front; the body shape then depends on `stream`.
+    let ok = match &state.model_dir {
+        Some(dir) => {
+            if !pull_name_is_safe(&name) {
+                // SEC-10: name is attacker-controlled; sanitize before logging.
+                tracing::info!(model = %sanitize_for_log(&name), "rejected unsafe /api/pull name");
+                false
+            } else if dir.join(format!("{name}.gguf")).is_file() {
+                // Present locally: register it (idempotent) so the router can
+                // serve it. CID is the v0.1 name-derived placeholder.
+                let cid = crate::registry::ModelCid::from_model_id(&name);
+                let caps = crate::registry::ModelCapabilities::now(
+                    &name,
+                    cid,
+                    "unknown",
+                    8192,
+                    1,
+                    "llama.cpp",
+                );
+                if let Err(e) = state.registry.advertise_loaded(caps).await {
+                    tracing::warn!(model = %sanitize_for_log(&name), error = %e, "advertise_loaded failed during /api/pull");
+                    // Advertisement is best-effort; the GGUF is still present.
+                    // Report success so the client proceeds — the next request
+                    // re-resolves locally regardless.
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // Echo mode: nothing to pull. Treat as success without advertising.
+        None => true,
+    };
+
+    if ok {
+        pull_success_response(stream_mode)
+    } else {
+        pull_not_found_response(&name, stream_mode)
+    }
+}
+
+/// Build the success response for `/api/pull` in the requested transport.
+fn pull_success_response(stream_mode: bool) -> Response {
+    if stream_mode {
+        ndjson_response(vec![
+            serde_json::json!({ "status": "pulling manifest" }),
+            serde_json::json!({ "status": "success" }),
+        ])
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({ "status": "success" }))).into_response()
+    }
+}
+
+/// Build the not-found response for `/api/pull`. Streaming can't carry a 404
+/// mid-NDJSON, so it emits an error status line and ends; non-streaming returns
+/// a real 404 with the same message.
+fn pull_not_found_response(name: &str, stream_mode: bool) -> Response {
+    let msg = format!(
+        "model '{name}' not found in model_dir; v0.1 /api/pull only registers an already-present local GGUF"
+    );
+    if stream_mode {
+        ndjson_response(vec![serde_json::json!({ "status": "error", "error": msg })])
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "status": "error", "error": msg })),
+        )
+            .into_response()
+    }
+}
+
+/// Serialize a sequence of JSON values as an `application/x-ndjson` body — one
+/// object per line, newline-terminated — the framing Ollama's pull progress
+/// uses. Values are owned (not streamed off a worker), so we build the body
+/// eagerly rather than through `async_stream`.
+fn ndjson_response(lines: Vec<serde_json::Value>) -> Response {
+    let mut buf = Vec::new();
+    for value in &lines {
+        if let Ok(mut bytes) = serde_json::to_vec(value) {
+            bytes.push(b'\n');
+            buf.extend_from_slice(&bytes);
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from(buf))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -911,5 +1320,68 @@ mod tests {
         // SEC-10: a normal path is unchanged.
         let clean = "/api/chat";
         assert_eq!(sanitize_for_log(clean), clean);
+    }
+
+    #[test]
+    fn embed_input_accepts_single_string() {
+        // Ollama's `/api/embed` allows `input` as a bare string; the
+        // `untagged` enum should pick `One` and normalize to a 1-element vec.
+        let req: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":"hello"}"#).expect("parse single");
+        let inputs = req.input.expect("input present").into_vec();
+        assert_eq!(inputs, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn embed_input_accepts_array_of_strings() {
+        // …and as an array; the same enum should pick `Many` and pass it
+        // through unchanged, preserving order.
+        let req: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":["x","y"]}"#)
+            .expect("parse array");
+        let inputs = req.input.expect("input present").into_vec();
+        assert_eq!(inputs, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn embed_input_ignores_unknown_fields() {
+        // Extra fields Ollama may send (options, truncate, dimensions, …) are
+        // accepted-and-ignored, not a deserialization error.
+        let req: EmbedRequest = serde_json::from_str(
+            r#"{"model":"m","input":"z","truncate":true,"options":{"x":1}}"#,
+        )
+        .expect("parse with extras");
+        assert_eq!(req.model, "m");
+        assert_eq!(req.input.expect("input").into_vec(), vec!["z".to_string()]);
+    }
+
+    #[test]
+    fn pull_name_hygiene_accepts_plain_names() {
+        // Ordinary model names (the only thing that can resolve to a local
+        // GGUF) pass the guard.
+        for name in ["qwen3", "llama3.1", "nomic-embed-text", "gpt-oss"] {
+            assert!(pull_name_is_safe(name), "expected {name:?} to be allowed");
+        }
+    }
+
+    #[test]
+    fn pull_name_hygiene_rejects_traversal_and_flags() {
+        // SEC-04 parity with worker_llama::resolve_model_path: separators,
+        // `..`, leading `-`, and empty are all rejected before the filesystem
+        // is ever touched.
+        for name in [
+            "",
+            "../etc/passwd",
+            "..",
+            "foo/bar",
+            "foo\\bar",
+            "-rf",
+            "--flag",
+            "a/../b",
+        ] {
+            assert!(
+                !pull_name_is_safe(name),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 }

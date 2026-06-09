@@ -612,13 +612,17 @@ impl ModelRegistry {
     /// uses this on `/api/chat` because Ollama clients name models by
     /// string, not by hash.
     ///
-    /// Implementation: check the local loaded set for a matching id; if
-    /// found, look up by its CID. There is currently no cross-peer
-    /// `name → cid` index, so a router that wants to route to peers for
-    /// a model **it doesn't have loaded** needs an out-of-band mapping
-    /// (e.g. an Ollama-style model name registry). That index is M5's
-    /// problem; today this method returns an empty `Vec` if the model
-    /// is not locally loaded.
+    /// Implementation: first check the local loaded set for a matching id
+    /// and use that CID if found. Otherwise fall back to the deterministic
+    /// `ModelCid::from_model_id(model_id)` derivation (SHA-256 with domain
+    /// separation), so two peers compute the same CID for the same name
+    /// without coordinating. That lets a consume-only node route to peers
+    /// for a model **it has never loaded**.
+    ///
+    /// v0.1 limitation: this deterministic derivation collides if two peers
+    /// serve genuinely different weights under the same name. A real
+    /// content-hashed cross-peer `name → cid` index lands in v0.2 (via
+    /// `/api/pull` verification).
     pub async fn find_peers_by_model_id(
         &self,
         model_id: &str,

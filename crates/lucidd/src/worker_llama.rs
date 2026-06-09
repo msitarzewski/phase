@@ -62,9 +62,9 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use phase_identity::NodeIdentity;
 use phase_protocol::{
-    ChatRole, CommitmentAccumulator, Completion, InferenceJobSpec, JobEvent, JobHandle,
-    JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream, OutputChunk,
-    SignedManifest, Worker, WorkerError,
+    ChatRole, CommitmentAccumulator, Completion, EmbeddingJobSpec, InferenceJobSpec, JobEvent,
+    JobHandle, JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream,
+    OutputChunk, SignedManifest, Worker, WorkerError,
 };
 use phase_receipt::ReceiptBuilder;
 use serde::Deserialize;
@@ -239,8 +239,31 @@ impl LlamaCppWorker {
     /// loaded, returns the existing entry. If not, spawns a new
     /// `llama-server` subprocess and waits for `/health` to go green
     /// before returning.
-    async fn ensure_loaded(&self, model_id: &str) -> Result<Arc<LoadedModel>, WorkerError> {
-        if let Some(existing) = self.inner.loaded_models.get(model_id) {
+    ///
+    /// `embeddings` selects which *flavour* of the model to load. A chat
+    /// model and an embedding model are spun up differently in llama-server
+    /// (`--embeddings` enables the `/embedding` endpoint and switches the
+    /// pooling mode), so the two cannot share one subprocess even for the
+    /// same `model_id`. To let both coexist we key the embedding instance
+    /// under a distinct composite id (`"{model_id}\u{0}emb"`); the NUL byte
+    /// is never valid in a caller-supplied id (rejected by
+    /// [`resolve_model_path`]), so the namespaces can't collide. Path
+    /// resolution always uses the BARE `model_id` — the same GGUF backs both
+    /// flavours.
+    async fn ensure_loaded(
+        &self,
+        model_id: &str,
+        embeddings: bool,
+    ) -> Result<Arc<LoadedModel>, WorkerError> {
+        // The DashMap key distinguishes chat vs embedding instances; the
+        // path resolved below strips the suffix back off.
+        let load_key = if embeddings {
+            format!("{model_id}\u{0}emb")
+        } else {
+            model_id.to_string()
+        };
+
+        if let Some(existing) = self.inner.loaded_models.get(&load_key) {
             if !existing
                 .failed_flag
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -251,7 +274,7 @@ impl LlamaCppWorker {
             // again. The supervisor's `kill()` already ran.
             let stale_port = existing.port;
             drop(existing);
-            self.inner.loaded_models.remove(model_id);
+            self.inner.loaded_models.remove(&load_key);
             self.release_port(stale_port).await;
         }
 
@@ -259,7 +282,9 @@ impl LlamaCppWorker {
         // / absolute / leading-dash / nul id is rejected here, before the
         // path ever reaches the spawn. Not-found and an invalid id collapse
         // to the SAME generic client error (oracle closed); the specific
-        // reason is logged server-side only.
+        // reason is logged server-side only. Resolution uses the BARE
+        // `model_id`, never the composite key, so the embedding flavour
+        // loads the same GGUF as the chat flavour.
         let model_path =
             match resolve_model_path(&self.inner.config.model_dir, model_id) {
                 Ok(p) => p,
@@ -278,8 +303,10 @@ impl LlamaCppWorker {
         // SEC-07: enforce the resident-model cap before spawning. If we're
         // at the cap, evict the least-recently-used model first. Done
         // before `allocate_port` so the freed port is available to the new
-        // model and we don't trip the range-full check unnecessarily.
-        self.evict_lru_if_at_cap(model_id).await;
+        // model and we don't trip the range-full check unnecessarily. The
+        // incoming candidate is the composite key so a chat instance of the
+        // same model isn't mistaken for "already the incoming one".
+        self.evict_lru_if_at_cap(&load_key).await;
 
         let port = self.allocate_port().await?;
         let child = match spawn_llama_server(
@@ -289,6 +316,7 @@ impl LlamaCppWorker {
             self.inner.config.default_n_gpu_layers,
             self.inner.config.default_context_size,
             &self.inner.config.extra_env,
+            embeddings,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -310,6 +338,11 @@ impl LlamaCppWorker {
         let failed = Arc::new(Notify::new());
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // The map entry is keyed by the composite `load_key`, but the
+        // `model_id` carried into telemetry stays the bare alias so logs
+        // read naturally. The supervisor re-spawns with the same
+        // `embeddings` flag so a crashed embedding instance comes back as an
+        // embedding instance.
         let model_id_owned = model_id.to_string();
         let supervisor_input = SupervisorInput {
             model_id: model_id_owned.clone(),
@@ -319,6 +352,7 @@ impl LlamaCppWorker {
             client: self.inner.client.clone(),
             config: self.inner.config.clone(),
             model_path: model_path.clone(),
+            embeddings,
         };
 
         // The supervisor task gets the child handle (so it can wait/kill).
@@ -338,12 +372,10 @@ impl LlamaCppWorker {
         });
         // A concurrent `ensure_loaded` for the same id could have raced us
         // to a winning load; if `insert` replaces a live entry, shut the
-        // loser down and free its port so we don't leak a subprocess.
-        if let Some(prev) = self
-            .inner
-            .loaded_models
-            .insert(model_id_owned, loaded.clone())
-        {
+        // loser down and free its port so we don't leak a subprocess. Keyed
+        // by `load_key` so chat and embedding instances of one model occupy
+        // separate slots.
+        if let Some(prev) = self.inner.loaded_models.insert(load_key, loaded.clone()) {
             if prev.port != port {
                 prev.shutdown();
                 self.release_port(prev.port).await;
@@ -430,48 +462,74 @@ impl LlamaCppWorker {
 
 impl Worker for LlamaCppWorker {
     fn supported_kinds(&self) -> &[JobSpecKind] {
-        &[JobSpecKind::Inference]
+        &[JobSpecKind::Inference, JobSpecKind::Embedding]
     }
 
     async fn execute(
         &self,
         job: SignedManifest<JobSpec>,
     ) -> Result<(JobHandle, JobStream), WorkerError> {
-        let inference = match &job.payload {
-            JobSpec::Inference(spec) => spec.clone(),
-            other => {
-                return Err(WorkerError::Unsupported {
-                    kind: other.kind(),
-                });
-            }
-        };
-
         let manifest_hash = job
             .manifest_hash()
             .map_err(|e| WorkerError::BadManifest(e.to_string()))?;
         let job_id = JobId(manifest_hash);
 
-        // Load the model up front so dispatch-time errors are returned
-        // through `WorkerError` rather than as a single `Final::Error`
-        // event with no chunks. Once we get past this point the only
-        // failure mode is in-stream.
-        let model = self.ensure_loaded(&inference.model_cid).await?;
+        match &job.payload {
+            JobSpec::Inference(spec) => {
+                let inference = spec.clone();
 
-        let (handle, producer) = JobHandle::new(job_id);
-        let identity = self.inner.identity.clone();
-        let client = self.inner.client.clone();
-        let idle_timeout = self.inner.config.per_request_idle_timeout;
+                // Load the model up front so dispatch-time errors are
+                // returned through `WorkerError` rather than as a single
+                // `Final::Error` event with no chunks. Once we get past
+                // this point the only failure mode is in-stream. The chat
+                // path always loads the non-embedding flavour.
+                let model = self.ensure_loaded(&inference.model_cid, false).await?;
 
-        let stream: JobStream = Box::pin(run_inference(
-            client,
-            model,
-            inference,
-            manifest_hash,
-            producer,
-            identity,
-            idle_timeout,
-        ));
-        Ok((handle, stream))
+                let (handle, producer) = JobHandle::new(job_id);
+                let identity = self.inner.identity.clone();
+                let client = self.inner.client.clone();
+                let idle_timeout = self.inner.config.per_request_idle_timeout;
+
+                let stream: JobStream = Box::pin(run_inference(
+                    client,
+                    model,
+                    inference,
+                    manifest_hash,
+                    producer,
+                    identity,
+                    idle_timeout,
+                ));
+                Ok((handle, stream))
+            }
+            JobSpec::Embedding(spec) => {
+                let embedding = spec.clone();
+
+                // Embedding loads spin up a *separate* llama-server with
+                // `--embeddings`, keyed apart from any chat instance of the
+                // same model (see `ensure_loaded`). Same up-front-load
+                // contract as the inference path.
+                let model = self.ensure_loaded(&embedding.model_cid, true).await?;
+
+                let (handle, producer) = JobHandle::new(job_id);
+                let identity = self.inner.identity.clone();
+                let client = self.inner.client.clone();
+                let request_timeout = self.inner.config.per_request_idle_timeout;
+
+                let stream: JobStream = Box::pin(run_embedding(
+                    client,
+                    model,
+                    embedding,
+                    manifest_hash,
+                    producer,
+                    identity,
+                    request_timeout,
+                ));
+                Ok((handle, stream))
+            }
+            other => Err(WorkerError::Unsupported {
+                kind: other.kind(),
+            }),
+        }
     }
 }
 
@@ -541,6 +599,7 @@ fn spawn_llama_server(
     n_gpu_layers: i32,
     ctx_size: usize,
     extra_env: &[(String, String)],
+    embeddings: bool,
 ) -> std::io::Result<Child> {
     // SEC-04 (L8): require an absolute binary path. Resolving `llama-server`
     // via the inherited `$PATH` is a binary-hijack vector (an attacker who
@@ -575,6 +634,14 @@ fn spawn_llama_server(
         cmd.arg("--n-gpu-layers").arg("all");
     } else {
         cmd.arg("--n-gpu-layers").arg(n_gpu_layers.to_string());
+    }
+    // Embedding loads are a different beast: `--embeddings` turns on the
+    // `/embedding` endpoint, and `--pooling mean` makes the server return
+    // one fixed-width vector per input rather than per-token states. We
+    // never set these on the chat path — they'd disable generation.
+    if embeddings {
+        cmd.arg("--embeddings");
+        cmd.arg("--pooling").arg("mean");
     }
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -641,6 +708,9 @@ struct SupervisorInput {
     client: reqwest::Client,
     config: LlamaCppConfig,
     model_path: PathBuf,
+    /// Whether this instance was spawned with `--embeddings`. Re-spawns on
+    /// crash must reuse the same flavour or the endpoint shape would flip.
+    embeddings: bool,
 }
 
 /// Long-running task: watch the child, restart on crash up to 3 times in
@@ -655,6 +725,7 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
         client,
         config,
         model_path,
+        embeddings,
     } = input;
 
     // Sliding window of recent crash timestamps. If we accumulate three
@@ -757,6 +828,7 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                     config.default_n_gpu_layers,
                     config.default_context_size,
                     &config.extra_env,
+                    embeddings,
                 );
                 match respawned {
                     Ok(c) => {
@@ -1039,6 +1111,216 @@ fn run_inference(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Embedding path
+// ---------------------------------------------------------------------------
+
+/// Drive an embedding job: for each input string, `POST /embedding` against
+/// the model's (embedding-flavoured) llama-server subprocess, decode the
+/// returned vector, and emit it as one `OutputChunk { kind: "embedding" }`
+/// per the shared embedding wire convention. The chunk `seq` is the input's
+/// index so the HTTP collector can re-order; `data` is the JSON encoding of
+/// `Vec<f32>`. Folds every chunk into a `CommitmentAccumulator` so the
+/// receipt's `output_commitment` covers exactly what we shipped — the same
+/// machinery `run_inference` uses for token streaming.
+///
+/// `/embedding` is request/response (no SSE), so we cap each call with the
+/// per-request timeout rather than the inter-token idle watchdog. On any
+/// per-input failure we emit a terminal `Final` with `Completion::Error`
+/// rather than panicking, mirroring `run_inference`'s error discipline.
+fn run_embedding(
+    client: reqwest::Client,
+    model: Arc<LoadedModel>,
+    embedding: EmbeddingJobSpec,
+    manifest_hash: [u8; 32],
+    mut producer: JobHandleProducer,
+    identity: NodeIdentity,
+    request_timeout: Duration,
+) -> impl futures::Stream<Item = JobEvent> + Send + 'static {
+    stream! {
+        let started_at = Instant::now();
+        let url = format!("http://127.0.0.1:{}/embedding", model.port);
+        // Sum of input lengths stands in for "prompt tokens" — embeddings
+        // have no completion side, so `completion_tokens` stays 0 while the
+        // emitted chunk count (one per input) lives in `output_chunk_count`.
+        let prompt_chars: u64 = embedding
+            .input
+            .iter()
+            .map(|s| s.chars().count() as u64)
+            .sum();
+
+        let mut acc = CommitmentAccumulator::new();
+        let mut cancelled = false;
+
+        for (i, text) in embedding.input.iter().enumerate() {
+            if producer.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+
+            // llama-server's `/embedding` takes a `content` field. Bound the
+            // call with the per-request timeout so a wedged server can't pin
+            // the job forever.
+            let body = serde_json::json!({ "content": text });
+            let response = client
+                .post(&url)
+                .json(&body)
+                .timeout(request_timeout)
+                .send()
+                .await;
+            let resp = match response {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    yield emit_final_error(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        0,
+                        started_at,
+                        format!("llama-server /embedding returned {status} for input {i}: {body}"),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    yield emit_final_error(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        0,
+                        started_at,
+                        format!("request to llama-server /embedding failed for input {i}: {e}"),
+                    );
+                    return;
+                }
+            };
+
+            let raw = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    yield emit_final_error(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        0,
+                        started_at,
+                        format!("reading /embedding body for input {i} failed: {e}"),
+                    );
+                    return;
+                }
+            };
+
+            let vector = match parse_embedding_response(&raw) {
+                Some(v) => v,
+                None => {
+                    yield emit_final_error(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        0,
+                        started_at,
+                        format!("could not parse embedding from /embedding response for input {i}"),
+                    );
+                    return;
+                }
+            };
+
+            // Encode the vector exactly as the wire convention requires:
+            // `serde_json::to_vec(&Vec<f32>)`. The HTTP collector decodes
+            // each chunk with the symmetric `from_slice::<Vec<f32>>`.
+            let data = serde_json::to_vec(&vector)
+                .expect("Vec<f32> serializes to JSON infallibly");
+            let chunk = OutputChunk {
+                kind: "embedding".to_string(),
+                data: Bytes::from(data),
+                seq: i as u64,
+            };
+            acc.update(&chunk);
+            yield JobEvent::Output(chunk);
+        }
+
+        {
+            let mut last = model.last_used.lock().await;
+            *last = Instant::now();
+        }
+
+        let (commitment, count) = acc.finalize();
+        let completion = if cancelled {
+            Completion::Cancelled
+        } else {
+            Completion::Stop
+        };
+
+        let result = JobResult {
+            job_spec_hash: manifest_hash,
+            output_commitment: commitment,
+            output_chunk_count: count,
+            completion,
+            resumption: None,
+            metrics: JobMetrics {
+                total_duration_ms: started_at.elapsed().as_millis() as u64,
+                prompt_tokens: prompt_chars,
+                completion_tokens: 0,
+                ..Default::default()
+            },
+        };
+
+        let receipt = ReceiptBuilder::new(result.clone(), manifest_hash)
+            .sign_with(&identity)
+            .expect("sign receipt (Serialize impls are infallible)");
+        producer.deliver_receipt(receipt);
+
+        yield JobEvent::Final { result, error: None };
+    }
+}
+
+/// Extract a single embedding vector from a `/embedding` response body.
+///
+/// The endpoint's JSON shape varies across llama-server versions, so we
+/// accept the three we've observed in the wild and pick the first vector:
+///
+/// 1. A top-level object: `{"embedding": [..]}`.
+/// 2. An array of per-input objects: `[{"embedding": [..], "index": 0}, ..]`
+///    (what newer servers return even for a single `content`).
+/// 3. An OpenAI-flavoured wrapper: `{"data": [{"embedding": [..]}, ..]}`.
+///
+/// Returns `None` if none of these yield a numeric array — the caller turns
+/// that into a `Completion::Error` rather than guessing.
+fn parse_embedding_response(raw: &[u8]) -> Option<Vec<f32>> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    // Shape 1: {"embedding": [...]}.
+    if let Some(v) = value.get("embedding").and_then(json_to_vec_f32) {
+        return Some(v);
+    }
+    // Shape 3: {"data": [{"embedding": [...]}, ...]} — take the first entry.
+    if let Some(first) = value.get("data").and_then(|d| d.as_array()).and_then(|a| a.first()) {
+        if let Some(v) = first.get("embedding").and_then(json_to_vec_f32) {
+            return Some(v);
+        }
+    }
+    // Shape 2: [{"embedding": [...], "index": 0}, ...] — take the first entry.
+    if let Some(first) = value.as_array().and_then(|a| a.first()) {
+        if let Some(v) = first.get("embedding").and_then(json_to_vec_f32) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Decode a JSON value that should be an array of numbers into `Vec<f32>`.
+/// Returns `None` for anything that isn't a numeric array.
+fn json_to_vec_f32(value: &serde_json::Value) -> Option<Vec<f32>> {
+    let arr = value.as_array()?;
+    arr.iter()
+        .map(|n| n.as_f64().map(|f| f as f32))
+        .collect::<Option<Vec<f32>>>()
+}
+
 /// Build the terminal `JobEvent::Final` for an error path and deliver the
 /// signed receipt out-of-band. Pure side-effecting helper so the happy
 /// and sad paths in `run_inference` look the same.
@@ -1264,6 +1546,34 @@ mod tests {
     fn find_double_newline_finds_first() {
         let buf = b"hello\n\nworld\n\nbye";
         assert_eq!(find_double_newline(buf), Some(5));
+    }
+
+    #[test]
+    fn parse_embedding_accepts_top_level_object() {
+        let raw = br#"{"embedding":[0.1,0.2,0.3]}"#;
+        let v = parse_embedding_response(raw).expect("parse");
+        assert_eq!(v, vec![0.1f32, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn parse_embedding_accepts_array_of_objects() {
+        let raw = br#"[{"embedding":[1.0,2.0],"index":0}]"#;
+        let v = parse_embedding_response(raw).expect("parse");
+        assert_eq!(v, vec![1.0f32, 2.0]);
+    }
+
+    #[test]
+    fn parse_embedding_accepts_data_wrapper() {
+        let raw = br#"{"data":[{"embedding":[4.0,5.0,6.0]}]}"#;
+        let v = parse_embedding_response(raw).expect("parse");
+        assert_eq!(v, vec![4.0f32, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn parse_embedding_rejects_non_numeric_and_missing() {
+        assert!(parse_embedding_response(br#"{"nope":1}"#).is_none());
+        assert!(parse_embedding_response(br#"{"embedding":["x"]}"#).is_none());
+        assert!(parse_embedding_response(b"not json").is_none());
     }
 
     #[test]

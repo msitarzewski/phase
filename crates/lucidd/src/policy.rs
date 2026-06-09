@@ -263,7 +263,7 @@ pub struct PolicyEngine {
     config: Arc<RwLock<PolicyConfig>>,
     state: Arc<RwLock<PolicyState>>,
     config_path: Option<PathBuf>,
-    _watcher_handle: JoinHandle<()>,
+    _watcher_handle: Option<JoinHandle<()>>,
 }
 
 impl PolicyEngine {
@@ -304,7 +304,7 @@ impl PolicyEngine {
             config,
             state,
             config_path: resolved,
-            _watcher_handle: watcher_handle,
+            _watcher_handle: Some(watcher_handle),
         })
     }
 
@@ -366,6 +366,17 @@ impl PolicyEngine {
         decision
     }
 
+    /// Decision for a SELF-INITIATED request (the operator using their own
+    /// node via :11434). Self-traffic bypasses the donation-protection gates
+    /// (battery / thermal / time-window / concurrency / model-allowlist) —
+    /// those exist to protect a contributor from the *network*, not from
+    /// themselves. It still respects manual_pause: an explicit operator
+    /// "this node is off" wins. No new config knob; this is correct semantics.
+    pub fn should_serve_self(&self, model_id: &str) -> PolicyDecision {
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        decide_self(&config, model_id)
+    }
+
     /// Flip the operator-controlled manual pause. The change is durable for
     /// the lifetime of the process; persisting to disk is a separate
     /// concern (M7 future work — the operator can also just edit the
@@ -401,12 +412,14 @@ impl PolicyEngine {
     /// needing real battery / thermal hardware.
     #[cfg(test)]
     pub fn new_for_tests(config: PolicyConfig, state: PolicyState) -> Self {
-        let handle = tokio::spawn(async {});
+        // No background watcher in tests, so no runtime is required to build
+        // the engine — `None` keeps this constructor usable from plain
+        // `#[test]` functions (not just `#[tokio::test]`).
         Self {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(state)),
             config_path: None,
-            _watcher_handle: handle,
+            _watcher_handle: None,
         }
     }
 
@@ -486,6 +499,20 @@ fn decide(
         };
     }
 
+    PolicyDecision::Allow
+}
+
+/// Pure decision for self-initiated traffic. Mirrors `decide` step 1 only:
+/// manual_pause is the operator explicitly saying "this node is off", and
+/// that intent applies to their own requests too. Every other gate in
+/// `decide` is donation-protection (shielding a contributor from the
+/// network's load), so none of it should reach the operator's own curl.
+fn decide_self(config: &PolicyConfig, _model_id: &str) -> PolicyDecision {
+    if config.manual_pause {
+        return PolicyDecision::Pause {
+            reason: PauseReason::Manual,
+        };
+    }
     PolicyDecision::Allow
 }
 
@@ -855,6 +882,56 @@ mod tests {
         s.on_battery = Some(true);
         let d = decide(&c, &s, "qwen3-next-80b-q4", 0);
         assert_eq!(d, PolicyDecision::Allow);
+    }
+
+    // --- self-traffic path -------------------------------------------------
+
+    #[test]
+    fn should_serve_self_allows_on_battery() {
+        // The network path pauses a battery node to protect the contributor;
+        // the operator's own request must not be collateral damage.
+        let c = cfg(); // auto_pause_on_battery defaults to true.
+        let mut s = st();
+        s.on_battery = Some(true);
+        let engine = PolicyEngine::new_for_tests(c, st());
+        engine.set_test_state(s);
+
+        assert_eq!(
+            engine.should_serve("qwen3-next-80b-q4", 0),
+            PolicyDecision::Pause {
+                reason: PauseReason::OnBattery
+            }
+        );
+        assert_eq!(
+            engine.should_serve_self("qwen3-next-80b-q4"),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn should_serve_self_respects_manual_pause() {
+        // An explicit "this node is off" wins even for self-traffic.
+        let mut c = cfg();
+        c.manual_pause = true;
+        let engine = PolicyEngine::new_for_tests(c, st());
+        assert_eq!(
+            engine.should_serve_self("qwen3-next-80b-q4"),
+            PolicyDecision::Pause {
+                reason: PauseReason::Manual
+            }
+        );
+    }
+
+    #[test]
+    fn should_serve_self_ignores_allowlist() {
+        // The allowlist gates the network, not the operator's own model.
+        let mut c = cfg();
+        c.serve_models = vec!["qwen3-*".to_string()];
+        let engine = PolicyEngine::new_for_tests(c, st());
+        assert_eq!(
+            engine.should_serve_self("some-model"),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]

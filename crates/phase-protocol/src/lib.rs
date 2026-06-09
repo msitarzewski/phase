@@ -32,8 +32,8 @@ mod worker;
 
 pub use commitment::CommitmentAccumulator;
 pub use job_spec::{
-    ChatMessage, ChatRole, Completion, ConversationToken, InferenceJobSpec, JobMetrics, JobResult,
-    JobSpec, JobSpecKind, PeerId, SamplingParams, WasmJobSpec,
+    ChatMessage, ChatRole, Completion, ConversationToken, EmbeddingJobSpec, InferenceJobSpec,
+    JobMetrics, JobResult, JobSpec, JobSpecKind, PeerId, SamplingParams, WasmJobSpec,
 };
 pub use worker::{
     should_resume_on_same_peer, DynWorker, JobEvent, JobHandle, JobHandleProducer, JobId,

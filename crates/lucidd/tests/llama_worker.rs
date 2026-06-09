@@ -26,7 +26,8 @@ use lucidd::{LlamaCppConfig, LlamaCppWorker};
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
 use phase_protocol::{
-    Completion, InferenceJobSpec, JobEvent, JobSpec, SamplingParams, SignedManifest, Worker,
+    Completion, EmbeddingJobSpec, InferenceJobSpec, JobEvent, JobSpec, SamplingParams,
+    SignedManifest, Worker,
 };
 
 /// Pick a port that's free *right now*. The fake binary will re-bind it
@@ -327,6 +328,57 @@ async fn missing_model_file_returns_artifact_unavailable() {
         msg.contains("artifact") || msg.contains("not found"),
         "unexpected error: {msg}"
     );
+}
+
+#[tokio::test]
+async fn embedding_streams_vectors_and_signs_receipt() {
+    // Drive the embedding path against the fake server's canned `/embedding`
+    // handler. Two inputs → two "embedding"-kind chunks, one per input,
+    // ordered by `seq`, each decoding to the canned Vec<f32>. The terminal
+    // Final carries a real commitment + Completion::Stop.
+    let setup = setup("embed");
+    let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
+
+    let id = NodeIdentity::generate();
+    let job_spec = JobSpec::Embedding(EmbeddingJobSpec {
+        model_cid: setup.model_id.clone(),
+        input: vec!["first".to_string(), "second".to_string()],
+    });
+    let manifest = phase_manifest::ManifestBuilder::new(job_spec)
+        .sign_with(&id)
+        .expect("sign manifest");
+
+    let (handle, mut stream) = worker.execute(manifest).await.expect("dispatch embedding");
+
+    let mut vectors: Vec<(u64, Vec<f32>)> = Vec::new();
+    let mut final_completion: Option<Completion> = None;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            JobEvent::Output(chunk) => {
+                assert_eq!(chunk.kind, "embedding");
+                let v: Vec<f32> =
+                    serde_json::from_slice(&chunk.data).expect("decode embedding vector");
+                vectors.push((chunk.seq, v));
+            }
+            JobEvent::Final { result, error } => {
+                assert!(error.is_none(), "unexpected error: {error:?}");
+                final_completion = Some(result.completion.clone());
+                assert_eq!(result.output_chunk_count as usize, vectors.len());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(final_completion, Some(Completion::Stop));
+    assert_eq!(vectors.len(), 2, "expected one chunk per input");
+    // Ordered by seq, matching input order.
+    vectors.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(vectors[0].0, 0);
+    assert_eq!(vectors[1].0, 1);
+    assert_eq!(vectors[0].1, vec![0.1f32, 0.2, 0.3, 0.4]);
+
+    let receipt = handle.finish().await.expect("receipt");
+    assert_eq!(receipt.result.completion, Completion::Stop);
+    assert_ne!(receipt.result.output_commitment, [0u8; 32]);
 }
 
 // -----------------------------------------------------------------------

@@ -29,7 +29,7 @@ use phase_identity::{default_identity_path, NodeIdentity};
 use phase_net::{Discovery, DiscoveryConfig};
 use phase_protocol::DynWorker;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum WorkerChoice {
     /// In-tree EchoWorker. No GPU required; reverses your message.
     Echo,
@@ -546,9 +546,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let client_identity = NodeIdentity::generate();
+    // Model directory exposed to /api/pull so it can confirm a GGUF is present
+    // before registering it. Only meaningful in llama-cpp mode with a local
+    // worker; echo / consume-only nodes have nothing to pull (`None`).
+    let app_model_dir = if local_worker.is_some() && cli.worker == WorkerChoice::LlamaCpp {
+        cli.model_dir.clone()
+    } else {
+        None
+    };
     let state = AppState {
         router,
         client_identity,
+        registry: registry.clone(),
+        model_dir: app_model_dir,
     };
     let app = ollama_router(state);
 
