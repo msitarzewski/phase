@@ -730,13 +730,22 @@ fn spawn_fs_watcher(
     use notify::{RecursiveMode, Watcher};
 
     let watch_path = path.to_path_buf();
+    let filter_path = watch_path.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(_event) => {
-                // We don't filter on event kind — text editors do all sorts
-                // of weird things (atomic-rename writes, vim swap files,
-                // etc.). Re-reading on any event is cheap and correct.
-                let _ = tx.blocking_send(WatcherEvent::ConfigChanged);
+            Ok(event) => {
+                // We watch the PARENT directory (below) to catch atomic-rename
+                // writes, so we must filter events down to ones that actually
+                // touch the config file. Without this, ANY change in that dir
+                // (e.g. a co-located log file) triggers a config reload — and
+                // if the reload's own logging lands in the same directory it
+                // feedback-loops (observed: ~64k reloads/sec). We still don't
+                // filter on event *kind* — editors do atomic-rename writes,
+                // swap files, etc., so re-reading on any event that names our
+                // file is the correct, cheap behaviour.
+                if event_touches_config(&event.paths, &filter_path) {
+                    let _ = tx.blocking_send(WatcherEvent::ConfigChanged);
+                }
             }
             Err(e) => {
                 tracing::debug!(error = %e, "notify watcher error");
@@ -745,7 +754,9 @@ fn spawn_fs_watcher(
 
     // Watch the *parent* directory non-recursively. Watching the file
     // itself misses atomic-rename writes (editors do `write to tmp; rename
-    // over original`), which would silently break reload-on-edit.
+    // over original`), which would silently break reload-on-edit. The
+    // callback filters dir events back down to our file via
+    // [`event_touches_config`].
     if let Some(parent) = watch_path.parent() {
         watcher.watch(parent, RecursiveMode::NonRecursive)?;
     } else {
@@ -753,6 +764,20 @@ fn spawn_fs_watcher(
     }
 
     Ok(Box::new(watcher))
+}
+
+/// Does a `notify` event (its affected paths) touch the config file we care
+/// about? We watch the config file's parent directory to catch atomic-rename
+/// writes, which means the watcher also sees unrelated files in that
+/// directory; this predicate filters them out. Matches either the exact path
+/// or the file name (notify may report absolute/canonicalized paths even when
+/// the watched path was relative, and an atomic rename's destination shares
+/// the file name). An empty path set never matches.
+fn event_touches_config(event_paths: &[PathBuf], config_path: &Path) -> bool {
+    let target_name = config_path.file_name();
+    event_paths
+        .iter()
+        .any(|p| p == config_path || (target_name.is_some() && p.file_name() == target_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +963,37 @@ mod tests {
             engine.should_serve_self("some-model"),
             PolicyDecision::Allow
         );
+    }
+
+    #[test]
+    fn watcher_filters_events_to_the_config_file() {
+        // The fs watcher watches the config's PARENT dir (for atomic-rename
+        // robustness), so it must ignore unrelated files in that dir — else a
+        // co-located log change triggers a reload feedback loop.
+        let cfg_path = Path::new("/tmp/cfgA/policy.toml");
+
+        // Exact path → reload.
+        assert!(event_touches_config(
+            &[PathBuf::from("/tmp/cfgA/policy.toml")],
+            cfg_path
+        ));
+        // Same file name reported under a different/canonicalized dir (or an
+        // atomic-rename destination) → reload.
+        assert!(event_touches_config(
+            &[PathBuf::from("/private/tmp/cfgA/policy.toml")],
+            cfg_path
+        ));
+        // Co-located UNRELATED files (the bug) → must NOT reload.
+        assert!(!event_touches_config(
+            &[PathBuf::from("/tmp/cfgA/A.log")],
+            cfg_path
+        ));
+        assert!(!event_touches_config(
+            &[PathBuf::from("/tmp/cfgA/other.toml")],
+            cfg_path
+        ));
+        // Empty path set → no reload.
+        assert!(!event_touches_config(&[], cfg_path));
     }
 
     #[test]
