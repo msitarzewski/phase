@@ -144,6 +144,7 @@ async fn main() {
         .route("/health", get(handle_health))
         .route("/completion", post(handle_completion))
         .route("/v1/chat/completions", post(handle_completion))
+        .route("/embedding", post(handle_embedding))
         .with_state(Arc::new(cfg));
 
     let addr: SocketAddr = format!("{host}:{port}")
@@ -199,6 +200,25 @@ struct FinalCompletionChunk<'a> {
     stop_type: &'a str,
     tokens_predicted: usize,
     tokens_evaluated: usize,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    #[allow(dead_code)]
+    content: Option<String>,
+}
+
+/// Canned `/embedding` handler. The worker only cares about extracting a
+/// `Vec<f32>` from one of the accepted response shapes, so we return the
+/// top-level `{"embedding": [...]}` form with a fixed short vector. That's
+/// enough to exercise `run_embedding` end-to-end (chunk emission, ordering,
+/// commitment, receipt) without a real model.
+async fn handle_embedding(
+    State(_cfg): State<Arc<Config>>,
+    Json(_req): Json<EmbeddingRequest>,
+) -> Response {
+    Json(serde_json::json!({ "embedding": [0.1f32, 0.2, 0.3, 0.4] })).into_response()
 }
 
 async fn handle_completion(

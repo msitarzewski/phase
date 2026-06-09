@@ -84,10 +84,9 @@ where
             });
         }
 
-        let pubkey_bytes = decode_hex32(&self.worker_pubkey)
-            .ok_or(ReceiptError::BadPublicKey)?;
-        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
-            .map_err(|_| ReceiptError::BadPublicKey)?;
+        let pubkey_bytes = decode_hex32(&self.worker_pubkey).ok_or(ReceiptError::BadPublicKey)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| ReceiptError::BadPublicKey)?;
 
         let sig_bytes = decode_hex64(&self.signature).ok_or(ReceiptError::BadSignature)?;
         let signature = Signature::from_bytes(&sig_bytes);
@@ -161,12 +160,8 @@ where
     pub fn sign_with(self, identity: &NodeIdentity) -> Result<SignedReceipt<T>, ReceiptError> {
         let completed_at = self.completed_at.unwrap_or_else(Utc::now);
         let job_id_hex = hex_encode(&self.job_id);
-        let message = signing_message(
-            self.schema_version,
-            &self.result,
-            &job_id_hex,
-            completed_at,
-        )?;
+        let message =
+            signing_message(self.schema_version, &self.result, &job_id_hex, completed_at)?;
         let signature: Signature = identity.signing_key().sign(&message);
 
         Ok(SignedReceipt {

@@ -112,16 +112,19 @@ async fn manifest_sign_serialize_fetch_verify() {
             serde_json::from_slice(&fetched).expect("deserialise fetched manifest");
 
         // 6. Verify the signature using only the public key.
-        let verified = verify_manifest_signature(&recovered, &verifying_key)
-            .expect("verify signature");
-        assert!(verified, "manifest signature did not verify after HTTP round-trip");
+        let verified =
+            verify_manifest_signature(&recovered, &verifying_key).expect("verify signature");
+        assert!(
+            verified,
+            "manifest signature did not verify after HTTP round-trip"
+        );
 
         // Sanity: tampering with the recovered manifest must cause verification
         // to fail, so we know the signature check is real.
         let mut tampered = recovered.clone();
         tampered.version = "0.0.0-tampered".to_string();
-        let still_ok = verify_manifest_signature(&tampered, &verifying_key)
-            .expect("verify tampered");
+        let still_ok =
+            verify_manifest_signature(&tampered, &verifying_key).expect("verify tampered");
         assert!(!still_ok, "tampered manifest must not verify");
 
         server_handle.abort();

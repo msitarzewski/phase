@@ -39,9 +39,8 @@ pub use worker_llama::{LlamaCppConfig, LlamaCppWorker};
 // `lucidd::ModelRegistry` etc. without having to know about the module
 // layout. See `registry` module docs for the trust model and TTL story.
 pub use registry::{
-    DhtTransport, ModelCapabilities, ModelCid, ModelRegistry,
-    SignedModelAdvertisement, ADVERTISEMENT_SCHEMA_VERSION, ADVERTISEMENT_TTL,
-    MODEL_KEY_PREFIX, TTL_REFRESH_INTERVAL,
+    DhtTransport, ModelCapabilities, ModelCid, ModelRegistry, SignedModelAdvertisement,
+    ADVERTISEMENT_SCHEMA_VERSION, ADVERTISEMENT_TTL, MODEL_KEY_PREFIX, TTL_REFRESH_INTERVAL,
 };
 
 // Public re-exports for the M7 policy surface. The router (M5) calls

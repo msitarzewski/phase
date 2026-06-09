@@ -11,21 +11,15 @@
 //! below preserve `plasm::provider::*` paths for backwards compat with the
 //! CLI, the boundary tests, and downstream consumers.
 
-pub mod manifest;
 pub mod config;
-pub mod signing;
 pub mod generator;
+pub mod manifest;
+pub mod signing;
 
 // Re-export the BootManifest payload type and its builder. These stay in
 // daemon/ until M7 because phase-boot's USB images regression-test on the
 // byte-identical wire format.
-pub use manifest::{
-    BootManifest,
-    ArtifactInfo,
-    Signature,
-    ProviderInfo,
-    ManifestBuilder,
-};
+pub use manifest::{ArtifactInfo, BootManifest, ManifestBuilder, ProviderInfo, Signature};
 
 // Re-export the daemon-side ProviderConfig (carries channel/arch on top of
 // what phase-artifact-server needs).
@@ -33,12 +27,8 @@ pub use config::ProviderConfig;
 
 // Re-export signing helpers (Ed25519 over the BootManifest hash).
 pub use signing::{
-    compute_file_hash,
-    compute_manifest_hash,
-    key_id,
-    sign_manifest,
+    compute_file_hash, compute_manifest_hash, generate_signing_key, key_id, sign_manifest,
     verify_manifest_signature,
-    generate_signing_key,
 };
 
 // Re-export the BootManifest generator.
@@ -49,22 +39,9 @@ pub use generator::ManifestGenerator;
 // moved out in M6. The names are preserved so the CLI, the boundary tests,
 // and any external consumer of `plasm::provider::*` keeps compiling.
 pub use phase_artifact_server::{
-    ArtifactMeta,
-    ArtifactServer,
-    ArtifactServerConfig,
-    ArtifactStore,
-    BlobId,
-    HealthCheck,
-    HealthChecks,
-    ManifestProvider,
-    ManifestRecord,
-    MdnsAdvertiser,
-    MdnsConfig,
-    MetricsSnapshot,
-    ProviderMetrics,
-    ServerHandle,
-    DEFAULT_MANIFEST_TTL,
-    MANIFEST_REFRESH_INTERVAL,
+    ArtifactMeta, ArtifactServer, ArtifactServerConfig, ArtifactStore, BlobId, HealthCheck,
+    HealthChecks, ManifestProvider, ManifestRecord, MdnsAdvertiser, MdnsConfig, MetricsSnapshot,
+    ProviderMetrics, ServerHandle, DEFAULT_MANIFEST_TTL, MANIFEST_REFRESH_INTERVAL,
     MDNS_SERVICE_TYPE,
 };
 

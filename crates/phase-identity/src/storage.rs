@@ -378,13 +378,19 @@ mod tests {
         let (_tmp, path) = fresh_path();
         create_new_secret(&path, &[0u8; SECRET_LEN]).expect("create");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "exclusively-created key must be 0600, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "exclusively-created key must be 0600, got {mode:o}"
+        );
         // No leftover temp files in the directory.
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "no temp files should remain after publish");
+        assert!(
+            leftovers.is_empty(),
+            "no temp files should remain after publish"
+        );
     }
 }

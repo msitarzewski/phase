@@ -83,7 +83,10 @@ fn tampered_manifest_payload_fails_verification() {
     bytes[pos + needle.len() - 1] = b'9'; // 1 -> 9
     let tampered: SignedManifest<JobPayload> =
         serde_json::from_slice(&bytes).expect("deserialize tampered");
-    assert!(matches!(tampered.verify(), Err(ManifestError::BadSignature)));
+    assert!(matches!(
+        tampered.verify(),
+        Err(ManifestError::BadSignature)
+    ));
 }
 
 #[test]
@@ -101,8 +104,7 @@ fn signed_receipt_round_trip_across_opaque_bytes() {
 
     let bytes = serde_json::to_vec(&signed).expect("serialize");
 
-    let recovered: SignedReceipt<JobResult> =
-        serde_json::from_slice(&bytes).expect("deserialize");
+    let recovered: SignedReceipt<JobResult> = serde_json::from_slice(&bytes).expect("deserialize");
     assert_eq!(recovered.result, result);
     assert_eq!(recovered.job_id_bytes(), Some(job_id));
     recovered.verify().expect("signature verifies");

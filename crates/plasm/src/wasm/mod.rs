@@ -1,7 +1,7 @@
-pub mod runtime;
 pub mod manifest;
 pub mod receipt;
+pub mod runtime;
 
-pub use runtime::{WasmRuntime, Wasm3Runtime, ExecutionResult};
 pub use manifest::JobManifest;
 pub use receipt::Receipt;
+pub use runtime::{ExecutionResult, Wasm3Runtime, WasmRuntime};

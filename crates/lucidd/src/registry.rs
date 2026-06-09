@@ -289,8 +289,7 @@ impl SignedModelAdvertisement {
     /// Sign a fresh advertisement with the given identity.
     pub fn sign(caps: ModelCapabilities, identity: &NodeIdentity) -> Result<Self> {
         let pubkey = identity.verifying_key().to_bytes();
-        let bytes =
-            Self::canonical_signed_bytes(ADVERTISEMENT_SCHEMA_VERSION, &caps, pubkey)?;
+        let bytes = Self::canonical_signed_bytes(ADVERTISEMENT_SCHEMA_VERSION, &caps, pubkey)?;
         let signature = identity.signing_key().sign(&bytes).to_bytes().to_vec();
         Ok(Self {
             schema_version: ADVERTISEMENT_SCHEMA_VERSION,
@@ -320,13 +319,8 @@ impl SignedModelAdvertisement {
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("advertisement signature has wrong length"))?;
-        let bytes = Self::canonical_signed_bytes(
-            self.schema_version,
-            &self.caps,
-            self.pubkey,
-        )?;
-        let vk = VerifyingKey::from_bytes(&self.pubkey)
-            .context("decode advertisement pubkey")?;
+        let bytes = Self::canonical_signed_bytes(self.schema_version, &self.caps, self.pubkey)?;
+        let vk = VerifyingKey::from_bytes(&self.pubkey).context("decode advertisement pubkey")?;
         let sig = Signature::from_bytes(sig_bytes);
         vk.verify(&bytes, &sig)
             .map_err(|e| anyhow!("advertisement signature failed to verify: {e}"))?;
@@ -492,8 +486,7 @@ impl ModelRegistry {
                 refreshed.valid_until =
                     refreshed.advertised_at + ADVERTISEMENT_TTL.as_millis() as u64;
 
-                let signed = match SignedModelAdvertisement::sign(refreshed, &identity)
-                {
+                let signed = match SignedModelAdvertisement::sign(refreshed, &identity) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(
@@ -513,9 +506,7 @@ impl ModelRegistry {
                         continue;
                     }
                 };
-                if let Err(e) =
-                    transport.put_record(cid_for_task.dht_key(), value).await
-                {
+                if let Err(e) = transport.put_record(cid_for_task.dht_key(), value).await {
                     // Network blips are expected; log and keep going.
                     debug!(
                         "model registry: refresh put_record failed for {}: {e}",
@@ -612,13 +603,17 @@ impl ModelRegistry {
     /// uses this on `/api/chat` because Ollama clients name models by
     /// string, not by hash.
     ///
-    /// Implementation: check the local loaded set for a matching id; if
-    /// found, look up by its CID. There is currently no cross-peer
-    /// `name → cid` index, so a router that wants to route to peers for
-    /// a model **it doesn't have loaded** needs an out-of-band mapping
-    /// (e.g. an Ollama-style model name registry). That index is M5's
-    /// problem; today this method returns an empty `Vec` if the model
-    /// is not locally loaded.
+    /// Implementation: first check the local loaded set for a matching id
+    /// and use that CID if found. Otherwise fall back to the deterministic
+    /// `ModelCid::from_model_id(model_id)` derivation (SHA-256 with domain
+    /// separation), so two peers compute the same CID for the same name
+    /// without coordinating. That lets a consume-only node route to peers
+    /// for a model **it has never loaded**.
+    ///
+    /// v0.1 limitation: this deterministic derivation collides if two peers
+    /// serve genuinely different weights under the same name. A real
+    /// content-hashed cross-peer `name → cid` index lands in v0.2 (via
+    /// `/api/pull` verification).
     pub async fn find_peers_by_model_id(
         &self,
         model_id: &str,
@@ -769,8 +764,8 @@ mod tests {
         assert!(key.starts_with(MODEL_KEY_PREFIX));
         assert_eq!(key.len(), MODEL_KEY_PREFIX.len() + 32);
         // Value decodes and verifies.
-        let ad = SignedModelAdvertisement::decode(&value)
-            .expect("published value must decode + verify");
+        let ad =
+            SignedModelAdvertisement::decode(&value).expect("published value must decode + verify");
         assert_eq!(ad.caps.model_id, "qwen3-next-80b-q4");
         assert_eq!(ad.schema_version, ADVERTISEMENT_SCHEMA_VERSION);
     }
@@ -832,12 +827,8 @@ mod tests {
         assert_eq!(transport.put_count(), 1);
 
         // Drive the clock forward until the first refresh has landed.
-        let saw_refresh = wait_for(
-            || transport.put_count() >= 2,
-            Duration::from_secs(61),
-            10,
-        )
-        .await;
+        let saw_refresh =
+            wait_for(|| transport.put_count() >= 2, Duration::from_secs(61), 10).await;
         assert!(
             saw_refresh,
             "expected refresh to publish; got {} puts",
@@ -871,12 +862,7 @@ mod tests {
         registry.advertise_loaded(sample_caps()).await.unwrap();
 
         // 1 initial + at least 3 refreshes.
-        let reached = wait_for(
-            || transport.put_count() >= 4,
-            Duration::from_secs(61),
-            20,
-        )
-        .await;
+        let reached = wait_for(|| transport.put_count() >= 4, Duration::from_secs(61), 20).await;
         assert!(
             reached,
             "expected >=4 puts (1 initial + 3 refreshes), got {}",
@@ -901,8 +887,7 @@ mod tests {
     #[test]
     fn tamper_with_caps_breaks_signature() {
         let identity = NodeIdentity::generate();
-        let mut ad =
-            SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
+        let mut ad = SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
         // Mutate a field after signing — verification must fail.
         ad.caps.context_length = ad.caps.context_length.wrapping_add(1);
         let err = ad.verify().expect_err("tampered caps must fail verify");
@@ -916,8 +901,7 @@ mod tests {
     #[test]
     fn tamper_with_pubkey_breaks_signature() {
         let identity = NodeIdentity::generate();
-        let mut ad =
-            SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
+        let mut ad = SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
         // Flip one byte of the embedded pubkey — postcard round-trips it
         // fine, but the signature was bound to the original pubkey.
         ad.pubkey[0] ^= 0x01;
@@ -932,8 +916,7 @@ mod tests {
     #[test]
     fn tamper_with_signature_bytes_breaks_verify() {
         let identity = NodeIdentity::generate();
-        let mut ad =
-            SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
+        let mut ad = SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
         ad.signature[0] ^= 0xff;
         assert!(ad.verify().is_err());
     }
@@ -941,8 +924,7 @@ mod tests {
     #[test]
     fn schema_version_mismatch_is_rejected() {
         let identity = NodeIdentity::generate();
-        let mut ad =
-            SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
+        let mut ad = SignedModelAdvertisement::sign(sample_caps(), &identity).unwrap();
         ad.schema_version = ADVERTISEMENT_SCHEMA_VERSION + 1;
         let err = ad.verify().expect_err("bumped schema must fail");
         let msg = format!("{err}");
@@ -968,10 +950,7 @@ mod tests {
         assert_eq!(peers[0].1.model_id, caps.model_id);
         // PeerId derives from the same pubkey we signed with — sanity-
         // check by re-deriving and comparing.
-        let expected = peer_id_from_ed25519_pubkey(
-            &identity.verifying_key().to_bytes(),
-        )
-        .unwrap();
+        let expected = peer_id_from_ed25519_pubkey(&identity.verifying_key().to_bytes()).unwrap();
         assert_eq!(peers[0].0, expected);
     }
 

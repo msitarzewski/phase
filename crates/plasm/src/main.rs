@@ -8,7 +8,7 @@ use plasm::{
     config::Config,
     network::{Discovery, DiscoveryConfig, ExecutionHandler, JobRequest, JobRequirements},
     provider::{ProviderConfig, ProviderServer},
-    wasm::runtime::{WasmRuntime, Wasm3Runtime},
+    wasm::runtime::{Wasm3Runtime, WasmRuntime},
 };
 
 // Persistent Ed25519 node identity (phase-identity crate, M3 of phase-core).
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
+                .add_directive(tracing::Level::INFO.into()),
         )
         .init();
 
@@ -162,7 +162,11 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
-        Commands::Start { config, listen, peer } => {
+        Commands::Start {
+            config,
+            listen,
+            peer,
+        } => {
             // Load config from file (with fallback chain)
             let mut cfg = Config::load_or_default(config.as_deref())?;
 
@@ -218,7 +222,10 @@ async fn main() -> Result<()> {
             // Advertise this node's capabilities
             discovery.advertise_capabilities().await?;
 
-            info!("Phase daemon started. Peer ID: {}", discovery.local_peer_id());
+            info!(
+                "Phase daemon started. Peer ID: {}",
+                discovery.local_peer_id()
+            );
             info!("Capabilities: {:?}", discovery.capabilities());
 
             // Dial configured peers
@@ -236,7 +243,11 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
-        Commands::Run { wasm_file, args, quiet } => {
+        Commands::Run {
+            wasm_file,
+            args,
+            quiet,
+        } => {
             if !quiet {
                 info!("Executing WASM file: {}", wasm_file);
             }
@@ -351,7 +362,11 @@ async fn main() -> Result<()> {
                             })
                             .unwrap_or_else(|| PathBuf::from("C:\\ProgramData\\plasm\\artifacts"))
                     }
-                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "windows"
+                    )))]
                     {
                         PathBuf::from("/var/lib/plasm/artifacts")
                     }
@@ -378,12 +393,30 @@ async fn main() -> Result<()> {
             println!("╔══════════════════════════════════════════════╗");
             println!("║           Phase Boot Provider                ║");
             println!("╠══════════════════════════════════════════════╣");
-            println!("║ HTTP:     http://{}:{:<21} ║", config.bind_addr, config.port);
-            println!("║ Artifacts: {:<33} ║", config.artifacts_dir.display().to_string().chars().take(33).collect::<String>());
+            println!(
+                "║ HTTP:     http://{}:{:<21} ║",
+                config.bind_addr, config.port
+            );
+            println!(
+                "║ Artifacts: {:<33} ║",
+                config
+                    .artifacts_dir
+                    .display()
+                    .to_string()
+                    .chars()
+                    .take(33)
+                    .collect::<String>()
+            );
             println!("║ Channel:  {:<34} ║", config.channel);
             println!("║ Arch:     {:<34} ║", config.arch);
-            println!("║ DHT:      {:<34} ║", if no_dht { "disabled" } else { "enabled" });
-            println!("║ mDNS:     {:<34} ║", if no_mdns { "disabled" } else { "enabled" });
+            println!(
+                "║ DHT:      {:<34} ║",
+                if no_dht { "disabled" } else { "enabled" }
+            );
+            println!(
+                "║ mDNS:     {:<34} ║",
+                if no_mdns { "disabled" } else { "enabled" }
+            );
             println!("╚══════════════════════════════════════════════╝");
             println!();
 
@@ -410,20 +443,56 @@ async fn main() -> Result<()> {
                                 } else {
                                     // Human-friendly output
                                     println!("Provider Status:");
-                                    println!("  Name:     {}", status["name"].as_str().unwrap_or("unknown"));
-                                    println!("  Version:  {}", status["version"].as_str().unwrap_or("unknown"));
-                                    println!("  Channel:  {}", status["channel"].as_str().unwrap_or("unknown"));
-                                    println!("  Arch:     {}", status["arch"].as_str().unwrap_or("unknown"));
-                                    println!("  Uptime:   {}s", status["uptime_seconds"].as_u64().unwrap_or(0));
+                                    println!(
+                                        "  Name:     {}",
+                                        status["name"].as_str().unwrap_or("unknown")
+                                    );
+                                    println!(
+                                        "  Version:  {}",
+                                        status["version"].as_str().unwrap_or("unknown")
+                                    );
+                                    println!(
+                                        "  Channel:  {}",
+                                        status["channel"].as_str().unwrap_or("unknown")
+                                    );
+                                    println!(
+                                        "  Arch:     {}",
+                                        status["arch"].as_str().unwrap_or("unknown")
+                                    );
+                                    println!(
+                                        "  Uptime:   {}s",
+                                        status["uptime_seconds"].as_u64().unwrap_or(0)
+                                    );
                                     println!();
                                     println!("Health:");
-                                    println!("  Status:             {}", status["health"]["status"].as_str().unwrap_or("unknown"));
-                                    println!("  Artifacts readable: {}", status["health"]["artifacts_readable"].as_bool().unwrap_or(false));
-                                    println!("  Disk space ok:      {}", status["health"]["disk_space_ok"].as_bool().unwrap_or(false));
+                                    println!(
+                                        "  Status:             {}",
+                                        status["health"]["status"].as_str().unwrap_or("unknown")
+                                    );
+                                    println!(
+                                        "  Artifacts readable: {}",
+                                        status["health"]["artifacts_readable"]
+                                            .as_bool()
+                                            .unwrap_or(false)
+                                    );
+                                    println!(
+                                        "  Disk space ok:      {}",
+                                        status["health"]["disk_space_ok"]
+                                            .as_bool()
+                                            .unwrap_or(false)
+                                    );
                                     println!();
                                     println!("Metrics:");
-                                    println!("  Requests total:     {}", status["metrics"]["requests_total"].as_u64().unwrap_or(0));
-                                    println!("  Bytes served total: {}", status["metrics"]["bytes_served_total"].as_u64().unwrap_or(0));
+                                    println!(
+                                        "  Requests total:     {}",
+                                        status["metrics"]["requests_total"].as_u64().unwrap_or(0)
+                                    );
+                                    println!(
+                                        "  Bytes served total: {}",
+                                        status["metrics"]["bytes_served_total"]
+                                            .as_u64()
+                                            .unwrap_or(0)
+                                    );
                                 }
                             } else {
                                 eprintln!("Error: Provider returned status {}", response.status());
@@ -450,8 +519,14 @@ async fn main() -> Result<()> {
                                 let manifest: serde_json::Value = response.json().await?;
 
                                 println!("Available Artifacts:");
-                                println!("  Channel: {}", manifest["channel"].as_str().unwrap_or("unknown"));
-                                println!("  Arch:    {}", manifest["arch"].as_str().unwrap_or("unknown"));
+                                println!(
+                                    "  Channel: {}",
+                                    manifest["channel"].as_str().unwrap_or("unknown")
+                                );
+                                println!(
+                                    "  Arch:    {}",
+                                    manifest["arch"].as_str().unwrap_or("unknown")
+                                );
                                 println!();
 
                                 if let Some(artifacts) = manifest["artifacts"].as_object() {

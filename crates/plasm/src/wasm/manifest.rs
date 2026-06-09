@@ -53,22 +53,20 @@ impl JobManifest {
 
     /// Deserialize from JSON
     pub fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json)
-            .map_err(|e| format!("Failed to deserialize manifest: {}", e))
+        serde_json::from_str(json).map_err(|e| format!("Failed to deserialize manifest: {}", e))
     }
 
     /// Load from JSON file
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
         Self::from_json(&content)
     }
 
     /// Save to JSON file
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), String> {
         let json = self.to_json()?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("Failed to write file: {}", e))
+        std::fs::write(path, json).map_err(|e| format!("Failed to write file: {}", e))
     }
 }
 

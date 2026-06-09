@@ -7,15 +7,15 @@
 //!   phase-fetch --manifest manifest.json --output /boot --artifact all
 //!   phase-fetch --manifest manifest.json --output /boot --artifact kernel --retry 5
 
-use std::fs::{self, File};
-use std::io::{Write, Read};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use anyhow::{anyhow, Context, Result};
-use tracing::{info, warn, error, Level};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Phase Fetch - Boot artifact downloader
@@ -98,20 +98,21 @@ fn main() -> Result<()> {
     }
 
     // Load manifest
-    let manifest_content = fs::read_to_string(&args.manifest)
-        .context("Failed to read manifest file")?;
+    let manifest_content =
+        fs::read_to_string(&args.manifest).context("Failed to read manifest file")?;
 
-    let manifest: Manifest = serde_json::from_str(&manifest_content)
-        .context("Failed to parse manifest JSON")?;
+    let manifest: Manifest =
+        serde_json::from_str(&manifest_content).context("Failed to parse manifest JSON")?;
 
     if !args.quiet {
-        info!("Fetching artifacts from manifest v{} ({}/{})",
-              manifest.manifest_version, manifest.channel, manifest.arch);
+        info!(
+            "Fetching artifacts from manifest v{} ({}/{})",
+            manifest.manifest_version, manifest.channel, manifest.arch
+        );
     }
 
     // Create output directory
-    fs::create_dir_all(&args.output)
-        .context("Failed to create output directory")?;
+    fs::create_dir_all(&args.output).context("Failed to create output directory")?;
 
     // Determine which artifacts to fetch
     let artifacts_to_fetch = match args.artifact.to_lowercase().as_str() {
@@ -119,7 +120,12 @@ fn main() -> Result<()> {
         "kernel" => vec!["kernel"],
         "initramfs" => vec!["initramfs"],
         "rootfs" => vec!["rootfs"],
-        other => return Err(anyhow!("Unknown artifact: {}. Use: kernel, initramfs, rootfs, or all", other)),
+        other => {
+            return Err(anyhow!(
+                "Unknown artifact: {}. Use: kernel, initramfs, rootfs, or all",
+                other
+            ))
+        }
     };
 
     // Fetch each artifact
@@ -136,14 +142,21 @@ fn main() -> Result<()> {
 
         let Some(artifact) = artifact else {
             if !args.quiet {
-                warn!("Artifact {} not present in manifest, skipping", artifact_name);
+                warn!(
+                    "Artifact {} not present in manifest, skipping",
+                    artifact_name
+                );
             }
             continue;
         };
 
         if !args.quiet {
-            info!("Fetching {} ({} bytes, hash: {}...)",
-                  artifact_name, artifact.size, &artifact.hash[..16]);
+            info!(
+                "Fetching {} ({} bytes, hash: {}...)",
+                artifact_name,
+                artifact.size,
+                &artifact.hash[..16]
+            );
         }
 
         match fetch_artifact(
@@ -175,10 +188,12 @@ fn main() -> Result<()> {
     if !args.quiet {
         info!("All artifacts fetched successfully:");
         for result in &results {
-            info!("  {} -> {} ({} bytes)",
-                  result.artifact_name,
-                  result.output_path.display(),
-                  result.size);
+            info!(
+                "  {} -> {} ({} bytes)",
+                result.artifact_name,
+                result.output_path.display(),
+                result.size
+            );
         }
     }
 
@@ -203,10 +218,22 @@ fn fetch_artifact(
     for (url_idx, url) in artifact.urls.iter().enumerate() {
         for attempt in 0..retry_count {
             if !quiet && attempt > 0 {
-                info!("  Retry {}/{} for URL {}", attempt + 1, retry_count, url_idx + 1);
+                info!(
+                    "  Retry {}/{} for URL {}",
+                    attempt + 1,
+                    retry_count,
+                    url_idx + 1
+                );
             }
 
-            match download_and_verify(url, &artifact.hash, artifact.size, &output_path, timeout_secs, quiet) {
+            match download_and_verify(
+                url,
+                &artifact.hash,
+                artifact.size,
+                &output_path,
+                timeout_secs,
+                quiet,
+            ) {
                 Ok(_) => {
                     // Write hash file
                     fs::write(&hash_path, &artifact.hash)
@@ -235,7 +262,10 @@ fn fetch_artifact(
 
         // If we get here, all retries for this URL failed
         if !quiet && url_idx < artifact.urls.len() - 1 {
-            warn!("  All retries failed for URL {}, trying next URL", url_idx + 1);
+            warn!(
+                "  All retries failed for URL {}, trying next URL",
+                url_idx + 1
+            );
         }
     }
 
@@ -265,10 +295,7 @@ fn download_and_verify(
         info!("  Downloading from {}...", url);
     }
 
-    let mut response = client
-        .get(url)
-        .send()
-        .context("HTTP request failed")?;
+    let mut response = client.get(url).send().context("HTTP request failed")?;
 
     if !response.status().is_success() {
         return Err(anyhow!("HTTP error: {}", response.status()));
@@ -286,14 +313,14 @@ fn download_and_verify(
     }
 
     // Download with progress indication
-    let mut file = File::create(&temp_path)
-        .context("Failed to create temporary file")?;
+    let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
     let mut hasher = Sha256::new();
     let mut total_bytes = 0u64;
     let mut buffer = [0u8; 8192];
 
     loop {
-        let bytes_read = response.read(&mut buffer)
+        let bytes_read = response
+            .read(&mut buffer)
             .context("Failed to read response")?;
 
         if bytes_read == 0 {
@@ -311,8 +338,7 @@ fn download_and_verify(
         }
     }
 
-    file.flush()
-        .context("Failed to flush file")?;
+    file.flush().context("Failed to flush file")?;
     drop(file);
 
     // Verify size
@@ -341,8 +367,7 @@ fn download_and_verify(
     }
 
     // Move to final location
-    fs::rename(&temp_path, output_path)
-        .context("Failed to move file to final location")?;
+    fs::rename(&temp_path, output_path).context("Failed to move file to final location")?;
 
     Ok(())
 }

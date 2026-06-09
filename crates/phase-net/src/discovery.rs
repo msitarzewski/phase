@@ -21,8 +21,8 @@ use futures::StreamExt;
 use libp2p::{
     identity::Keypair,
     kad::{
-        store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent,
-        GetRecordOk, Mode as KademliaMode, QueryId, QueryResult,
+        store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent, GetRecordOk,
+        Mode as KademliaMode, QueryId, QueryResult,
     },
     mdns,
     request_response::{self, cbor, json, OutboundRequestId, ProtocolSupport, ResponseChannel},
@@ -64,8 +64,7 @@ pub type JobRelayHandler = std::sync::Arc<
     dyn Fn(
             PeerId,
             Vec<u8>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = JobRelayResponse> + Send>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = JobRelayResponse> + Send>>
         + Send
         + Sync
         + 'static,
@@ -190,7 +189,9 @@ enum Command {
     /// `JobRelayRequest`s. The default — no handler — refuses every
     /// inbound relay request with a structured "no handler" reason so a
     /// daemon that never wired one in fails closed.
-    SetJobRelayHandler { handler: Option<JobRelayHandler> },
+    SetJobRelayHandler {
+        handler: Option<JobRelayHandler>,
+    },
 }
 
 /// Peer discovery service. Owns no swarm directly — instead holds a handle
@@ -510,11 +511,7 @@ impl Discovery {
     ///
     /// Returns an error if the peer is unreachable, the request times out,
     /// or the response fails to deserialize.
-    pub async fn send_job_offer(
-        &self,
-        peer: PeerId,
-        offer: JobOffer,
-    ) -> Result<JobResponse> {
+    pub async fn send_job_offer(&self, peer: PeerId, offer: JobOffer) -> Result<JobResponse> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::SendJobOffer {
@@ -592,7 +589,10 @@ impl Discovery {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(Command::EvaluateOffer { offer: offer.clone(), reply: tx })
+            .send(Command::EvaluateOffer {
+                offer: offer.clone(),
+                reply: tx,
+            })
             .await
             .is_err()
         {
@@ -718,10 +718,7 @@ impl Driver {
                         Ok(())
                     }
                     Err(e) => {
-                        warn!(
-                            "DHT bootstrap failed (normal for standalone nodes): {}",
-                            e
-                        );
+                        warn!("DHT bootstrap failed (normal for standalone nodes): {}", e);
                         warn!("Node will wait for incoming connections or manual peer additions");
                         info!("mDNS is active for local network peer discovery");
                         Ok(()) // Not fatal.
@@ -776,7 +773,11 @@ impl Driver {
                 })();
                 let _ = reply.send(res);
             }
-            Command::DiscoverPeers { arch, kind_label, reply } => {
+            Command::DiscoverPeers {
+                arch,
+                kind_label,
+                reply,
+            } => {
                 use libp2p::kad::RecordKey;
                 let capability_key = format!("/phase/capability/{}/{}", arch, kind_label);
                 let key = RecordKey::new(&capability_key.as_bytes());
@@ -800,8 +801,7 @@ impl Driver {
             Command::GetKadRecord { key, reply } => {
                 use libp2p::kad::RecordKey;
                 let record_key = RecordKey::new(&key);
-                let query_id =
-                    self.swarm.behaviour_mut().kademlia.get_record(record_key);
+                let query_id = self.swarm.behaviour_mut().kademlia.get_record(record_key);
                 self.pending_get_records.insert(
                     query_id,
                     PendingGetRecord {
@@ -822,7 +822,11 @@ impl Driver {
                 let response = self.evaluate_offer(offer);
                 let _ = reply.send(response);
             }
-            Command::SendJobRelay { peer, request, reply } => {
+            Command::SendJobRelay {
+                peer,
+                request,
+                reply,
+            } => {
                 let req_id = self
                     .swarm
                     .behaviour_mut()
@@ -836,10 +840,7 @@ impl Driver {
         }
     }
 
-    async fn handle_swarm_event(
-        &mut self,
-        event: SwarmEvent<CombinedBehaviourEvent>,
-    ) {
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<CombinedBehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(CombinedBehaviourEvent::Kademlia(kad)) => {
                 self.handle_kad_event(kad);
@@ -965,10 +966,7 @@ impl Driver {
         }
     }
 
-    fn handle_job_offer_event(
-        &mut self,
-        event: request_response::Event<JobOffer, JobResponse>,
-    ) {
+    fn handle_job_offer_event(&mut self, event: request_response::Event<JobOffer, JobResponse>) {
         use request_response::{Event, Message};
         match event {
             Event::Message { message, .. } => match message {

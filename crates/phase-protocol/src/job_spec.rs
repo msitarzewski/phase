@@ -44,9 +44,10 @@ pub enum JobSpec {
     Wasm(WasmJobSpec),
     /// A model inference request — LUCID's domain.
     Inference(InferenceJobSpec),
+    /// An embedding request — LUCID's domain (produces a vector, not tokens).
+    Embedding(EmbeddingJobSpec),
     // Future variants slot in here. Examples that have been considered:
     //   ImageGen(ImageGenJobSpec),
-    //   Embedding(EmbeddingJobSpec),
     //   FineTune(FineTuneJobSpec),
     //   Render(RenderJobSpec),
     //   Science(ScienceJobSpec),
@@ -59,6 +60,7 @@ impl JobSpec {
         match self {
             JobSpec::Wasm(_) => JobSpecKind::Wasm,
             JobSpec::Inference(_) => JobSpecKind::Inference,
+            JobSpec::Embedding(_) => JobSpecKind::Embedding,
         }
     }
 }
@@ -75,6 +77,7 @@ impl JobSpec {
 pub enum JobSpecKind {
     Wasm,
     Inference,
+    Embedding,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +161,24 @@ pub struct InferenceJobSpec {
 
 fn default_true() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddingJobSpec
+// ---------------------------------------------------------------------------
+
+/// LUCID's embedding workload. Mirrors the Ollama /api/embed request:
+/// one or more input strings, each mapped to an embedding vector by the
+/// worker. The vector rides back as "embedding"-kind OutputChunks (see
+/// the worker docs), so the existing commitment/receipt machinery covers
+/// it without a new JobResult shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingJobSpec {
+    /// Content-address (or human alias resolved to one) of the model.
+    pub model_cid: String,
+    /// One or more input strings to embed.
+    #[serde(default)]
+    pub input: Vec<String>,
 }
 
 /// A chat-style message. Mirrors the Ollama `/api/chat` request shape so the

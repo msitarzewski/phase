@@ -60,7 +60,9 @@ impl BlobId {
     /// Relative path of this blob under the artifacts root:
     /// `blobs/<aa>/<full_hex>.bin`.
     pub fn relative_path(&self) -> PathBuf {
-        PathBuf::from("blobs").join(self.prefix()).join(format!("{}.bin", self.0))
+        PathBuf::from("blobs")
+            .join(self.prefix())
+            .join(format!("{}.bin", self.0))
     }
 }
 
@@ -123,7 +125,10 @@ impl ArtifactStore {
     pub fn get_artifact_path(&self, channel: &str, arch: &str, name: &str) -> Option<PathBuf> {
         if !Self::is_valid_name(channel) || !Self::is_valid_name(arch) || !Self::is_valid_name(name)
         {
-            warn!("Invalid artifact path components: {}/{}/{}", channel, arch, name);
+            warn!(
+                "Invalid artifact path components: {}/{}/{}",
+                channel, arch, name
+            );
             return None;
         }
 
@@ -252,8 +257,7 @@ impl ArtifactStore {
         fs::create_dir_all(&dir)
             .with_context(|| format!("create channel artifact dir {:?}", dir))?;
         let path = dir.join(filename);
-        fs::write(&path, content)
-            .with_context(|| format!("write channel artifact {:?}", path))?;
+        fs::write(&path, content).with_context(|| format!("write channel artifact {:?}", path))?;
 
         let hash = format!("sha256:{}", BlobId::from_content(content).as_str());
         if let Ok(mut cache) = self.hash_cache.write() {
@@ -450,7 +454,9 @@ mod tests {
     #[test]
     fn test_path_traversal_prevention() {
         let (_temp, store) = setup_test_store();
-        assert!(store.get_artifact_path("../etc", "passwd", "file").is_none());
+        assert!(store
+            .get_artifact_path("../etc", "passwd", "file")
+            .is_none());
         assert!(store
             .get_artifact_path("stable", "arm64", "../../../etc/passwd")
             .is_none());
@@ -503,19 +509,17 @@ mod tests {
         let rel = id.relative_path();
         let rel_str = rel.to_string_lossy();
         assert!(rel_str.starts_with("blobs/b9/"));
-        assert!(rel_str.ends_with(
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9.bin"
-        ));
+        assert!(rel_str
+            .ends_with("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9.bin"));
     }
 
     #[test]
     fn test_blob_id_from_hex_rejects_invalid() {
         assert!(BlobId::from_hex("not-hex").is_none());
         assert!(BlobId::from_hex("abcdef").is_none()); // too short
-        let valid = BlobId::from_hex(
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-        )
-        .unwrap();
+        let valid =
+            BlobId::from_hex("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+                .unwrap();
         assert_eq!(valid.prefix(), "b9");
     }
 

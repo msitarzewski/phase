@@ -7,13 +7,13 @@
 //!   phase-verify --manifest manifest.json
 //!   phase-verify --manifest manifest.json --key targets.pub --check-version /cache/version
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use clap::Parser;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use clap::Parser;
-use serde::{Deserialize, Serialize};
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-use sha2::{Sha256, Digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -133,8 +133,10 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to parse manifest: {}", e))?;
 
     if !args.quiet {
-        info!("Verifying manifest v{} ({}/{})",
-              manifest.manifest_version, manifest.channel, manifest.arch);
+        info!(
+            "Verifying manifest v{} ({}/{})",
+            manifest.manifest_version, manifest.channel, manifest.arch
+        );
     }
 
     // Check rollback protection
@@ -165,8 +167,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load verification key
     let key_bytes = if let Some(key_path) = &args.key {
-        fs::read(key_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read key file: {}", e))?
+        fs::read(key_path).map_err(|e| anyhow::anyhow!("Failed to read key file: {}", e))?
     } else {
         // Use embedded key
         if EMBEDDED_ROOT_KEY.is_empty() || EMBEDDED_ROOT_KEY == b"PLACEHOLDER" {
@@ -268,7 +269,8 @@ fn parse_public_key(bytes: &[u8]) -> anyhow::Result<VerifyingKey> {
     let hex_str = hex_str.trim();
     if hex_str.len() == 64 {
         let decoded = hex::decode(hex_str)?;
-        let key_bytes: [u8; 32] = decoded.try_into()
+        let key_bytes: [u8; 32] = decoded
+            .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
         return Ok(VerifyingKey::from_bytes(&key_bytes)?);
     }
@@ -276,13 +278,16 @@ fn parse_public_key(bytes: &[u8]) -> anyhow::Result<VerifyingKey> {
     // Try as base64
     if let Ok(decoded) = BASE64.decode(hex_str.as_bytes()) {
         if decoded.len() == 32 {
-            let key_bytes: [u8; 32] = decoded.try_into()
+            let key_bytes: [u8; 32] = decoded
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
             return Ok(VerifyingKey::from_bytes(&key_bytes)?);
         }
     }
 
-    Err(anyhow::anyhow!("Could not parse public key (expected 32 bytes raw, 64 hex chars, or base64)"))
+    Err(anyhow::anyhow!(
+        "Could not parse public key (expected 32 bytes raw, 64 hex chars, or base64)"
+    ))
 }
 
 /// Verify Ed25519 signature
@@ -296,7 +301,8 @@ fn verify_signature(data_b64: &str, sig_b64: &str, key: &VerifyingKey) -> anyhow
         return Err(anyhow::anyhow!("Invalid signature length"));
     }
 
-    let sig_array: [u8; 64] = sig_bytes.try_into()
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
     let signature = Signature::from_bytes(&sig_array);
 

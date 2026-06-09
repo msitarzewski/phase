@@ -29,7 +29,7 @@ use phase_identity::{default_identity_path, NodeIdentity};
 use phase_net::{Discovery, DiscoveryConfig};
 use phase_protocol::DynWorker;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum WorkerChoice {
     /// In-tree EchoWorker. No GPU required; reverses your message.
     Echo,
@@ -163,9 +163,7 @@ fn validate_bootstrap_multiaddr(raw: &str) -> Option<String> {
     // Require a `/p2p/<non-empty>` segment. Split on `/` and look for a
     // `p2p` token immediately followed by a non-empty value.
     let segs: Vec<&str> = s.split('/').collect();
-    let has_pinned_peer = segs
-        .windows(2)
-        .any(|w| w[0] == "p2p" && !w[1].is_empty());
+    let has_pinned_peer = segs.windows(2).any(|w| w[0] == "p2p" && !w[1].is_empty());
     if !has_pinned_peer {
         return None;
     }
@@ -401,8 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Model registry, backed by phase-net's Kademlia DHT.
-    let transport: Arc<dyn DhtTransport> =
-        Arc::new(PhaseNetDhtTransport::new(discovery.clone()));
+    let transport: Arc<dyn DhtTransport> = Arc::new(PhaseNetDhtTransport::new(discovery.clone()));
     let registry = Arc::new(ModelRegistry::new(node_identity.clone(), transport));
 
     // Operator policy. The engine seeds `~/.config/lucidd/policy.toml`
@@ -454,16 +451,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // inherited `$PATH` — a binary-hijack vector. Canonicalize
                 // it (which also fails fast if it's missing) and require the
                 // result to be absolute so the spawn never PATH-resolves.
-                let server_binary_path = cli
-                    .llama_server_binary
-                    .canonicalize()
-                    .map_err(|e| {
-                        format!(
-                            "--llama-server-binary {:?} must be an existing, absolute path \
+                let server_binary_path = cli.llama_server_binary.canonicalize().map_err(|e| {
+                    format!(
+                        "--llama-server-binary {:?} must be an existing, absolute path \
                              (PATH-resolved defaults are rejected for security): {e}",
-                            cli.llama_server_binary
-                        )
-                    })?;
+                        cli.llama_server_binary
+                    )
+                })?;
                 if !server_binary_path.is_absolute() {
                     return Err(format!(
                         "--llama-server-binary resolved to a non-absolute path: {}",
@@ -546,9 +540,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let client_identity = NodeIdentity::generate();
+    // Model directory exposed to /api/pull so it can confirm a GGUF is present
+    // before registering it. Only meaningful in llama-cpp mode with a local
+    // worker; echo / consume-only nodes have nothing to pull (`None`).
+    let app_model_dir = if local_worker.is_some() && cli.worker == WorkerChoice::LlamaCpp {
+        cli.model_dir.clone()
+    } else {
+        None
+    };
     let state = AppState {
         router,
         client_identity,
+        registry: registry.clone(),
+        model_dir: app_model_dir,
     };
     let app = ollama_router(state);
 
@@ -579,10 +583,7 @@ mod tests {
     #[test]
     fn validate_rejects_missing_p2p_pin() {
         // SEC-09: multiaddr shape but no /p2p/<id> → rejected.
-        assert_eq!(
-            validate_bootstrap_multiaddr("/ip4/1.2.3.4/tcp/4001"),
-            None
-        );
+        assert_eq!(validate_bootstrap_multiaddr("/ip4/1.2.3.4/tcp/4001"), None);
         // /p2p present but empty value → rejected.
         assert_eq!(
             validate_bootstrap_multiaddr("/ip4/1.2.3.4/tcp/4001/p2p/"),

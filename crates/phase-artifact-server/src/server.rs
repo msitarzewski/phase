@@ -378,10 +378,7 @@ async fn serve_artifact_with_range(
                     Ok(f) => f,
                     Err(e) => {
                         warn!("Error opening artifact file {:?}: {}", meta.path, e);
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to open artifact",
-                        ));
+                        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to open artifact"));
                     }
                 };
 
@@ -420,8 +417,7 @@ async fn serve_artifact_with_range(
                     HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, file_size))
                         .unwrap(),
                 );
-                response_headers
-                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 response_headers.insert(
                     HeaderName::from_static("x-artifact-hash"),
                     HeaderValue::from_str(&meta.hash).unwrap(),
@@ -440,8 +436,7 @@ async fn serve_artifact_with_range(
                     header::CONTENT_RANGE,
                     HeaderValue::from_str(&format!("bytes */{}", file_size)).unwrap(),
                 );
-                response_headers
-                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
                 let mut response = Response::new(Body::empty());
                 *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -454,10 +449,7 @@ async fn serve_artifact_with_range(
             Ok(f) => f,
             Err(e) => {
                 warn!("Error opening artifact file {:?}: {}", meta.path, e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to open artifact",
-                ));
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to open artifact"));
             }
         };
 
@@ -468,8 +460,7 @@ async fn serve_artifact_with_range(
 
         use axum::http::header::{HeaderName, HeaderValue};
         let mut response_headers = HeaderMap::new();
-        response_headers
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
         response_headers.insert(
             header::CONTENT_LENGTH,
             HeaderValue::from_str(&meta.size_bytes.to_string()).unwrap(),
@@ -495,14 +486,20 @@ async fn artifact_handler(
     info!("Artifact request: {}/{}/{}", channel, arch, artifact);
     state.metrics.increment_requests();
 
-    let meta = match state.artifact_store.get_artifact(&channel, &arch, &artifact) {
+    let meta = match state
+        .artifact_store
+        .get_artifact(&channel, &arch, &artifact)
+    {
         Ok(Some(m)) => m,
         Ok(None) => {
             warn!("Artifact not found: {}/{}/{}", channel, arch, artifact);
             return Err((StatusCode::NOT_FOUND, "Artifact not found"));
         }
         Err(e) => {
-            warn!("Error getting artifact {}/{}/{}: {}", channel, arch, artifact, e);
+            warn!(
+                "Error getting artifact {}/{}/{}: {}",
+                channel, arch, artifact, e
+            );
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"));
         }
     };
@@ -587,10 +584,7 @@ async fn manifest_handler(
     let manifest = provider.manifest(&channel, &arch).map_err(|e| {
         warn!("Error generating manifest for {}/{}: {}", channel, arch, e);
         if e.to_string().contains("No artifacts found") {
-            (
-                StatusCode::NOT_FOUND,
-                "No artifacts found for channel/arch",
-            )
+            (StatusCode::NOT_FOUND, "No artifacts found for channel/arch")
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -808,21 +802,37 @@ mod tests {
 
         let expected_len = end - start + 1;
         assert_eq!(
-            resp.headers().get("content-length").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             expected_len.to_string()
         );
         assert_eq!(
-            resp.headers().get("content-range").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             format!("bytes {start}-{end}/{total}")
         );
         assert_eq!(
-            resp.headers().get("accept-ranges").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "bytes"
         );
 
         let body = resp.bytes().await.unwrap();
         assert_eq!(body.len(), expected_len, "streamed body length");
-        assert_eq!(&body[..], &payload[start..=end], "streamed bytes byte-exact");
+        assert_eq!(
+            &body[..],
+            &payload[start..=end],
+            "streamed bytes byte-exact"
+        );
 
         handle.abort();
     }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::wasm::receipt::Receipt;
-use crate::wasm::runtime::{WasmRuntime, Wasm3Runtime};
+use crate::wasm::runtime::{Wasm3Runtime, WasmRuntime};
 // JobRequest / JobResult moved to phase-net::protocol in M2; the network
 // shim re-exports them so the rest of the daemon doesn't notice.
 use super::protocol::{JobRequest, JobResult};
@@ -23,10 +23,14 @@ impl ExecutionHandler {
 
     /// Execute a job request and return the result
     pub async fn execute_job(&self, request: JobRequest) -> Result<JobResult> {
-        info!("Executing job: {} (hash: {})", request.job_id, request.module_hash);
+        info!(
+            "Executing job: {} (hash: {})",
+            request.job_id, request.module_hash
+        );
 
         // Validate request
-        request.validate()
+        request
+            .validate()
             .map_err(|e| anyhow::anyhow!("Job request validation failed: {}", e))?;
 
         // Verify module hash
@@ -46,13 +50,15 @@ impl ExecutionHandler {
         debug!("Module hash verified: {}", computed_hash);
 
         // Execute WASM in sandbox
-        let runtime = Wasm3Runtime::new()
-            .with_memory_limit(request.requirements.memory_mb * 1024 * 1024);
+        let runtime =
+            Wasm3Runtime::new().with_memory_limit(request.requirements.memory_mb * 1024 * 1024);
 
         let args_refs: Vec<&str> = request.args.iter().map(|s| s.as_str()).collect();
 
         let timeout = Duration::from_secs(request.requirements.timeout_seconds);
-        let exec_result = runtime.execute_with_timeout(&request.wasm_bytes, &args_refs, timeout).await
+        let exec_result = runtime
+            .execute_with_timeout(&request.wasm_bytes, &args_refs, timeout)
+            .await
             .context("WASM execution failed")?;
 
         info!(
@@ -67,10 +73,12 @@ impl ExecutionHandler {
             exec_result.wall_time_ms,
         );
 
-        receipt.sign(&self.signing_key)
+        receipt
+            .sign(&self.signing_key)
             .map_err(|e| anyhow::anyhow!("Failed to sign receipt: {}", e))?;
 
-        let receipt_json = receipt.to_json()
+        let receipt_json = receipt
+            .to_json()
             .map_err(|e| anyhow::anyhow!("Failed to serialize receipt: {}", e))?;
 
         debug!("Receipt signed with pubkey: {}", receipt.node_pubkey);
@@ -101,8 +109,8 @@ impl ExecutionHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::JobRequirements;
+    use super::*;
     use rand::RngCore;
 
     fn generate_signing_key() -> SigningKey {
