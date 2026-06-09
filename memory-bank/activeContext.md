@@ -1,8 +1,8 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2026-05-31
-**Sprint**: Security hardening SHIPPED TO PRODUCTION; next thread open
-**Status**: Phase Core + LUCID software complete + two-node demo proven; security hardening (PR #9) merged to `main` and deployed live to the umbp relay. `scratch` clean-room build VM standing. Next focus undecided (options at bottom).
+**Last Updated**: 2026-06-09
+**Sprint**: LUCID v0.1.1 gap-closure SHIPPED (PR #10); deploy + demo follow-on in progress
+**Status**: Phase Core + LUCID software complete; security hardening (PR #9) live on the umbp relay; **v0.1.1 gaps (embeddings, multi-peer retry, self-traffic policy, `/api/pull` stub) merged to `main` (PR #10, `14ae8d6`)** and validated on `scratch`. Follow-on: docs (this update), umbp redeploy, authz demo.
 
 ---
 
@@ -67,11 +67,17 @@ Three dependency advisories documented-and-accepted (upstream-pinned hickory via
 
 **Final gate:** 246 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns, `cargo deny check` ok. **MERGED (PR #9, `73fa907`) and deployed live — see the "SHIPPED TO PRODUCTION" header above.**
 
-## Next Thread (OPEN — undecided as of 2026-05-31)
+## v0.1.1 gap-closure SHIPPED (PR #10, merged `14ae8d6`, 2026-06-09)
 
-Security is shipped and live; no forced next step. Candidate threads, roughly by leverage:
+`/api/embed` + legacy `/api/embeddings`, multi-peer relay failover (`RouteDecision.fallback_peers`), self-traffic policy path (`should_serve_self` — bypasses donation-protection gates, honors only `manual_pause`), `/api/pull` stub (registers an already-present local GGUF; network pull + content CIDs are v0.2), and the corrected `find_peers_by_model_id` docstring. Embeddings ride the existing `OutputChunk` commitment/receipt machinery (no new `JobResult`); SEC-05 verify+bind covers embedding relays unchanged. 263 tests / clippy `-D warnings` / `cargo audit` 0 vulns; validated live on `scratch`. See `tasks/2026-06/260609_lucid-v0.1.1-gaps.md` + `decisions.md` 2026-06-09.
 
-- **LUCID v0.1.1 feature gaps:** `/api/embeddings`, `/api/pull`, multi-peer retry on first-peer failure, cross-peer name→CID registry (today a consume-only node can only route a model it knows the name of). `scratch` is the clean test target; Mac M5 Max for GPU/inference.
+**Post-merge (2026-06-09):** umbp relay redeployed to v0.1.1 (x86_64 cross-build, peer-id `12D3KooWJ6vTjo6yFgEc…` preserved, old binary backed up `~/bin/lucidd.pre-v0.1.1`). Two-node authz demo run on `scratch` (default-deny reject → escape-hatch accept w/ `receipt-verified: true`). Demo surfaced + fixed two latent bugs on branch **`lucid-sec05-receipt-binding`** (workers now sign receipts with the node identity → SEC-05 peer-receipt binding actually works; echo model advertised under `from_model_id` → cross-peer discoverable). Deferred: policy notify-watcher dir-scope reload loop (see `decisions.md` 2026-06-09).
+
+## Next Thread (OPEN — undecided as of 2026-06-09)
+
+v0.1.1 is shipped; no forced next step. Candidate threads, roughly by leverage:
+
+- **Remaining LUCID gaps:** real network `/api/pull` (content-hashed CIDs), token streaming over the relay, a content-hashed cross-peer name→CID index (today the deterministic `from_model_id` placeholder stands in). All v0.2-flavored. `scratch` is the clean test target; Mac M5 Max for GPU/real-embedding-model validation.
 - **Reach / "anyone, anywhere":** make `--bootstrap-dns` the default for fresh installs; stand up 2-3 more geographically-distributed foundation relays (Hetzner CAX11s ~$4/mo); the consumer install page at `phasebased.com` (mom-language one-liner).
 - **v0.2 frontier:** `ShardWorker` sharded inference (was `ExoProxyWorker` — renamed off the "exo" trademark, can still *proxy to* exo clusters per nominative fair use) — gated on the **partial-compute verification open problem** (recorded in `decisions.md` 2026-05-29; redundant-execution + reputation spot-checking is the likely answer). Flipping the authz default to open is in-scope for this milestone (see [[authz-default-flip-trigger]]).
 - **LUMEN:** stand up the diffusion-node skeleton against the substrate — proves the second flagship compiles, validates the workload-agnostic bet. Post-v0.1.

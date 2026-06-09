@@ -421,9 +421,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // about the weights). Advertise a synthetic "echo"
                 // entry in the registry so the router's "local has
                 // model" check resolves on common Ollama CLI calls.
+                //
+                // CID is derived via `from_model_id("echo")` — the SAME
+                // derivation every name→CID resolution path uses
+                // (`registry::find_peers_by_model_id`, the llama-cpp
+                // auto-advertise loop). A hardcoded all-zeros CID here made
+                // the echo model undiscoverable cross-peer: a consume-only
+                // node looking up "echo" computes `from_model_id("echo")`
+                // and never matched the `[0u8; 32]` advertisement.
                 let caps = lucidd::ModelCapabilities::now(
                     "echo",
-                    lucidd::ModelCid([0u8; 32]),
+                    lucidd::ModelCid::from_model_id("echo"),
                     "none",
                     8192,
                     16,
@@ -432,7 +440,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = registry.advertise_loaded(caps).await {
                     tracing::warn!(error = %e, "failed to advertise synthetic echo entry");
                 }
-                Some(Arc::new(EchoWorker::new()) as Arc<dyn DynWorker>)
+                // SEC-05: the worker signs receipts, and a peer verifying a
+                // relayed receipt binds `worker_pubkey -> delivering PeerId`.
+                // So the worker MUST sign with THIS node's identity (the same
+                // key its libp2p PeerId derives from) — a random worker key
+                // would make every peer-served receipt fail the bind check.
+                Some(Arc::new(EchoWorker {
+                    identity: node_identity.clone(),
+                    ..EchoWorker::new()
+                }) as Arc<dyn DynWorker>)
             }
             WorkerChoice::LlamaCpp => {
                 let model_dir = cli
@@ -514,7 +530,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 };
                 tracing::info!(?config, "worker: llama-cpp");
-                let worker_identity = NodeIdentity::generate();
+                // SEC-05: sign receipts with THIS node's identity so a peer
+                // verifying a relayed receipt can bind worker_pubkey -> our
+                // PeerId (a random key would fail that bind). See the echo arm.
+                let worker_identity = node_identity.clone();
                 Some(Arc::new(LlamaCppWorker::new(worker_identity, config)) as Arc<dyn DynWorker>)
             }
         }
