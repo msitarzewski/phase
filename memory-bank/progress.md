@@ -1,8 +1,8 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-05-27
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID M1-M7 software (May 2026)
-**Phase**: Plasm repositioned as `crates/plasm/`; daemon/ removed; LUCID software complete; M8 hardware-blocked.
+**Last Updated**: 2026-06-09
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1 + security hardening + v0.1.1 (PRs #10–#13)
+**Phase**: Phase Core complete; LUCID v0.1 functional + security-hardened + live on the umbp foundation relay; v0.1.1 gaps shipped and validated on real hardware (GPU embeddings, two-node authz demo). `main` @ `0aefbb2`.
 
 ---
 
@@ -149,6 +149,31 @@ A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of fil
 Three dependency advisories documented-and-accepted (`.cargo/audit.toml` + `deny.toml`): 2 hickory-proto reachable only via libp2p-mdns (upstream-pinned, link-local path, no DNSSEC); 1 nix compiled only on freebsd/dragonfly (never built on our targets).
 
 See [memory-bank/plans/security-hardening/](plans/security-hardening/) for the full plan + per-task files.
+
+---
+
+### LUCID v0.1.1 SHIPPED (2026-06-09; PRs #10–#13 merged to `main` `0aefbb2`, umbp redeployed)
+
+The post-security gap-closure sprint. Closed the v0.1.1 feature gaps, then validated on real hardware — which surfaced and fixed three latent bugs the unit tests couldn't see.
+
+| PR | What | Notes |
+|---|---|---|
+| **#10** | v0.1.1 gaps | `/api/embed` + legacy `/api/embeddings`; multi-peer relay failover (`RouteDecision.fallback_peers`); self-traffic policy (`should_serve_self` — bypasses donation-protection gates, honors only `manual_pause`); `/api/pull` stub (registers a local GGUF); `JobSpec::Embedding` rides the existing `OutputChunk` commitment/receipt machinery (no new `JobResult`); corrected `find_peers_by_model_id` docstring. |
+| **#11** | SEC-05 binding made real | Workers now sign receipts with the **node identity** (was a random key → the `worker_pubkey → PeerId` bind always failed, so peer `X-Lucid-Receipt-Verified` could never be `true`). Echo model advertised under `from_model_id` → cross-peer discoverable. Found via the authz demo. |
+| **#12** | notify-watcher scoped to the config file | The policy watcher watched the config's *parent dir* and reload-looped on any file change there (~64k/s when a log shared the dir). Now filters events to the config file. Found via the authz demo. |
+| **#13** | llama nested `/embedding` parse | The native `llama-server` `/embedding` wraps the pooled vector as `[[...]]`; the parser expected a flat array and returned **zero** vectors. Found via real-GPU validation. |
+
+**Validated on real hardware (2026-06-09):**
+- `scratch` (ARM64): build + tests + live `/api/embed`·`/api/embeddings`·`/api/pull` against the echo worker.
+- M5 Max (Apple Metal): real embeddings via `llama-server --embeddings` + `nomic-embed-text-v1.5` — `/api/embed` → 768-dim vectors, correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
+- Two-node authz demo (`scratch`): default-deny **rejects** an unauthorized routed job; escape hatch **accepts** + routes (`X-Lucid-Routed-Via: peer:…`) + `X-Lucid-Receipt-Verified: true`.
+- **umbp relay redeployed** to `0aefbb2` (x86_64 cross-build, peer id `12D3KooWJ6vTjo6yFgEc…` preserved, old binary backed up).
+
+**Final gate:** 266 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulnerabilities, `cargo deny check` ok.
+
+**Deferred (documented):** `--identity-path` under `/tmp` on macOS fails SEC-08's atomic key write (edge case; keys normally live in `~/.config`). v0.2 items unchanged — real network `/api/pull` with content CIDs, token-streaming over the relay, cross-peer content-hashed name index, reputation-hardened receipts, ShardWorker.
+
+See [tasks/2026-06/260609_lucid-v0.1.1-gaps.md](tasks/2026-06/260609_lucid-v0.1.1-gaps.md) and `decisions.md` (2026-06-09).
 
 ---
 

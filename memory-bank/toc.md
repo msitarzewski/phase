@@ -1,15 +1,17 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2025-11-26
-**Version**: 0.2
+**Last Updated**: 2026-06-09
+**Version**: 0.3
 
 ---
 
 ## Overview
 
-This Memory Bank contains all project knowledge, decisions, patterns, and progress tracking for Phase development (MVP + Phase Boot).
+This Memory Bank contains all project knowledge, decisions, patterns, and progress tracking for Phase development: the November 2025 MVP + Phase Boot, the May 2026 Phase Core extraction + LUCID flagship, security hardening, and LUCID v0.1.1.
 
 **Navigation**: This TOC is your starting point. Jump to specific files based on what you need.
+
+**Most current state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md) (both refreshed 2026-06-09). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, and `tasks/2026-06/`. Release plans are in `releases/phase-core/` and `releases/lucid/`. (The per-file "Last Updated" dates in the table below predate the May/June work — treat activeContext.md/progress.md as authoritative for current state.)
 
 ---
 

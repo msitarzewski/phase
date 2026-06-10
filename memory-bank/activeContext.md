@@ -1,14 +1,14 @@
 # Active Context: Current Sprint
 
 **Last Updated**: 2026-06-09
-**Sprint**: LUCID v0.1.1 gap-closure SHIPPED (PR #10); deploy + demo follow-on in progress
-**Status**: Phase Core + LUCID software complete; security hardening (PR #9) live on the umbp relay; **v0.1.1 gaps (embeddings, multi-peer retry, self-traffic policy, `/api/pull` stub) merged to `main` (PR #10, `14ae8d6`)** and validated on `scratch`. Follow-on: docs (this update), umbp redeploy, authz demo.
+**Sprint**: LUCID v0.1.1 SHIPPED + validated on real hardware; follow-on fixes merged; umbp current
+**Status**: Phase Core + LUCID v0.1 complete + security-hardened + live on the umbp foundation relay. **PRs #10–#13 merged to `main` (`0aefbb2`)**: v0.1.1 gaps (embeddings, multi-peer retry, self-traffic policy, `/api/pull` stub) + SEC-05 receipt binding made real + echo cross-peer discoverability + notify-watcher scoped-to-file + llama nested-`/embedding` parse. Validated on `scratch` (ARM64) and the M5 Max (real GPU embeddings via `nomic-embed`); authz demo run; **umbp redeployed to `0aefbb2`, peer-id preserved**. 266 tests / clippy `-D warnings` / `cargo audit` 0 vulns. README + Memory Bank refreshed to current state (this pass).
 
 ---
 
 ## Current Focus
 
-Phase Core and the LUCID software stack have both shipped in a single sprint. Eight crates build clean; 210 tests pass workspace-wide; zero clippy warnings on `cargo clippy --workspace --all-targets -- -D warnings`. The 0→1 live two-node demo (LUCID M8) is the only outstanding work, gated entirely on hardware acquisition (a Linux box with a 24GB+ NVIDIA card plus a second networked machine).
+Phase Core and the LUCID flagship are both functional. Eight crates build clean; **266 tests** pass workspace-wide; zero clippy warnings on `cargo clippy --workspace --all-targets -- -D warnings`; `cargo audit` 0 vulns. The two-node demo (LUCID M8) ran on real hardware back in May; since then security hardening (PR #9) and v0.1.1 (PRs #10–#13) shipped, real GPU embeddings were validated on Apple Metal, and the umbp foundation relay runs the current binary. No work is hardware-blocked. Next focus is open (options at the bottom of this file).
 
 ```
 crates/
