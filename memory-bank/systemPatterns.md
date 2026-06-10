@@ -5,6 +5,8 @@
 **Status**: MVP Complete + Phase Boot Implemented + Phase Core Released + LUCID Software Complete
 
 > **Note (2026-05-27):** The November 2025 patterns below were authored when the daemon was monolithic. The Phase Core release (May 2026) split the daemon into eight crates and added the streaming Worker trait. The pre-existing patterns are still accurate for their domains (WASM execution still works the same way, peer discovery semantics unchanged, etc.) but the crate location prefixes have changed: `daemon/src/network/*` is now `crates/phase-net/src/*`, `daemon/src/wasm/*` is now `crates/plasm/src/wasm/*`, and so on. See `memory-bank/releases/phase-core/` for the full mapping. New patterns introduced by the May 2026 sprint are documented at the bottom of this file under "Streaming Worker Pattern", "DhtTransport Seam Pattern", "Auto-Pause Policy Pattern", and "Peer-Relay Batch Pattern (v0.1)".
+>
+> **Note (2026-06-09):** LUCID v0.1.1 (PRs #10–#13) added three architectural patterns recorded as ADRs in `decisions.md` (2026-06-09) rather than duplicated here: **embeddings ride the existing `OutputChunk` commitment/receipt machinery** (no new `JobResult` shape — `JobSpec::Embedding` emits `"embedding"`-kind chunks the HTTP layer collects), **self-traffic vs donation-protection split** (`should_serve_self` honors only `manual_pause`), and **workers sign receipts with the node identity** so SEC-05 peer-receipt binding (`worker_pubkey → PeerId`) actually holds. Multi-peer relay failover (`RouteDecision.fallback_peers`) extends the Peer-Relay Batch Pattern.
 
 ---
 
