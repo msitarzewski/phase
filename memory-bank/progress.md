@@ -1,12 +1,38 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-06-09
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1 + security hardening + v0.1.1 (PRs #10–#13)
-**Phase**: Phase Core complete; LUCID v0.1 functional + security-hardened + live on the umbp foundation relay; v0.1.1 gaps shipped and validated on real hardware (GPU embeddings, two-node authz demo). `main` @ `0aefbb2`.
+**Last Updated**: 2026-08-10
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint
+**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Approved source `1356ef65…d847` is green on macOS ARM64 and native UMBP Ubuntu x86_64. Checkpoint commit/push was approved on 2026-08-10; no v0.2 tag or production deployment exists.
 
 ---
 
 ## Major Deliverables
+
+### LUCID v0.2 implementation checkpoint APPROVED (2026-08-09; release incomplete)
+
+| Area | Implemented checkpoint | Remaining release gate |
+|---|---|---|
+| Content | Content-derived CIDs, signed alias/provider records, rollback protection, bounded resumable blob transfer, verified atomic catalog/install, real pull coordinator | Physical multi-GB pull/resume/provider failover and cold third-node resolution |
+| Live relay | v2 ordered substream, immediate event delivery, cancellation, backpressure, shared v1/v2 limits/replay cache, exact receipt binding | Physical two-peer first-token/cancellation and 100+ stream resource evidence |
+| Reachability | Circuit relay server/client, AutoNAT, rendezvous client/optional-server surfaces, DCUtR, explicit infrastructure roles, path observation and bounded loopback QA | Public rendezvous admission quotas, real consumer NAT, DCUtR upgrade/failure, hostile/VPN network matrix |
+| Operations | Hardened user service/config, reusable evidence runner, resource-bounded UMBP native qualification, approved independent DigitalOcean foundation topology | Provision/deploy the public node, geographic fleet, DNS/default bootstrap, monitoring and independent clean-host/failure drills |
+| Reputation | Private attributable evidence, corruption/retention/compaction, decay/confidence/cold start, operator precedence, bounded deterministic redundancy | Multi-peer divergence/Sybil/load/network-partition acceptance and threat-model approval |
+| ShardWorker | Prerequisite evidence/redundancy primitives only | Blocked: partial-tensor determinism/verification study and approved ADR; no worker exists |
+| MLX | Pinned runtime/bundle subprocess worker, strict mutation/SSE/cancellation/resource checks, shared receipt/API path | Real Apple Silicon model, peer routing, lifecycle, performance/power acceptance |
+| Qualification | macOS ARM64 460 passed/2 ignored; UMBP Linux x86_64 release + 450 passed/2 ignored + strict Clippy; isolated HTTP smoke; zero vulnerabilities | Linux ARM64, full physical interoperability/NAT, MLX, rollback, clean-host and claims audit |
+
+The UMBP production relay was not upgraded or restarted during qualification. It remained active on PID `106521` with zero restarts; the temporary loopback smoke service was removed and port `11435` closed. Evidence and exact commands are recorded in `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md` and the authoritative tracker at `releases/lucid-v0.2/README.md`.
+
+### External intended-stream staging APPROVED (2026-08-10; deployment pending)
+
+- Use a DigitalOcean Ubuntu x86_64 host with Reserved IPv4 as the independent public foundation actor. Run the bounded `lucidd --mode infrastructure` service locally on public TCP `4001`; do not redirect Phase traffic to the Sonic DHCP address.
+- Terminate TCP `80/443` in Caddy on the public host and proxy only the existing web origins to UMBP through Tailscale. Keep LUCID HTTP loopback-only and Ollama private.
+- Start at 1 vCPU, 2 GB RAM, and 50 GB disk; build artifacts elsewhere. Resize temporarily for saturation evidence if measurement requires it.
+- Use Pip (M1 iMac, 16 GB) as the Apple Silicon contributor/MLX candidate and an external-network Apple Silicon development machine as requester. Tailscale is an administrative path, not the acceptance data path.
+- UMBP is being snapshotted before its Ubuntu 26.04 LTS upgrade. Post-upgrade qualification must verify SSH/Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, and TCP `4001` before it is considered healthy.
+- The public daemon currently enables bounded relay and AutoNAT roles but intentionally leaves rendezvous serving off because upstream TTL bounds do not supply required global/per-peer/per-namespace admission quotas (`crates/lucidd/src/main.rs:756-765`). This remains an explicit reachability gate, not a hidden deployment assumption.
+
+---
 
 ### Phase Core COMPLETE (May 2026)
 
@@ -638,12 +664,12 @@ Nov 2025: ██████████ Milestone 4 (Packaging & Demo) ✅
 
 ## Next Review Date
 
-**Date**: 2025-11-15 (weekly)
+**Date**: After the DigitalOcean deployment and UMBP post-upgrade audit
 **Agenda**:
-- Review Milestone 1 progress
-- Update completion percentages
-- Identify blockers
-- Adjust timeline if needed
+- Record the public foundation PeerId/address, service version, firewall, and health evidence.
+- Record UMBP upgrade/recovery evidence without overwriting its identity.
+- Run or schedule the external requester → public relay → Pip contributor acceptance matrix.
+- Update milestone counts only when the tracker acceptance criteria and human approval gates pass.
 
 ---
 

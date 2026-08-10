@@ -95,8 +95,8 @@ Phase and LUCID currently share one repository for development velocity. They wi
 
 ## Why now
 
-- **Open weights are competitive.** 2026 frontier models are nearly indistinguishable from closed APIs at the median use case. The "donate your GPU for a worse model" objection no longer applies.
-- **AI sovereignty is a political reality.** Export restrictions on frontier hardware and weights, API gating, board-level control disputes at major labs — there's a growing constituency for inference infrastructure that cannot be unilaterally switched off.
+- **Open weights are competitive.** Mid-2026 frontier open models are at parity with closed APIs at the median use case — GLM-5.2 (744B MoE), MiniMax M3 (#1 open-weight SWE-Bench Pro, 59.0%), DeepSeek-V4-Flash, Qwen3.6-35B-A3B (73.4 SWE-bench Verified, and exactly the model class a contributor Mac would realistically serve). The "donate your GPU for a worse model" objection no longer applies.
+- **AI sovereignty stopped being theoretical.** On 2026-06-12 the US Commerce Department ordered Anthropic to block all foreign nationals from Claude Fable 5 / Mythos 5; unable to verify nationality in real time, Anthropic switched both models off *worldwide* overnight — the first government-forced takedown of a live, commercial frontier model. Days earlier it had announced mandatory biometric identity verification (Persona — government ID + live selfie) for consumer access. These are the same control architecture from two sides: **identity-gating is the enforcement layer that makes the off-switch possible.** LUCID's no-identity, no-KYC substrate is the structural refusal of both. (See [research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md](research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md).)
 - **Consumer GPUs are everywhere and mostly idle.** Aggregate consumer compute capacity is enormous; the missing piece has always been coordination, not silicon.
 - **Petals proved the protocol; the movement was missing.** Distributed inference works technically. What it has lacked is brand, packaging, and ideological energy.
 - **Phase already exists.** The libp2p + signed-receipts + DHT substrate is ~60-70% built. The work ahead is extraction, generalization, and a flagship — not greenfield.
@@ -111,7 +111,7 @@ Phase and LUCID currently share one repository for development velocity. They wi
 
 3. **Privacy is foundational, not roadmap.** Per-request prompt visibility is the brutal honest UX cost of distributed routing. UI must communicate this from day one. "Local-only" toggle ships in v0.1. Real cryptographic prompt privacy (onion-routing, split-prompt) lands in v0.3 — but it is *committed*, not aspirational.
 
-4. **Verification beats payments.** No tokens, no rate-limit-by-pay. Abuse is the real threat model, addressed by community moderation (Tor-shaped), redundant execution, and reputation. Not blockchain-shaped.
+4. **Verification beats payments.** No tokens, no rate-limit-by-pay. Abuse is the real threat model, addressed by community moderation (Tor-shaped), redundant execution, and reputation. Not blockchain-shaped. Signed receipts carry a second payload — integrity: the closed labs just demonstrated covert, deniable capability-throttling (Anthropic shipped, then apologized for, invisibly downgrading frontier-AI-development responses in Fable 5). You cannot audit a black box you don't control; open weights plus verifiable execution is the answer.
 
 5. **No vendor capture.** Apache-2.0 for the protocol so anyone — including governments hostile to other partners — can adopt without legal friction. AGPL-3.0 for LUCID so no one can fork-and-close the flagship. Take public dev resources from NVIDIA, AMD, Apple; never take their official blessing.
 
@@ -144,3 +144,4 @@ End state of these two releases: a runnable demo where two machines on different
 - [progress.md](progress.md) — Historical milestone log (existing)
 - [releases/phase-core/](releases/phase-core/) — Library extraction release plan
 - [releases/lucid/](releases/lucid/) — Inference flagship release plan
+- [research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md](research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md) — June 2026 sovereignty events + local-inference ecosystem; real-world validation of the thesis

@@ -16,18 +16,31 @@ pub mod discovery;
 pub mod peer;
 pub mod protocol;
 
-pub use discovery::{Discovery, DiscoveryConfig, JobRelayHandler};
+pub use discovery::{
+    BlobStream, BlobStreamHandler, Discovery, DiscoveryConfig, JobRelayHandler, JobRelayLiveStream,
+    JobRelayStreamHandler, NatReachability, ReachabilityConfig, ReachabilityConnection,
+    ReachabilityPath, ReachabilityRole, ReachabilitySnapshot, RelayServerLimits, RendezvousPeer,
+    RendezvousServerLimits,
+};
 pub use peer::{BandwidthBucket, LatencyBucket, PeerCapabilities, PeerInfo};
 pub use protocol::{
-    JobOffer, JobRelayRequest, JobRelayResponse, JobRequest, JobRequirements, JobResponse,
-    JobResult, RejectionReason,
+    BlobStreamError, BlobStreamFrame, BlobStreamFrameKind, BlobStreamRequest, BlobStreamValidator,
+    JobOffer, JobRelayRequest, JobRelayResponse, JobRelayStreamControl, JobRelayStreamControlKind,
+    JobRelayStreamError, JobRelayStreamFrame, JobRelayStreamFrameKind, JobRelayStreamOpen,
+    JobRelayStreamValidator, JobRequest, JobRequirements, JobResponse, JobResult, RejectionReason,
+    BLOB_STREAM_DEFAULT_IDLE_TIMEOUT_MS, BLOB_STREAM_MAX_CHUNK_BYTES,
+    BLOB_STREAM_MAX_DEADLINE_AHEAD_MS, BLOB_STREAM_MAX_IDLE_TIMEOUT_MS,
+    BLOB_STREAM_MAX_METADATA_BYTES, BLOB_STREAM_MAX_REASON_BYTES, BLOB_STREAM_MIN_IDLE_TIMEOUT_MS,
+    BLOB_STREAM_PROTOCOL, BLOB_STREAM_SCHEMA_VERSION, JOB_RELAY_STREAM_MAX_EVENT_BYTES,
+    JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_MAX_REASON_BYTES,
+    JOB_RELAY_STREAM_MAX_RECEIPT_BYTES, JOB_RELAY_STREAM_PROTOCOL, JOB_RELAY_STREAM_SCHEMA_VERSION,
 };
 
 // Re-export libp2p's `PeerId` so downstream Phase crates (lucidd, future
 // workers) can speak in canonical peer identifiers without each one taking
 // a direct `libp2p` dependency. This is the same pattern phase-identity
 // uses for `SigningKey`/`VerifyingKey` from `ed25519-dalek`.
-pub use libp2p::PeerId;
+pub use libp2p::{Multiaddr, PeerId};
 
 /// Re-export of `libp2p::identity` so downstream Phase crates (the LUCID
 /// model registry, future workers) can derive `PeerId` from an Ed25519

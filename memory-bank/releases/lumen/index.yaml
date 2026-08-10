@@ -1,0 +1,125 @@
+release: lumen
+version: unassigned
+status: planned
+tracker: README.md
+owner: Michael S.
+license: decision-required
+tagline: "Diffusion on the public's hardware, built as a native Phase node."
+
+description: |
+  Independent diffusion and image-synthesis flagship. LUMEN has its own daemon,
+  compatibility API, worker, scheduler, policy, artifact model, and release.
+  It reuses Phase identity, manifests, receipts, protocol streams, networking,
+  and artifact serving without adding diffusion behavior to lucidd.
+
+release_decisions_required:
+  - "Version and milestone IDs"
+  - "Product-name/trademark clearance"
+  - "Application license"
+  - "Compatibility API wedge"
+  - "First backend and supported model families"
+  - "Image-generation JobSpec and chunk/result contract"
+  - "Artifact bundle and provenance schemas"
+  - "Remote-routing and operator-policy contract"
+
+milestones:
+  - slug: product-contract-and-compatibility-wedge
+    name: Product Contract and Compatibility Wedge
+    sequence: 1
+    status: not_started
+    spec: product-contract-and-compatibility-wedge.md
+    blocking: true
+    depends_on: []
+  - slug: protocol-contract
+    name: Protocol Contract
+    sequence: 2
+    status: not_started
+    spec: protocol-contract.md
+    blocking: true
+    depends_on: [product-contract-and-compatibility-wedge]
+  - slug: artifact-plane
+    name: Artifact Plane
+    sequence: 3
+    status: not_started
+    spec: artifact-plane.md
+    blocking: true
+    depends_on: [product-contract-and-compatibility-wedge, protocol-contract]
+  - slug: local-diffusion-worker
+    name: Local Diffusion Worker
+    sequence: 4
+    status: not_started
+    spec: local-diffusion-worker.md
+    blocking: true
+    depends_on: [protocol-contract, artifact-plane]
+  - slug: client-api-and-preview-stream
+    name: Client API and Preview Stream
+    sequence: 5
+    status: not_started
+    spec: client-api-and-preview-stream.md
+    blocking: true
+    depends_on: [product-contract-and-compatibility-wedge, local-diffusion-worker]
+  - slug: discovery-routing-and-policy
+    name: Discovery, Routing, and Policy
+    sequence: 6
+    status: not_started
+    spec: discovery-routing-and-policy.md
+    blocking: true
+    depends_on: [protocol-contract, artifact-plane, local-diffusion-worker]
+  - slug: intended-image-flow
+    name: Intended Image Flow
+    sequence: 7
+    status: not_started
+    spec: intended-image-flow.md
+    blocking: true
+    depends_on:
+      - product-contract-and-compatibility-wedge
+      - protocol-contract
+      - artifact-plane
+      - local-diffusion-worker
+      - client-api-and-preview-stream
+      - discovery-routing-and-policy
+  - slug: distributed-diffusion-research-gate
+    name: Distributed Diffusion Research Gate
+    sequence: 8
+    status: not_started
+    spec: distributed-diffusion-research-gate.md
+    blocking: false
+    implementation_authorized: false
+    depends_on: [intended-image-flow]
+  - slug: release-qualification
+    name: Release Qualification
+    sequence: 9
+    status: not_started
+    spec: release-qualification.md
+    blocking: true
+    depends_on:
+      - product-contract-and-compatibility-wedge
+      - protocol-contract
+      - artifact-plane
+      - local-diffusion-worker
+      - client-api-and-preview-stream
+      - discovery-routing-and-policy
+      - intended-image-flow
+
+release_gates:
+  - "Independent daemon/product boundary; no diffusion implementation in lucidd"
+  - "Real native-client compatibility workflow"
+  - "Verified model, adapter, input, and final-output artifacts"
+  - "Real local diffusion backend with cancellation and bounded resources"
+  - "Bounded progress/preview stream and atomically committed final artifact"
+  - "Remote single-worker flow with signed manifest/receipt and PeerId binding"
+  - "Clean-machine installation, operation, failure recovery, and documentation"
+  - "Workspace QA, security, license, trademark, and claims review"
+
+explicit_non_goals:
+  - "Diffusion support inside lucidd"
+  - "Ollama API reused without a product-fit decision"
+  - "Distributed partial diffusion presented as verified before research gate"
+  - "Training/fine-tuning in the first release"
+  - "Payments, KYC, token, marketplace, or blockchain"
+
+references:
+  architectural_decision: ../../decisions.md
+  mission: ../../MISSION.md
+  protocol: ../../../crates/phase-protocol/SPEC.md
+  lucid_v0_2: ../lucid-v0.2/index.yaml

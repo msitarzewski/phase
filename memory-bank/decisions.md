@@ -1007,6 +1007,156 @@ The two-node authz demo (default-deny reject → escape-hatch accept) exposed tw
 
 ---
 
+### 2026-08-09: Content identity, signed alias/provider records, and verification-before-exposure
+
+**Status**: Accepted for the LUCID v0.2 implementation checkpoint; physical multi-gigabyte/two-network acceptance remains open.
+
+**Context**:
+LUCID v0.1 derived a placeholder `ModelCid` from a human model name and `/api/pull` could only register a file already present. That cannot safely support network transfer: names are mutable, the DHT is untrusted, provider availability differs from inference capacity, and partially downloaded bytes must never become worker-visible.
+
+**Decision**:
+
+1. A production GGUF `ModelCid` is the exact 32-byte SHA-256 of the verified weight file. The explicit `EchoWorker` alone may use the clearly named development-only name hash; production alias resolution, pull, llama.cpp, and MLX reject that shortcut.
+2. A human alias maps to immutable content through a versioned Ed25519-signed alias record binding normalized alias, exact CID, size, format, publisher, sequence, creation, and expiry. Records are short-lived, replay/rollback protected per `(alias, publisher)`, and persisted through a private bounded atomic replay checkpoint.
+3. Conflicting valid publishers are returned as conflicts rather than resolved by arrival order. An exact CID and/or publisher pin may narrow the set but cannot weaken verification.
+4. Content-provider claims are separately signed, expiring, PeerId-bound records. Possessing bytes is not equivalent to having the model loaded or accepting inference.
+5. Transfer uses the existing Phase artifact store plus a workload-neutral bounded libp2p blob stream. A peer supplies bytes for an already selected CID; it never supplies an arbitrary URL or filesystem path.
+6. Pulls write to bounded staging, resume only the same CID, re-hash the complete file, atomically commit, checkpoint the content catalog, and publish registry/provider state only after verification. Startup restore re-hashes catalog entries before exposing them.
+7. MLX content uses a domain-separated canonical bundle root (`sha256:phase/mlx-bundle-root/v1`) because the runtime consumes a directory, not one GGUF. Relative path, size, and bytes of every accepted regular file contribute to the root.
+
+**Alternatives considered**:
+- Continue name-derived CIDs — rejected because they identify aliases, not bytes.
+- Trust a publisher URL or HTTP checksum — rejected because it moves authority outside the signed Phase identity/content contract.
+- Choose the first valid alias record — rejected because DHT arrival order is attacker-influenceable.
+- Expose installed content before backend/catalog commit — rejected because failures could leave executable registry state pointing at invalid or absent bytes.
+
+**Consequences**:
+- Positive: content identity is independently reproducible, conflicts remain visible, provider failover cannot change target bytes, and no unverified partial can execute.
+- Negative: whole-file GGUF hashing is O(file size), and the first schema supports one-file GGUF plus a separate canonical MLX bundle-root contract rather than a general Merkle/chunk CID.
+- Completion is not implied: real multi-gigabyte pull/resume and cold third-node alias resolution remain release gates.
+
+**References**: `crates/lucidd/src/{registry,content}.rs`, `crates/phase-artifact-server/src/artifacts.rs`, `crates/phase-net/src/{protocol,discovery}.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-09: Live relay v2 uses opaque bounded substreams; negotiation time is not frame-idle time
+
+**Status**: Accepted for the LUCID v0.2 implementation checkpoint; physical first-token/load acceptance remains open.
+
+**Context**:
+The v1 request/response relay batches a completed `Vec<JobEvent>`, so it cannot provide genuine remote token streaming or mid-job cancellation. Early Linux qualification also exposed a subtler issue: applying the caller's legal 250 ms post-open idle timeout to the shared control mutex and multistream negotiation made valid requests fail under bounded CPU load before a substream existed.
+
+**Decision**:
+
+1. Add versioned workload-neutral live-relay substreams carrying bounded opaque open/control/event/receipt envelopes. `phase-net` validates schema, job binding, sequence, lifecycle, size, idle/total deadline, and cancellation without interpreting tokens, embeddings, or Ollama.
+2. LUCID v2 forwards each validated worker event as it arrives, folds exactly delivered output chunks into the commitment, and verifies the terminal signed receipt against manifest, job, serving PeerId, commitment, and chunk count.
+3. v1 fallback is permitted only when v2 negotiation is unsupported and no output has been exposed. Batch fallback remains explicitly distinguishable; a partial live stream is never replayed/retried as success through another peer.
+4. v1 and v2 inbound paths share one concurrency gate and one manifest replay cache so protocol selection cannot double operator limits.
+5. Control-lock wait, multistream selection, and the initial open write use a dedicated 10-second negotiation budget capped by the request's absolute total deadline. The caller-provided idle timeout begins only after establishment and bounds silence between frames.
+6. Test harnesses wait for observed swarm state and use explicit producer gates; heavyweight loopback swarms are serialized to prevent host scheduler variance from changing protocol assertions.
+
+**Consequences**:
+- Positive: remote output is genuinely incremental, cancellation and receipt state stay attributable, and the minimum legal idle timeout works under constrained Linux scheduling.
+- Negative: v1 compatibility adds a guarded pre-output branch, and live streams cannot migrate after client-visible output without a separately designed resumable-output protocol.
+
+**References**: `crates/phase-net/src/{protocol,discovery}.rs`, `crates/lucidd/src/router.rs`, `crates/lucidd/tests/http_api.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-09: Reachability services are explicit infrastructure roles; rendezvous assists but never authorizes
+
+**Status**: Accepted for the LUCID v0.2 implementation checkpoint; public rendezvous admission, real consumer-NAT/DCUtR, and fleet acceptance remain open.
+
+**Context**:
+Ordinary peers need relay reservations, rendezvous discovery, AutoNAT, and DCUtR without accidentally becoming public infrastructure. Relay/rendezvous services need hard bounds and must share the existing authenticated swarm rather than introducing a second identity or network stack.
+
+**Decision**:
+
+1. `phase-net` retains one `CombinedBehaviour`/driver and exposes explicit `Peer` versus `Infrastructure` reachability roles. Ordinary peers cannot enable relay, AutoNAT, or rendezvous servers.
+2. Infrastructure roles are operator opt-in and share bounded configuration. Circuit relay and AutoNAT serving are enabled only for infrastructure mode. The optional rendezvous server surface exists in `phase-net`, but public `lucidd` serving remains disabled until hard global/per-peer/per-namespace registration quotas exist.
+3. Ordinary LUCID nodes request circuit reservations from pinned public PeerIds, may register/discover through an explicitly available bounded rendezvous service, and de-duplicate results with existing DHT/mDNS/configured discovery. A configured relay is not assumed to provide rendezvous.
+4. DCUtR may upgrade an authenticated relayed connection to direct; a failed upgrade preserves the relay path. Observable connection state labels direct versus relayed rather than inferring topology from configuration.
+5. Rendezvous is discovery assistance only. Identity, authorization, model capability, alias/content verification, and policy remain independently enforced.
+
+**Consequences**:
+- Positive: no duplicate swarm/identity exists, infrastructure cannot be enabled by an ordinary-node typo, and tests can assert an exact relayed path independently from DCUtR.
+- Negative: loopback coverage does not establish real NAT success; physical topology and capacity evidence remain required; public rendezvous cannot deploy from `lucidd` until its admission layer is complete.
+
+**References**: `crates/phase-net/src/discovery.rs`, `crates/lucidd/src/main.rs`, `crates/lucidd/systemd/lucidd-relay.service`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-09: Reputation is private local evidence, not global truth; redundancy is bounded and literal
+
+**Status**: Accepted for the implementation checkpoint; multi-peer adversarial/load acceptance remains open.
+
+**Context**:
+Routing needs attributable history without turning reputation into a centralized score, storing private prompts/results, or pretending agreement proves computation correct. Redundant execution can detect literal disagreement for deterministic work but can amplify cost and cannot safely compare arbitrary nondeterministic or cross-backend output.
+
+**Decision**:
+
+1. Store versioned, privacy-minimal local evidence containing observer/remote PeerIds, job-spec hash/class, exact model CID, protocol/software version, timestamp, classified outcome, and optional output commitment. Raw prompts, tokens, embeddings, model bytes, and other result payloads are not representable in the schema.
+2. Stable domain-separated event IDs make duplicate ingestion idempotent. The private append-oriented file is bounded, checksummed, corruption-detecting, partial-tail recoverable, compactable, and retention-limited.
+3. Derived assessment remains separate from raw evidence, local to one observer, decayed over time, confidence-weighted by evidence volume, deterministic on ties, and subordinate to explicit operator pin/block precedence. Cold peers receive a bounded opportunity rather than inherited trust.
+4. Evidence taxonomy distinguishes cryptographic/protocol failures, policy/capacity refusals, pre-output network failures, mid-stream loss, cancellation, timeout, and redundant comparison outcomes so unrelated outages do not become false maliciousness claims.
+5. Automatic redundant execution is disabled by default. When enabled it is deterministic-sampled, concurrency/cost bounded, uses two distinct peers, and is eligible only for exact-CID seeded deterministic inference with signed equivalent backend capabilities. Literal commitments can show agreement/disagreement; they do not identify the dishonest peer or prove correctness. Embeddings/nondeterministic results remain incomparable without an approved tolerance contract.
+6. Reputation does not flip the default authorization policy and does not solve ShardWorker partial-tensor verification.
+
+**Consequences**:
+- Positive: operators can inspect attributable evidence without creating a global authority or privacy archive; redundant checks cannot silently multiply unbounded work.
+- Negative: confidence is observer-local and Sybil/collusion limits remain; a larger physical adversarial campaign is still required.
+
+**References**: `crates/lucidd/src/reputation.rs`, `crates/lucidd/src/router.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-09: MLX remains a pinned local subprocess adapter with explicit unverified hardware status
+
+**Status**: Accepted for the implementation checkpoint; real Apple Silicon inference is not yet accepted.
+
+**Context**:
+`mlx_lm.server` has a different command, lifecycle, HTTP/SSE protocol, and failure profile from `llama-server`. Treating it as a flag on `LlamaCppWorker` would merge incompatible supervisors. Conversely, creating another registry/router/API/receipt stack would violate the LUCID architecture. Python entry points and model directories also create mutable-code/content risks that must fail closed.
+
+**Decision**:
+
+1. Implement `MlxWorker` beside `LlamaCppWorker` inside `lucidd`, reusing the existing `Worker`, router, policy, API, commitment, receipt, node identity, and signed registry/content paths.
+2. The first contract is macOS ARM64 only, one canonical immutable bundle, one in-flight job, inference only, loopback HTTP/SSE, forced `default_model`, and no adapters, draft models, embeddings, remote model identifiers, redirects, proxies, or remote code.
+3. Target `mlx-lm==0.31.3` and `mlx==0.31.2`, but label runtime attestation and hardware acceptance unverified until a real offline-pinned Apple Silicon run exists. Compilation or fixture success cannot upgrade that claim.
+4. Hash and pin the runtime entry-point bytes and canonical model bundle; reject writable/symlinked/hardlinked/ambiguous/excessive entries and revalidate before spawn/request. Any post-construction mutation, malformed/oversized stream, EOF without terminal state, timeout, or cancellation invalidates and terminates the server.
+5. Reuse Phase output commitments and node-identity-signed receipts. Unsupported platforms fail before paths or network are touched.
+
+**Consequences**:
+- Positive: backend-specific risk stays inside one adapter while LUCID semantics remain shared and testable on non-Apple CI.
+- Negative: the adapter has a documented loopback port bind race because upstream cannot inherit a reserved listener; real model, thermal, power, cancellation, crash, and remote-relay acceptance remain mandatory.
+
+**References**: `crates/lucidd/src/worker_mlx.rs`, `crates/lucidd/src/main.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-10: The first independent foundation site runs Phase locally; web ingress is a separate Tailscale-backed proxy
+
+**Status**: Accepted for deployment and physical-test staging; provisioning and acceptance evidence remain open.
+
+**Context**:
+UMBP’s Sonic public IPv4 is DHCP-assigned and the existing public host also serves unrelated HTTP applications through Caddy. A small public cloud host can supply a stable IP and independent network context, but blindly forwarding TCP `80/443` or Phase traffic to the mutable Sonic address would preserve the home-link dependency and would not create the required public circuit-relay actor.
+
+**Decision**:
+
+1. Provision the first independent foundation site on a small DigitalOcean Ubuntu x86_64 host with a Reserved IPv4. Start with 1 vCPU, 2 GB RAM, and 50 GB disk; deploy a prebuilt qualified binary rather than compiling or storing models there.
+2. Run the existing bounded `lucidd --mode infrastructure` service locally. Public native Phase/libp2p TCP `4001` terminates at that process and is never redirected to UMBP or the Sonic address.
+3. Terminate public web TCP `80/443` in Caddy on the cloud host. Caddy may reverse-proxy the existing web origins to UMBP through Tailscale, which provides a stable encrypted upstream independent of Sonic DHCP churn. The LUCID HTTP API stays loopback-only and Ollama remains private.
+4. Treat Tailscale as the administration/recovery plane, not the Phase acceptance data path. The external requester must reach Pip through Phase’s configured public relay so the test cannot pass merely because both machines share a tailnet.
+5. Use Pip, the M1 iMac with 16 GB RAM, as the Apple Silicon inference contributor and MLX acceptance candidate. UMBP remains a transitional origin/relay until its backup, Ubuntu 26.04 LTS upgrade, and post-upgrade audit pass.
+6. Do not claim public rendezvous from this deployment. `lucidd` keeps `rendezvous_server: None` until hard global/per-peer/per-namespace registration quotas exist; bootstrap, DHT, circuit relay, AutoNAT, and configured-peer paths are the first-site scope.
+
+**Consequences**:
+- Positive: Phase gains a stable public failure domain and real relay actor; home DHCP churn no longer controls Phase ingress; web migration can happen independently over the tailnet.
+- Negative: the proxied web origins still depend on UMBP and the home connection; one cloud site is not geographic fleet resilience; public rendezvous and the physical intended-stream evidence remain incomplete.
+
+**References**: `crates/lucidd/src/main.rs:756-803`, `crates/lucidd/systemd/lucidd-relay.service:17-40`, `releases/lucid-v0.2/reachability-plane.md`, `releases/lucid-v0.2/network-operations.md`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
 ## Superseded Decisions
 
 *(None yet)*
@@ -1016,10 +1166,10 @@ The two-node authz demo (default-deny reject → escape-hatch accept) exposed tw
 ## Future Decisions to Make
 
 ### Pending
-- **Bootstrap node strategy**: Public bootstrap nodes vs. configurable list
+- **Bootstrap defaults and fleet policy**: Default-domain opt-out/override behavior, DNS rotation, and minimum multi-region/provider inventory
 - **Configuration format**: TOML vs YAML vs JSON
 - **Log format**: JSON logs vs structured text
-- **Peer reputation system**: Design and storage mechanism
+- **Reputation evolution**: Multi-peer adversarial/load acceptance, Sybil/collusion policy, and any future evidence exchange remain open
 
 ### Deferred
 - **zk-SNARK proofs**: Wait for production workloads (Phase 3)

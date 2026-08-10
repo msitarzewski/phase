@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Integration tests for `LlamaCppWorker` against the in-tree
-//! `fake-llama-server` fixture binary (see `tests/fixtures/`).
+//! test-only llama-server protocol fixture (see `tests/fixtures/`).
 //!
 //! These tests deliberately don't require a real `llama-server` or any
-//! GGUF model on disk — the fake binary emits SSE frames in the same
+//! GGUF model on disk — the fixture emits SSE frames in the same
 //! shape the real server uses, plus configurable failure modes
 //! (`FAKE_LLAMA_CRASH_AFTER_MS`, `FAKE_LLAMA_HANG_AFTER`, etc.). The
-//! real-binary path is exercised separately by `real_llama_server`
+//! fixture is compiled into this integration-test harness and reached by a
+//! temporary re-exec wrapper, so it is never an installable production
+//! binary. The real-binary path is exercised separately by `real_llama_server`
 //! (gated on `#[ignore]` + the `LLAMA_SERVER_PATH` env var).
 //!
 //! Each test:
 //! 1. Allocates a temp dir; touches a `dummy.gguf` so the model-file
-//!    existence check passes. The fake server ignores `--model`.
-//! 2. Constructs `LlamaCppConfig { server_binary_path: <fake>, … }`.
+//!    existence check passes. The protocol fixture ignores `--model`.
+//! 2. Constructs `LlamaCppConfig { server_binary_path: <fixture-launcher>, … }`.
 //! 3. Builds a `SignedManifest<JobSpec>` and drives `worker.execute()`.
 //! 4. Collects the resulting [`JobEvent`]s and asserts on shape.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -30,7 +32,10 @@ use phase_protocol::{
     SignedManifest, Worker,
 };
 
-/// Pick a port that's free *right now*. The fake binary will re-bind it
+#[path = "fixtures/fake_llama_server.rs"]
+mod fake_llama_server;
+
+/// Pick a port that's free *right now*. The fixture process will re-bind it
 /// almost immediately; on the tiny window between drop and re-bind we
 /// accept the rare flake.
 fn free_port() -> u16 {
@@ -40,8 +45,70 @@ fn free_port() -> u16 {
     p
 }
 
-fn fake_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_fake-llama-server"))
+/// Quote arbitrary UTF-8 text for a POSIX shell single-quoted word.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build an ephemeral subprocess launcher for the fixture entrypoint baked
+/// into this integration-test executable. `LlamaCppWorker` can therefore
+/// exercise its real `Command` supervision path without publishing or
+/// installing a test server binary as part of the `lucidd` package.
+fn fixture_launcher(dir: &Path) -> PathBuf {
+    let test_exe = std::env::current_exe().expect("resolve llama_worker test executable");
+    let test_exe = test_exe
+        .to_str()
+        .expect("llama_worker test executable path must be UTF-8");
+    let launcher = dir.join("llama-server-test-fixture");
+    let script = format!(
+        r#"#!/bin/sh
+port=""
+host="127.0.0.1"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --port)
+            [ "$#" -ge 2 ] || exit 64
+            port="$2"
+            shift 2
+            ;;
+        --host)
+            [ "$#" -ge 2 ] || exit 64
+            host="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+[ -n "$port" ] || exit 64
+export PHASE_FAKE_LLAMA_SERVER_PROCESS=1
+export PHASE_FAKE_LLAMA_PORT="$port"
+export PHASE_FAKE_LLAMA_HOST="$host"
+exec {} --exact fixture_server_process_entrypoint --ignored --nocapture
+"#,
+        shell_quote(test_exe)
+    );
+    std::fs::write(&launcher, script).expect("write fixture subprocess launcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture subprocess launcher executable");
+    }
+    launcher
+}
+
+/// Internal subprocess entrypoint. It is ignored during ordinary test runs
+/// and only entered by `fixture_launcher` with the explicit process marker.
+#[test]
+#[ignore = "internal llama-server fixture subprocess entrypoint"]
+fn fixture_server_process_entrypoint() {
+    if std::env::var_os("PHASE_FAKE_LLAMA_SERVER_PROCESS").is_none() {
+        eprintln!("internal fixture entrypoint unavailable outside its launcher");
+        return;
+    }
+    fake_llama_server::run();
 }
 
 fn make_manifest(model_id: &str, prompt: &str) -> SignedManifest<JobSpec> {
@@ -72,7 +139,7 @@ fn setup(model_id: &str) -> TestModel {
     std::fs::write(&model_path, b"fake").expect("touch model");
     let port = free_port();
     let config = LlamaCppConfig {
-        server_binary_path: fake_binary(),
+        server_binary_path: fixture_launcher(dir.path()),
         model_dir: dir.path().to_path_buf(),
         default_n_gpu_layers: 0,
         default_context_size: 2048,
@@ -119,7 +186,7 @@ fn multi_model_worker(
     }
     let base = free_port();
     let config = LlamaCppConfig {
-        server_binary_path: fake_binary(),
+        server_binary_path: fixture_launcher(dir.path()),
         model_dir: dir.path().to_path_buf(),
         default_n_gpu_layers: 0,
         default_context_size: 2048,
@@ -204,7 +271,7 @@ async fn happy_path_streams_tokens_and_signs_receipt() {
     assert_eq!(final_completion, Some(Completion::Stop));
     assert!(!tokens.is_empty(), "expected at least one token");
     let joined: String = tokens.concat();
-    // Default token list in the fake binary is "Hello,, ,world,!".
+    // Default fixture token list is "Hello,, ,world,!".
     assert!(joined.contains("Hello"));
     assert!(joined.contains("world"));
 
@@ -382,22 +449,21 @@ async fn embedding_streams_vectors_and_signs_receipt() {
 }
 
 // -----------------------------------------------------------------------
-// Optional: real llama-server integration test. Skipped unless
-// `LLAMA_SERVER_PATH` is set. Marked `#[ignore]` so `cargo test` doesn't
-// run it by default — invoke with `cargo test -- --ignored` to opt in.
+// Optional: real llama-server integration test. Marked `#[ignore]` so
+// ordinary `cargo test` reports the external hardware gate without trying
+// it. An explicit run fails (rather than silently passing) unless both
+// required paths are supplied.
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore]
-async fn real_llama_server_smoke_test_when_env_set() {
-    let Ok(bin) = std::env::var("LLAMA_SERVER_PATH") else {
-        eprintln!("LLAMA_SERVER_PATH not set; skipping");
-        return;
-    };
-    let Ok(model) = std::env::var("LLAMA_TEST_MODEL_PATH") else {
-        eprintln!("LLAMA_TEST_MODEL_PATH not set; skipping");
-        return;
-    };
+async fn real_llama_server_smoke_test_requires_explicit_hardware_env() {
+    let bin = std::env::var("LLAMA_SERVER_PATH").expect(
+        "real llama hardware gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_MODEL_PATH",
+    );
+    let model = std::env::var("LLAMA_TEST_MODEL_PATH").expect(
+        "real llama hardware gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_MODEL_PATH",
+    );
 
     let model_path = PathBuf::from(&model);
     let model_dir = model_path

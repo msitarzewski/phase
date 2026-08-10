@@ -1,5 +1,6 @@
 # Rust workspace
 /target/
+/target-linux-amd64/
 /target-linux-arm64/
 /target-linux-x86_64/
 **/target/

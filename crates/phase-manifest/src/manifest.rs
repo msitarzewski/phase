@@ -2,7 +2,7 @@
 
 //! `SignedManifest<T>` -- the generic signed envelope.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey, SIGNATURE_LENGTH};
 use phase_identity::NodeIdentity;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -14,10 +14,65 @@ use crate::error::ManifestError;
 /// future SDK implementations depend on this exact string.
 pub const SIGNING_DOMAIN: &[u8] = b"phase-manifest:v1:";
 
-/// Highest schema version this crate understands. Bump alongside any
-/// breaking change to the envelope shape (not the payload — payload shape
-/// is the caller's choice).
+/// Exact schema version this crate understands. Bump alongside any breaking
+/// change to the envelope shape (not the payload — payload shape is the
+/// caller's choice).
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Maximum amount by which a remotely executable manifest's `created_at`
+/// may lead the verifier's wall clock.
+pub const REMOTE_MAX_FUTURE_CLOCK_SKEW_SECS: i64 = 5 * 60;
+
+/// Maximum validity window for a remotely executable manifest.
+pub const REMOTE_MAX_MANIFEST_TTL_SECS: i64 = 15 * 60;
+
+/// Errors specific to the stricter policy applied before remote execution.
+///
+/// Signature, schema, and expiry failures retain their existing
+/// [`ManifestError`] representation. The remaining variants describe remote
+/// replay-prevention requirements that intentionally do not apply to local
+/// manifests.
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteManifestVerificationError {
+    /// The common manifest verification checks failed.
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+
+    /// Remote execution requires a finite replay window.
+    #[error("remote execution manifest must set expires_at")]
+    MissingExpiry,
+
+    /// The manifest was issued too far ahead of the verifier's clock.
+    #[error(
+        "manifest created_at {created_at} exceeds the allowed future clock skew of {maximum_seconds} seconds"
+    )]
+    CreatedTooFarInFuture {
+        /// Timestamp supplied by the manifest.
+        created_at: String,
+        /// Maximum permitted future skew in seconds.
+        maximum_seconds: i64,
+    },
+
+    /// The expiry does not follow the creation timestamp.
+    #[error("manifest expires_at {expires_at} must be later than created_at {created_at}")]
+    InvalidValidityWindow {
+        /// Timestamp supplied as the beginning of the validity window.
+        created_at: String,
+        /// Timestamp supplied as the end of the validity window.
+        expires_at: String,
+    },
+
+    /// The signed validity window is too long for remote execution.
+    #[error(
+        "manifest validity window of {ttl_seconds} seconds exceeds the remote maximum of {maximum_seconds} seconds"
+    )]
+    TtlExceeded {
+        /// Signed validity-window length in seconds.
+        ttl_seconds: i64,
+        /// Maximum permitted validity-window length in seconds.
+        maximum_seconds: i64,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // SignedManifest<T>
@@ -90,9 +145,24 @@ where
     /// non-expired manifest. Otherwise a `ManifestError` describing what
     /// failed.
     pub fn verify(&self) -> Result<(), ManifestError> {
-        // Schema compatibility first — newer envelopes might add fields a
-        // pre-1.x verifier cannot parse without losing information.
-        if self.schema_version > SCHEMA_VERSION {
+        self.verify_at(Utc::now())
+    }
+
+    /// Verify a manifest before dispatching it to a remote execution worker.
+    ///
+    /// In addition to [`Self::verify`], this requires an expiry, limits future
+    /// clock skew, and caps the signed validity window. Keeping this policy in
+    /// a separate method preserves compatibility for local manifests whose
+    /// callers intentionally omit `expires_at`.
+    pub fn verify_for_remote_execution(&self) -> Result<(), RemoteManifestVerificationError> {
+        self.verify_for_remote_execution_at(Utc::now())
+    }
+
+    fn verify_at(&self, now: DateTime<Utc>) -> Result<(), ManifestError> {
+        // Only the exact supported schema is safe to verify. Accepting older
+        // numbers without an explicit compatibility implementation creates a
+        // downgrade path even when the current field shape happens to parse.
+        if self.schema_version != SCHEMA_VERSION {
             return Err(ManifestError::UnsupportedSchema {
                 found: self.schema_version,
                 supported: SCHEMA_VERSION,
@@ -123,12 +193,46 @@ where
         // Expiry is the last check so a tampered-with manifest with a past
         // expiry surfaces as BadSignature, not Expired.
         if let Some(exp) = self.expires_at {
-            let now = Utc::now();
             if now > exp {
                 return Err(ManifestError::Expired {
                     expires_at: exp.to_rfc3339(),
                 });
             }
+        }
+
+        Ok(())
+    }
+
+    fn verify_for_remote_execution_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), RemoteManifestVerificationError> {
+        self.verify_at(now)?;
+
+        let expires_at = self
+            .expires_at
+            .ok_or(RemoteManifestVerificationError::MissingExpiry)?;
+
+        let maximum_future = now + Duration::seconds(REMOTE_MAX_FUTURE_CLOCK_SKEW_SECS);
+        if self.created_at > maximum_future {
+            return Err(RemoteManifestVerificationError::CreatedTooFarInFuture {
+                created_at: self.created_at.to_rfc3339(),
+                maximum_seconds: REMOTE_MAX_FUTURE_CLOCK_SKEW_SECS,
+            });
+        }
+
+        let ttl = expires_at.signed_duration_since(self.created_at);
+        if ttl <= Duration::zero() {
+            return Err(RemoteManifestVerificationError::InvalidValidityWindow {
+                created_at: self.created_at.to_rfc3339(),
+                expires_at: expires_at.to_rfc3339(),
+            });
+        }
+        if ttl > Duration::seconds(REMOTE_MAX_MANIFEST_TTL_SECS) {
+            return Err(RemoteManifestVerificationError::TtlExceeded {
+                ttl_seconds: ttl.num_seconds(),
+                maximum_seconds: REMOTE_MAX_MANIFEST_TTL_SECS,
+            });
         }
 
         Ok(())
@@ -309,6 +413,12 @@ mod tests {
         }
     }
 
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2030-01-01T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn round_trip_sign_then_verify() {
         let id = NodeIdentity::generate();
@@ -391,6 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn schema_version_zero_is_rejected() {
+        let id = NodeIdentity::generate();
+        let signed = ManifestBuilder::new(sample_payload())
+            .schema_version(0)
+            .sign_with(&id)
+            .expect("sign");
+
+        assert!(matches!(
+            signed.verify(),
+            Err(ManifestError::UnsupportedSchema {
+                found: 0,
+                supported: SCHEMA_VERSION
+            })
+        ));
+    }
+
+    #[test]
     fn expired_manifest_surfaces_expired() {
         let id = NodeIdentity::generate();
         let past = Utc::now() - chrono::Duration::seconds(60);
@@ -413,6 +540,89 @@ mod tests {
             .sign_with(&id)
             .expect("sign");
         signed.verify().expect("verify pre-expiry");
+    }
+
+    #[test]
+    fn remote_execution_requires_expiry() {
+        let id = NodeIdentity::generate();
+        let now = fixed_now();
+        let signed = ManifestBuilder::new(sample_payload())
+            .created_at(now)
+            .sign_with(&id)
+            .expect("sign");
+
+        assert!(matches!(
+            signed.verify_for_remote_execution(),
+            Err(RemoteManifestVerificationError::MissingExpiry)
+        ));
+    }
+
+    #[test]
+    fn remote_execution_rejects_created_at_beyond_clock_skew() {
+        let id = NodeIdentity::generate();
+        let now = fixed_now();
+        let created_at = now + chrono::Duration::seconds(REMOTE_MAX_FUTURE_CLOCK_SKEW_SECS + 1);
+        let signed = ManifestBuilder::new(sample_payload())
+            .created_at(created_at)
+            .expires_at(created_at + chrono::Duration::minutes(1))
+            .sign_with(&id)
+            .expect("sign");
+
+        assert!(matches!(
+            signed.verify_for_remote_execution_at(now),
+            Err(RemoteManifestVerificationError::CreatedTooFarInFuture { .. })
+        ));
+    }
+
+    #[test]
+    fn remote_execution_rejects_overlong_ttl() {
+        let id = NodeIdentity::generate();
+        let now = fixed_now();
+        let created_at = now - chrono::Duration::minutes(1);
+        let expires_at = created_at + chrono::Duration::seconds(REMOTE_MAX_MANIFEST_TTL_SECS + 1);
+        let signed = ManifestBuilder::new(sample_payload())
+            .created_at(created_at)
+            .expires_at(expires_at)
+            .sign_with(&id)
+            .expect("sign");
+
+        assert!(matches!(
+            signed.verify_for_remote_execution_at(now),
+            Err(RemoteManifestVerificationError::TtlExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn remote_execution_rejects_expired_manifest() {
+        let id = NodeIdentity::generate();
+        let now = fixed_now();
+        let signed = ManifestBuilder::new(sample_payload())
+            .created_at(now - chrono::Duration::minutes(2))
+            .expires_at(now - chrono::Duration::seconds(1))
+            .sign_with(&id)
+            .expect("sign");
+
+        assert!(matches!(
+            signed.verify_for_remote_execution_at(now),
+            Err(RemoteManifestVerificationError::Manifest(
+                ManifestError::Expired { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn remote_execution_accepts_valid_bounded_manifest() {
+        let id = NodeIdentity::generate();
+        let now = fixed_now();
+        let signed = ManifestBuilder::new(sample_payload())
+            .created_at(now - chrono::Duration::minutes(1))
+            .expires_at(now + chrono::Duration::minutes(5))
+            .sign_with(&id)
+            .expect("sign");
+
+        signed
+            .verify_for_remote_execution_at(now)
+            .expect("valid remote manifest");
     }
 
     #[test]

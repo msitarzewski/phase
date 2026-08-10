@@ -180,11 +180,12 @@ impl PolicyConfig {
             .any(|k| k.eq_ignore_ascii_case(pubkey_hex))
     }
 
-    /// SEC-01: clamp a manifest-supplied `max_tokens` to the operator
-    /// ceiling. `None` (client didn't ask) stays `None`; any value above
-    /// the ceiling is reduced to it.
+    /// SEC-01: force every remote request to a positive, operator-owned
+    /// generation bound. `None`, zero, and values above the configured
+    /// ceiling cannot select a backend-specific unlimited mode.
     pub fn clamp_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
-        requested.map(|n| n.min(self.max_tokens_ceiling))
+        let ceiling = self.max_tokens_ceiling.max(1);
+        Some(requested.unwrap_or(ceiling).clamp(1, ceiling))
     }
 }
 
@@ -1193,6 +1194,18 @@ mod tests {
         let serialized = toml::to_string(&original).expect("serialize");
         let parsed: PolicyConfig = toml::from_str(&serialized).expect("parse back");
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn remote_max_tokens_is_always_positive_and_bounded() {
+        let config = PolicyConfig {
+            max_tokens_ceiling: 256,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(config.clamp_max_tokens(None), Some(256));
+        assert_eq!(config.clamp_max_tokens(Some(0)), Some(1));
+        assert_eq!(config.clamp_max_tokens(Some(128)), Some(128));
+        assert_eq!(config.clamp_max_tokens(Some(u32::MAX)), Some(256));
     }
 
     // --- PolicyEngine surface ---------------------------------------------

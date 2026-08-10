@@ -1,12 +1,14 @@
 # System Patterns: Phase Architecture
 
-**Last Updated**: 2026-05-27
-**Version**: 1.2
-**Status**: MVP Complete + Phase Boot Implemented + Phase Core Released + LUCID Software Complete
+**Last Updated**: 2026-08-09
+**Version**: 1.3
+**Status**: MVP Complete + Phase Boot Implemented + Phase Core Released + LUCID v0.2 Implementation Active (Unreleased)
 
 > **Note (2026-05-27):** The November 2025 patterns below were authored when the daemon was monolithic. The Phase Core release (May 2026) split the daemon into eight crates and added the streaming Worker trait. The pre-existing patterns are still accurate for their domains (WASM execution still works the same way, peer discovery semantics unchanged, etc.) but the crate location prefixes have changed: `daemon/src/network/*` is now `crates/phase-net/src/*`, `daemon/src/wasm/*` is now `crates/plasm/src/wasm/*`, and so on. See `memory-bank/releases/phase-core/` for the full mapping. New patterns introduced by the May 2026 sprint are documented at the bottom of this file under "Streaming Worker Pattern", "DhtTransport Seam Pattern", "Auto-Pause Policy Pattern", and "Peer-Relay Batch Pattern (v0.1)".
 >
 > **Note (2026-06-09):** LUCID v0.1.1 (PRs #10–#13) added three architectural patterns recorded as ADRs in `decisions.md` (2026-06-09) rather than duplicated here: **embeddings ride the existing `OutputChunk` commitment/receipt machinery** (no new `JobResult` shape — `JobSpec::Embedding` emits `"embedding"`-kind chunks the HTTP layer collects), **self-traffic vs donation-protection split** (`should_serve_self` honors only `manual_pause`), and **workers sign receipts with the node identity** so SEC-05 peer-receipt binding (`worker_pubkey → PeerId`) actually holds. Multi-peer relay failover (`RouteDecision.fallback_peers`) extends the Peer-Relay Batch Pattern.
+>
+> **Note (2026-08-09):** The approved LUCID v0.2 implementation checkpoint adds verified content publication, live bounded relay streams, evidence-based reputation/redundancy, a pinned MLX subprocess adapter, and evidence-bearing cross-platform qualification. These patterns are documented at the bottom of this file. They describe implemented structure, not completed release acceptance; the physical two-machine/NAT, large-artifact, Apple MLX, and fleet qualification gates remain open.
 
 ---
 
@@ -22,6 +24,7 @@
 8. [Error Handling](#error-handling)
 9. [Testing Patterns](#testing-patterns)
 10. [Phase Boot Patterns](#phase-boot-patterns)
+11. [LUCID v0.2 Patterns](#patterns-added-2026-08-lucid-v02-checkpoint)
 
 ---
 
@@ -1040,6 +1043,77 @@ Pros: ships in one session, libp2p `request_response` covers it natively, receip
 Cons: peer-routed inference has multi-second TTFT minimum (full generation + one round trip). Document expectation; users with TTFT-sensitive needs use `X-Lucid-Local-Only`.
 
 The wire format change to true streaming in v0.2 is a substream-pattern swap, not a protocol redesign — `JobEvent` framing stays identical, only the libp2p behaviour changes.
+
+The v0.2 live-stream implementation below supersedes this pattern for negotiated v2 peers. The batch protocol remains a compatibility path for v0.1 peers; it is not evidence of v2 streaming acceptance.
+
+---
+
+## Patterns Added 2026-08 (LUCID v0.2 Checkpoint)
+
+### Verification-Before-Exposure Content Pattern
+
+**Where**: `crates/lucidd/src/content.rs`, `crates/lucidd/src/registry.rs`, `crates/phase-artifact-server/src/artifacts.rs`
+
+Content moves through a staged pipeline: resolve the signed name/provider record, fetch into non-public storage, recompute the exact content identifier, and only then commit it to the local catalog and public artifact path. A friendly name is never treated as identity, and bytes are never exposed merely because a peer supplied them.
+
+**Key principles**:
+
+- The content identifier is derived from the bytes and verified before catalog publication.
+- Name-to-CID and provider records are signed and validated at the trust boundary.
+- Interrupted or invalid transfers remain outside the public artifact namespace.
+- Resume and failover preserve the same expected CID; they do not relax identity checks.
+
+### Live Substream Deadline Pattern
+
+**Where**: `crates/phase-net/src/protocol.rs`, `crates/phase-net/src/discovery.rs`, `crates/lucidd/src/router.rs`
+
+Live relay v2 uses bounded opaque frames over a negotiated libp2p substream. Negotiation, stream idleness, and total execution are separate clocks: successful negotiation cannot consume the idle allowance, inbound activity refreshes idle time, and the total deadline still caps the request.
+
+**Key principles**:
+
+- Bound every frame and reject malformed or oversized input before allocation or decoding.
+- Keep negotiation timeout, idle timeout, and total deadline semantically distinct.
+- Preserve ordered `JobEvent` and receipt verification across the wire.
+- Use the v0.1 batch path only as an explicit compatibility fallback.
+
+### Evidence-Is-Not-Proof Pattern
+
+**Where**: `crates/lucidd/src/reputation.rs`, `crates/lucidd/src/router.rs`
+
+Reputation records local, privacy-minimal observations and decays their influence over time. It informs routing but does not become a global truth oracle. Redundant execution raises confidence only when independent results literally agree under the configured comparison rule.
+
+**Key principles**:
+
+- Persist bounded local evidence rather than peer-authored global scores.
+- Decay stale observations and cap their routing effect.
+- Treat disagreement as disagreement; never manufacture consensus.
+- Keep redundancy bounded so verification cannot become uncontrolled duplicate work.
+
+### Pinned Subprocess Backend Pattern
+
+**Where**: `crates/lucidd/src/worker_mlx.rs`, `crates/lucidd/src/worker_llama.rs`
+
+Native inference backends accessed through local subprocesses are bound to a validated executable/runtime and model bundle. Loopback communication disables ambient proxying and redirects, revalidates the child endpoint, and invalidates or terminates the child when its pinned identity no longer matches expectations.
+
+**Key principles**:
+
+- Pin executable/runtime and bundle identity before accepting work.
+- Restrict control/data traffic to the validated loopback endpoint.
+- Disable proxy and redirect behavior that can escape the trust boundary.
+- Report backend availability truthfully when required hardware has not been qualified.
+
+### Evidence-Bearing Qualification Pattern
+
+**Where**: `scripts/phase-validate.sh`, `memory-bank/releases/lucid-v0.2/release-qualification.md`
+
+A qualification result is an evidence directory, not a prose claim. Each run records source fingerprint, lockfile hash, host architecture, toolchain, command outcomes, and ignored-test targets so a pass can be reproduced and its omissions remain visible.
+
+**Key principles**:
+
+- Bind evidence to exact source and dependency state.
+- Separate native architecture results instead of inferring portability.
+- Name every ignored or hardware-gated test in the result.
+- Keep release acceptance open until every required platform and real-network gate has evidence.
 
 ---
 

@@ -1,17 +1,17 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-06-09
-**Version**: 0.3
+**Last Updated**: 2026-08-10
+**Version**: 0.5
 
 ---
 
 ## Overview
 
-This Memory Bank contains all project knowledge, decisions, patterns, and progress tracking for Phase development: the November 2025 MVP + Phase Boot, the May 2026 Phase Core extraction + LUCID flagship, security hardening, and LUCID v0.1.1.
+This Memory Bank contains all project knowledge, decisions, patterns, and progress tracking for Phase development: the November 2025 MVP + Phase Boot, the May 2026 Phase Core extraction + LUCID flagship, security hardening, LUCID v0.1.1, the active-but-unreleased LUCID v0.2 public-network implementation, and the independent planned LUMEN diffusion-node release.
 
 **Navigation**: This TOC is your starting point. Jump to specific files based on what you need.
 
-**Most current state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md) (both refreshed 2026-06-09). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, and `tasks/2026-06/`. Release plans are in `releases/phase-core/` and `releases/lucid/`. (The per-file "Last Updated" dates in the table below predate the May/June work — treat activeContext.md/progress.md as authoritative for current state.)
+**Most current shipped and active state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, `tasks/2026-06/`, and `tasks/2026-08/`. Historical release plans are in `releases/phase-core/` and `releases/lucid/`; the active LUCID v0.2 tracker is [`releases/lucid-v0.2/`](./releases/lucid-v0.2/), and the planned independent LUMEN tracker is [`releases/lumen/`](./releases/lumen/). Tracker status is authoritative; implementation existence does not mean a release shipped.
 
 ---
 
@@ -20,12 +20,12 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 | File | Purpose | Update Frequency | Last Updated |
 |------|---------|------------------|--------------|
 | [projectbrief.md](./projectbrief.md) | Vision, goals, MVP scope | Rarely (major pivots) | 2025-11-08 |
-| [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2025-11-08 |
-| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2025-11-08 |
-| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2025-11-08 |
-| [progress.md](./progress.md) | Status, blockers | Weekly | 2025-11-08 |
+| [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2026-08-09 |
+| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-08-10 |
+| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-08-10 |
+| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-08-10 |
 | [projectRules.md](./projectRules.md) | Coding standards | New patterns | 2025-11-08 |
-| [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2025-11-08 |
+| [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2026-08-10 |
 | [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2025-11-08 |
 
 ---
@@ -227,6 +227,54 @@ What was accomplished
 
 ---
 
+## Current Task Documentation (2026-08)
+
+**Status**: LUCID v0.2 implementation checkpoint approved; release acceptance incomplete
+
+| Task | Status | File |
+|---|---|---|
+| LUCID v0.2 implementation + UMBP qualification | ✅ Checkpoint approved | [260809_lucid-v0.2-implementation-umbp-qualification.md](./tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md) |
+
+**Monthly Summary**: [tasks/2026-08/README.md](./tasks/2026-08/README.md)
+
+---
+
+## Release Plans and Build Trackers
+
+| Release | Status | Authoritative tracker | Scope |
+|---|---|---|---|
+| Phase Core | Released | [releases/phase-core/README.md](./releases/phase-core/README.md) | Workload-neutral crate extraction and generic Worker foundation |
+| LUCID v0.1 | Released | [releases/lucid/README.md](./releases/lucid/README.md) | First inference flagship and Ollama-compatible local/peer path |
+| LUCID v0.2 | Implementation active; unreleased | [releases/lucid-v0.2/README.md](./releases/lucid-v0.2/README.md) | Verified content pull, live relay, NAT reachability, operated network, trust, research-gated sharding, and MLX |
+| LUMEN | Planned; version unassigned | [releases/lumen/README.md](./releases/lumen/README.md) | Independent diffusion node using Phase protocol and artifact substrate |
+
+### LUCID v0.2 milestone specifications
+
+- [Content Plane](./releases/lucid-v0.2/content-plane.md)
+- [Live Relay Plane](./releases/lucid-v0.2/live-relay-plane.md)
+- [Reachability Plane](./releases/lucid-v0.2/reachability-plane.md)
+- [Network Operations](./releases/lucid-v0.2/network-operations.md)
+- [Intended-Stream Vertical Slice](./releases/lucid-v0.2/intended-stream-vertical-slice.md)
+- [Reputation and Redundant Verification](./releases/lucid-v0.2/reputation-and-redundant-verification.md)
+- [ShardWorker](./releases/lucid-v0.2/shardworker.md)
+- [MLX Backend](./releases/lucid-v0.2/mlx-backend.md)
+- [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
+- [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
+
+### LUMEN milestone specifications
+
+- [Product Contract and Compatibility Wedge](./releases/lumen/product-contract-and-compatibility-wedge.md)
+- [Protocol Contract](./releases/lumen/protocol-contract.md)
+- [Artifact Plane](./releases/lumen/artifact-plane.md)
+- [Local Diffusion Worker](./releases/lumen/local-diffusion-worker.md)
+- [Client API and Preview Stream](./releases/lumen/client-api-and-preview-stream.md)
+- [Discovery, Routing, and Policy](./releases/lumen/discovery-routing-and-policy.md)
+- [Intended Image Flow](./releases/lumen/intended-image-flow.md)
+- [Distributed Diffusion Research Gate](./releases/lumen/distributed-diffusion-research-gate.md)
+- [Release Qualification](./releases/lumen/release-qualification.md)
+
+---
+
 ## Memory Bank Workflow (AGENTS.md)
 
 ### When to Read Memory Bank Files
@@ -286,20 +334,22 @@ What was accomplished
 
 ## Memory Bank Statistics
 
-**Total Files**: 9 core files + 6 major task docs + planning files
-**Last Updated**: 2025-11-26
+**Total Files**: Living Memory Bank; use this TOC and `rg --files memory-bank` rather than a stale manual count
+**Last Updated**: 2026-08-10
 **Coverage**:
 - ✅ Project vision and goals (projectbrief.md)
 - ✅ Architecture patterns (systemPatterns.md) - updated with Phase Boot patterns
-- ✅ Tech stack documentation (techContext.md)
-- ✅ Current focus (activeContext.md) - updated for Phase Boot
-- ✅ Progress tracking (progress.md) - MVP + Phase Boot complete
+- ✅ Tech stack documentation (techContext.md) - LUCID v0.2 checkpoint and experimental MLX adapter reflected
+- ✅ Current focus (activeContext.md) - external foundation/Pip/UMBP acceptance staging
+- ✅ Progress tracking (progress.md) - shipped releases plus unreleased LUCID v0.2 checkpoint
 - ✅ Coding standards (projectRules.md)
 - ✅ Architectural decisions (decisions.md)
 - ✅ Quick reference (quick-start.md)
 - ✅ Navigation (toc.md - this file)
-- ✅ Monthly summaries (tasks/2025-11/README.md - complete)
+- ✅ Monthly summaries (2025-11, 2026-05, 2026-06, and 2026-08)
 - ✅ Phase Boot documentation (releases/boot/)
+- ✅ LUCID v0.2 detailed release tracker (releases/lucid-v0.2/)
+- ✅ Independent LUMEN detailed release tracker (releases/lumen/)
 
 ---
 
