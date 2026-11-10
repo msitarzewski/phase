@@ -1,14 +1,28 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2026-06-09
-**Sprint**: LUCID v0.1.1 SHIPPED + validated on real hardware; follow-on fixes merged; umbp current
-**Status**: Phase Core + LUCID v0.1 complete + security-hardened + live on the umbp foundation relay. **PRs #10–#13 merged to `main` (`0aefbb2`)**: v0.1.1 gaps (embeddings, multi-peer retry, self-traffic policy, `/api/pull` stub) + SEC-05 receipt binding made real + echo cross-peer discoverability + notify-watcher scoped-to-file + llama nested-`/embedding` parse. Validated on `scratch` (ARM64) and the M5 Max (real GPU embeddings via `nomic-embed`); authz demo run; **umbp redeployed to `0aefbb2`, peer-id preserved**. 266 tests / clippy `-D warnings` / `cargo audit` 0 vulns. README + Memory Bank refreshed to current state (this pass).
+**Last Updated**: 2026-11-09
+**Sprint**: Refresh competitive positioning, revalidate current hosts/QA, and complete the LUCID v0.2 public-network and trust gates
+**Status**: Phase Core, LUCID v0.1, and v0.1.1 remain shipped. The LUCID v0.2 checkpoint contains approved implementations for verified content pull/alias/provider records, live relay v2, circuit relay/AutoNAT/DCUtR plus fail-closed rendezvous surfaces, reputation and bounded redundant verification, and the experimental MLX adapter. Source `1356ef65…d847` passed macOS ARM64 workspace QA and native UMBP Ubuntu x86_64 release/tests/Clippy plus isolated live HTTP smoke. Checkpoint publication was approved on 2026-08-10. The 2026-08-24 architecture update distinguishes transcript integrity from computation correctness and requires a whole-model independent-job baseline before tensor sharding. This is not a v0.2 release or production deployment: the physical two-network/NAT intended stream, real multi-GB pull/resume, real Apple Silicon MLX, Linux ARM64, public rendezvous quotas, correctness-evidence validator, whole-model baseline, ShardWorker research/ADR, rollback, and clean-host operations remain open.
 
 ---
 
 ## Current Focus
 
-Phase Core and the LUCID flagship are both functional. Eight crates build clean; **266 tests** pass workspace-wide; zero clippy warnings on `cargo clippy --workspace --all-targets -- -D warnings`; `cargo audit` 0 vulns. The two-node demo (LUCID M8) ran on real hardware back in May; since then security hardening (PR #9) and v0.1.1 (PRs #10–#13) shipped, real GPU embeddings were validated on Apple Metal, and the umbp foundation relay runs the current binary. No work is hardware-blocked. Next focus is open (options at the bottom of this file).
+The immediate focus is converting the approved component implementation into release acceptance evidence without weakening the tracker. Seven v0.2 milestones are in progress, the physical intended-stream slice and ShardWorker are blocked on named gates, and Core AI remains not started/non-blocking. The authoritative state and evidence links are in `releases/lucid-v0.2/README.md`; LUMEN remains a separate planned node under `releases/lumen/`.
+
+### CI security and test reliability refresh (2026-11-09)
+
+The owner approved updating dependencies and repairing CI after the new branch runs failed. The repair at `313565e` updates compatible dependency families, scopes audit check-write permission to the advisory job, fixes the relay timeout test's valid peer-failure outcome, and isolates macOS fixture processes after captured socket-inheritance failures. Final local qualification passes 460 tests / 2 ignored, formatting, strict Clippy, actionlint, dependency audit and cargo-deny; there are zero reported vulnerabilities or yanked packages under the existing policy, with four transitive unmaintained warnings retained. The relay test passed 40 repeats and the backend suite passed 16 repeats. See [the dated qualification record](progress.md#ci-security-and-test-reliability-refresh-2026-11-09) for source/evidence details. This supersedes the November 7 local test-investigation blocker; public-network and release-acceptance gates remain open.
+
+### Competitive and operational reassessment — 2026-11-07
+
+- The [current competitive review](research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) identifies OpenHydra as a direct inference-network peer and KwaaiNet as a close nonprofit/technical peer. Petals, exo, AI Horde, Hyperspace, Cocoon and the Public AI utility cover other parts of the intended end state. The category is not empty; differentiation must rest on demonstrated protocol, governance and evidence guarantees.
+- Both READMEs now distinguish shipped v0.1/v0.1.1, implemented-but-unreleased v0.2, and open acceptance gates. Mission copy no longer treats signatures as proof of model execution or onion routing as serving-operator confidentiality. Historical June provider/political/model-ranking claims remain clearly marked as unvalidated history, not current positioning evidence.
+- The existing [trust milestone](releases/lucid-v0.2/reputation-and-redundant-verification.md#method-comparison--2026-11-07) now compares TOPLOC, redundant replay, log-probability challenges and TEE assumptions, with an experiment/go-no-go record. No new validator or correctness guarantee is claimed.
+- Read-only host preflight found `beacon` reachable but without a Phase service/toolchain or TCP 4001 ingress; historical `pip` timed out; `pipx` is now a reachable NVIDIA/Linux contributor candidate without Phase/llama-server tooling. Reconfirm the physical/NAT topology rather than assuming the August M1 assignment still holds. The [operator runbook](releases/lucid-v0.2/intended-stream-vertical-slice.md#operator-runbook--2026-11-07) records prerequisites and concrete actor commands.
+- Fresh QA is separate from August's passing checkpoint. Initial failures are retained at `target/phase-validation/20261107T182908Z-24926/`. Internal HTTP error boxing and narrow annotations for async_trait-generated attributes resolve Rust 1.99 strict-Clippy diagnostics; the existing test allocator now probes whole disjoint ranges below standard ephemeral ports. A full workspace run passed 460 tests / 2 ignored, formatting and strict Clippy at `target/phase-validation/20261107T184728Z-43089/`.
+- Repeated backend suites still expose an intermittent subprocess startup bind failure (diagnostics report `Address already in use`), including after several successful runs. Fixture stderr can now be retained with `PHASE_TEST_DIAGNOSTICS_DIR`; the six-run diagnostic campaign passed five times and failed once. This remains an open QA issue; the required retry/time-budget extension was requested before further investigation or public-host setup. One full green run is not a waiver for the repeated failure.
+- The real installed llama-server 0.8.0/build 11960 and 6,975,879,008-byte Gemma GGUF passed the existing explicit hardware smoke separately. This is local backend evidence only; no public-network, multi-GB pull/resume, MLX or independent-validator gate is promoted.
 
 ```
 crates/
@@ -22,12 +36,43 @@ crates/
 └── lucidd/                 # LUCID daemon — inference Phase node (in progress)
 ```
 
+### Verification and scale sequencing — 2026-08-24
+
+- Existing receipt verification binds signer, dispatched job, serving PeerId, chunk sequence/count, and delivered output commitment. That is attributable transcript integrity, not proof that the peer executed the claimed model/backend correctly (`crates/lucidd/src/router.rs:1550-1678`).
+- The next trust upgrade is a bounded, versioned, workload-specific evidence seam: serving backends generate exact-bound opaque evidence; independently selected LUCID validators interpret it and sign explicit empirical/probabilistic trust labels. The generic Phase stream may carry and commit the bytes without learning inference semantics.
+- Before `ShardWorker`, benchmark heterogeneous peers executing complete exact-CID jobs independently. Reuse router eligibility, `ModelCapabilities`, verified content pull, worker lifecycle, commitments, and receipts; measure aggregate throughput, latency, content fan-out, validator overhead, fairness, and failure recovery.
+- ShardWorker advances only if that baseline leaves a concrete workload requirement unmet and the partial-compute verification ADR passes. Open authorization is no longer tied to sharding; its gate is correctness evidence plus public-load, amplification, Sybil, abuse, and network qualification.
+
+---
+
+## LUCID v0.2 approved implementation checkpoint (2026-08-09)
+
+- **Content Plane**: content-derived GGUF CIDs, canonical MLX bundle roots, signed alias/provider records, durable rollback protection, bounded resumable transfer, verification-before-commit, catalog restore, and real `/api/pull` coordination are implemented. Real multi-gigabyte physical transfer/resume remains.
+- **Live Relay Plane**: v2 ordered substreams, cancellation, terminal receipts, shared v1/v2 admission/replay gates, backpressure, and strict frame/lifecycle validation are implemented. Linux qualification found and fixed the negotiation-vs-idle timing bug.
+- **Reachability**: explicit peer/infrastructure roles, relay server/client, AutoNAT, rendezvous client/optional-server surfaces, DCUtR, path observation, and exact relay-loopback tests are implemented. The production daemon deliberately keeps the public rendezvous server disabled until global/per-peer/per-namespace quotas exist (`crates/lucidd/src/main.rs:756-765`). Real consumer NAT/DCUtR remains.
+- **Trust**: privacy-minimal local evidence, decay/confidence/cold-start assessment, operator precedence, truthful outcome taxonomy, and bounded deterministic redundancy are implemented. Receipts prove transcript integrity; the correctness-evidence/independent-validator seam remains unimplemented, and no global-truth or partial-compute claim is made.
+- **MLX**: a pinned-bundle loopback subprocess adapter reuses the shared Worker/router/API/receipt path and fails closed on unsupported platforms or mutable runtime/content. Real Apple Silicon model acceptance remains.
+- **Qualification**: macOS ARM64 460 passed / 2 ignored; UMBP Linux x86_64 450 passed / 2 ignored plus all-target release and strict Clippy; live isolated HTTP generate/stream/embed passed; zero vulnerabilities. Evidence: `target/phase-validation/linux-x86_64-umbp/1356ef6520ce7ad7dab6369ed40e50cd7507bfff570df87f1881db41fbb7d847/20260809T183940Z-634076/`.
+- **Production safety**: UMBP qualification used separate fingerprinted source/evidence and transient units. The standing relay stayed on PID `106521`, zero restarts, and its existing ports/config/Caddy were untouched.
+- **Next executable gate**: finish the UMBP backup/Ubuntu 26.04 LTS upgrade and post-upgrade audit, provision the independent public foundation node, enroll Pip as the Apple Silicon contributor candidate, then run the physical consumer/contributor/relay intended stream. Independently rerun Linux ARM64 qualification and real MLX acceptance. Trust/scale research starts with the correctness-evidence contract and whole-model independent-job baseline; ShardWorker cannot begin until that baseline and its verification research/ADR are approved.
+
+See `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+## Approved external test topology (2026-08-10)
+
+- **Public foundation node**: provision a small DigitalOcean Ubuntu x86_64 host with a Reserved IPv4 and run `lucidd --mode infrastructure` locally. The recommended starting envelope is 1 vCPU, 2 GB RAM, and 50 GB disk; the Phase service remains capped at 1 GB and 200% CPU by `crates/lucidd/systemd/lucidd-relay.service:35-40`.
+- **Traffic separation**: expose native Phase/libp2p TCP `4001` directly to the foundation `lucidd`. Terminate web TCP `80/443` in Caddy on the public host and proxy web origins to UMBP over Tailscale, not to the DHCP-assigned Sonic public address. The LUCID HTTP API remains loopback-only; Ollama is never public.
+- **Contributor**: Pip, the M1 iMac with 16 GB RAM, is the Apple Silicon inference/MLX acceptance candidate. Its Tailscale address is private operational data and is used for administration, not as proof of Phase relay reachability.
+- **Requester**: the current Apple Silicon development machine on a physically different network is the consumer. Proton VPN/Tailscale may remain available for administration, but acceptance traffic must traverse the Phase public relay path rather than a Tailscale data path.
+- **UMBP**: remains the existing foundation/HTTP origin during transition. A backup snapshot is in progress before its Ubuntu 26.04 LTS upgrade; it must pass SSH, Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, and TCP `4001` post-upgrade checks before re-entering the test matrix.
+- **Acceptance truth**: the DigitalOcean plan supplies the missing independent public actor and stable ingress, but it does not complete the milestone until real pull/resume, relay-only inference, first-token timing, cancellation, receipt verification, DCUtR/fallback, and resource evidence are recorded.
+
 ---
 
 ## Phase Core COMPLETE (May 2026)
 
 - [x] **M1**: Workspace scaffold — root Cargo.toml, eight crate skeletons, SPDX headers, empty `cargo build --workspace` green.
-- [x] **M2**: Extract `phase-net` — libp2p 0.54 → 0.57 upgrade, Kademlia + mDNS + Noise+QUIC, generic peer capabilities decoupled from WASM-specific fields.
+- [x] **M2**: Extract `phase-net` — libp2p upgraded to the current workspace 0.56 line, Kademlia + mDNS + Noise+QUIC, generic peer capabilities decoupled from WASM-specific fields.
 - [x] **M3**: Extract `phase-identity` — persistent Ed25519 keypair on disk via `dirs` crate, fixes the ephemeral-key bug carried over from the November MVP.
 - [x] **M4**: `phase-protocol` — `JobSpec` enum with `Wasm` and `Inference` variants, streaming `Worker` trait with `JobHandle` + `JobStream`, `DynWorker` object-safe shim.
 - [x] **M5**: Extract `phase-manifest` + `phase-receipt` — generic `SignedManifest<T>` / `SignedReceipt<T>` envelopes, Ed25519 signing reused from `phase-identity`, commitment-accumulator chunk hashing for streamed results.
@@ -73,13 +118,13 @@ Three dependency advisories documented-and-accepted (upstream-pinned hickory via
 
 **Post-merge (2026-06-09):** umbp relay redeployed to v0.1.1 (x86_64 cross-build, peer-id `12D3KooWJ6vTjo6yFgEc…` preserved, old binary backed up `~/bin/lucidd.pre-v0.1.1`). Two-node authz demo run on `scratch` (default-deny reject → escape-hatch accept w/ `receipt-verified: true`). Demo surfaced + fixed two latent bugs on branch **`lucid-sec05-receipt-binding`** (workers now sign receipts with the node identity → SEC-05 peer-receipt binding actually works; echo model advertised under `from_model_id` → cross-peer discoverable). Deferred: policy notify-watcher dir-scope reload loop (see `decisions.md` 2026-06-09).
 
-## Next Thread (OPEN — undecided as of 2026-06-09)
+## Historical candidate threads (2026-06-09; superseded by Current Focus)
 
 v0.1.1 is shipped; no forced next step. Candidate threads, roughly by leverage:
 
 - **Remaining LUCID gaps:** real network `/api/pull` (content-hashed CIDs), token streaming over the relay, a content-hashed cross-peer name→CID index (today the deterministic `from_model_id` placeholder stands in). All v0.2-flavored. `scratch` is the clean test target; Mac M5 Max for GPU/real-embedding-model validation.
 - **Reach / "anyone, anywhere":** make `--bootstrap-dns` the default for fresh installs; stand up 2-3 more geographically-distributed foundation relays (Hetzner CAX11s ~$4/mo); the consumer install page at `phasebased.com` (mom-language one-liner).
-- **v0.2 frontier:** `ShardWorker` sharded inference (was `ExoProxyWorker` — renamed off the "exo" trademark, can still *proxy to* exo clusters per nominative fair use) — gated on the **partial-compute verification open problem** (recorded in `decisions.md` 2026-05-29; redundant-execution + reputation spot-checking is the likely answer). Flipping the authz default to open is in-scope for this milestone (see [[authz-default-flip-trigger]]).
+- **v0.2 frontier:** strengthen LUCID trust with an exact-bound correctness-evidence/independent-validator seam, then measure whole-model independent-job parallelism across heterogeneous peers. `ShardWorker` remains gated on both that control baseline and the **partial-compute verification open problem** (`decisions.md#2026-05-29-verifying-sharded--partial-computation-is-an-unsolved-open-problem-recorded-risk`). Open authorization has a separate correctness/load/abuse/public-network trigger and is not a ShardWorker deliverable.
 - **LUMEN:** stand up the diffusion-node skeleton against the substrate — proves the second flagship compiles, validates the workload-agnostic bet. Post-v0.1.
 - **MLX worker (LUCID M3, deferred):** Apple Silicon native inference (GPU/Metal, via turnkey `mlx-lm`) — the M5 Max can validate it. Faster path to an Apple backend.
 - **`CoreAIWorker` (Apple Neural Engine backend, candidate):** license-clean path to run *our own* converted open-weights models on the ANE — the efficiency play for always-on contributor Macs (pairs with M7 battery/thermal auto-pause). After MLX; more harness work (you supply tokenizer/KV-cache/sampling); **gated on verifying the public Core AI API exposes KV-cache / stateful decode.** Full analysis: `research/2026-06-09-apple-coreai-foundation-models.md`. NOTE: Apple **Foundation Models** is a hard no for a LUCID backend (ToS + unenforceable-AUP-for-a-relay) — see `decisions.md` 2026-06-09.
@@ -98,7 +143,7 @@ v0.1.1 is shipped; no forced next step. Candidate threads, roughly by leverage:
 - [x] **LUCID M7**: Policy + auto-pause — declarative `lucid-policy.toml` (default at `~/.config/lucidd/policy.toml`), `PauseReason::{Manual, OnBattery, ThermalLimit, OutsideTimeWindow, ConcurrencyLimit, ModelNotInAllowlist, SystemPaused}`. Battery via the `battery` crate (macOS IOKit / Linux sysfs), thermals via `sysinfo`. Config reload via `notify` filesystem watch + SIGHUP. 24 policy tests cover every decision branch.
 - [ ] **LUCID M8**: Two-node end-to-end demo — *Hardware-blocked.* Software is ready. Requires Machine A (Linux + 24GB+ NVIDIA GPU + real llama-server binary + a GGUF model) and Machine B (any Linux), Tailscale-bridged or real WAN.
 
-## Honest v0.1 Limitations (all v0.2 work, none demo-blocking)
+## Historical v0.1 limitations (superseded by the v0.2 tracker)
 
 - Peer-relay is batch-shaped; token streaming across the relay is v0.2
 - No multi-peer retry on first-peer failure
@@ -192,11 +237,13 @@ The first "M8 complete" claim earlier in the day was premature — the user got 
 ## Blockers & Risks
 
 ### Current Blockers
-None for LUCID M2 work; pure-software path on commodity Linux + llama.cpp.
+- Repeated backend startup: the full workspace passes, but stress repeats still intermittently fail while binding the fixture server. Resolve the race and repeat qualification; diagnostics and failed attempts are retained. Further investigation is at the AGENTS.md retry/time-budget gate.
+- Physical acceptance: install fingerprinted test actors/backends, arrange scoped native Phase ingress, verify the actual consumer-NAT topology and record the complete intended stream. The former M1 contributor is not currently reachable through its documented alias.
+- Correctness validation, whole-model control measurements, real MLX, Linux ARM64 and remaining operational qualification remain open as described by the authoritative release tracker.
 
 ### Risks
 - **First-token latency over WAN**: DHT-routed inference may have unacceptable TTFT. Mitigation: stream tokens, local-only fast path.
-- **Privacy perception**: Per-request prompts visible to serving peer in v0.1. Mitigation: honest disclosure, local-only toggle, v0.3 cryptographic privacy committed.
+- **Prompt visibility**: Serving operators can read remote prompts. Mitigation: honest disclosure and local-only operation; stronger confidentiality requires a separate construction and qualification, not transport encryption alone.
 - **Ollama API drift**: Upstream API moves faster than LUCID can track. Mitigation: pin to a specific API version, document drift.
 
 ---
@@ -248,10 +295,15 @@ Substrate extraction. Seven publishable Phase library crates (Apache-2.0) + Plas
 
 ## Next Actions (Priority Order)
 
-1. Open LUCID M2 — `LlamaCppWorker` subprocess management.
-2. Stand up CI for the workspace (currently local-only verification).
-3. Schedule LUCID M3 MLX work for next Apple Silicon dev session.
-4. Begin sequential crates.io publication of phase-identity → phase-* → plasm once a publication policy is decided.
+1. Obtain the required retry/time-budget extension, resolve the remaining fixture startup bind race using captured diagnostics, and rerun qualification. Keep failed evidence and the exact source/toolchain for every attempt.
+2. Reconcile current `beacon`/`pipx` host roles with the historical August topology. Verify UMBP upgrade/service state before reusing it; do not assume the old M1 or relay is still available.
+3. Stage fingerprinted isolated native Phase actors and a real backend, arrange scoped public Phase ingress and rollback, and validate relay reservations with public rendezvous still disabled. Preserve existing Caddy/SSH/identities.
+4. Capture real local inference evidence on available hardware. Assign separate actual Apple Silicon hardware for the pinned MLX contract; Linux/NVIDIA cannot satisfy that gate.
+5. Run the [physical intended stream](releases/lucid-v0.2/intended-stream-vertical-slice.md#operator-runbook--2026-11-07), including cold alias resolution, multi-GB pull/resume, token streaming, cancellation, receipt verification, forced relay path, and DCUtR/fallback observations. Establish network independence from observed topology, not host aliases.
+6. Rerun Linux ARM64 qualification and complete the remaining release, rollback, fleet, reputation, and clean-host gates.
+7. Specify and threat-model the bounded correctness-evidence envelope, exact bindings, method negotiation, validator independence, verdict taxonomy, privacy limits, and client-visible trust labels.
+8. Run the whole-model independent-job control baseline across heterogeneous exact-CID peers using existing LUCID routing, content, worker, commitment, and receipt paths.
+9. Reassess ShardWorker only from the baseline’s measured unmet requirement; it remains research-blocked until the partial-compute verification ADR also passes.
 
 ---
 
@@ -268,4 +320,4 @@ Substrate extraction. Seven publishable Phase library crates (Apache-2.0) + Plas
 
 ---
 
-**This document is updated at milestone boundaries. Last review: 2026-05-27.**
+**This document is updated at milestone boundaries. Last review: 2026-08-10.**

@@ -32,11 +32,16 @@ libp2p = { version = "0.56", features = [
     "dcutr",
     "autonat",
     "identify",
+    "rendezvous",
     "mdns",
     "request-response",
     "json",
     "cbor",
 ] }
+# Official generic substream behaviour used by the distinct v2 live relay
+# protocol. This keeps token/event streaming on the existing libp2p swarm
+# while leaving v1 request/response compatibility explicit.
+libp2p-stream = "0.4.0-alpha"
 
 # Async runtime + stream plumbing.
 tokio = { version = "1.0", features = ["full"] }
@@ -49,6 +54,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_bytes = "0.11"
 base64 = "0.22"
+postcard = { version = "1", features = ["use-std"] }
 
 # Cryptography. Used only to bridge phase-identity's Ed25519 secret into the
 # libp2p Keypair — the actual signing live in phase-identity / phase-receipt.

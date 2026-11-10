@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Integration tests for `LlamaCppWorker` against the in-tree
-//! `fake-llama-server` fixture binary (see `tests/fixtures/`).
+//! test-only llama-server protocol fixture (see `tests/fixtures/`).
 //!
 //! These tests deliberately don't require a real `llama-server` or any
-//! GGUF model on disk — the fake binary emits SSE frames in the same
+//! GGUF model on disk — the fixture emits SSE frames in the same
 //! shape the real server uses, plus configurable failure modes
 //! (`FAKE_LLAMA_CRASH_AFTER_MS`, `FAKE_LLAMA_HANG_AFTER`, etc.). The
-//! real-binary path is exercised separately by `real_llama_server`
+//! fixture is compiled into this integration-test harness and reached by a
+//! temporary re-exec wrapper, so it is never an installable production
+//! binary. The real-binary path is exercised separately by `real_llama_server`
 //! (gated on `#[ignore]` + the `LLAMA_SERVER_PATH` env var).
 //!
 //! Each test:
 //! 1. Allocates a temp dir; touches a `dummy.gguf` so the model-file
-//!    existence check passes. The fake server ignores `--model`.
-//! 2. Constructs `LlamaCppConfig { server_binary_path: <fake>, … }`.
+//!    existence check passes. The protocol fixture ignores `--model`.
+//! 2. Constructs `LlamaCppConfig { server_binary_path: <fixture-launcher>, … }`.
 //! 3. Builds a `SignedManifest<JobSpec>` and drives `worker.execute()`.
 //! 4. Collects the resulting [`JobEvent`]s and asserts on shape.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -30,18 +33,125 @@ use phase_protocol::{
     SignedManifest, Worker,
 };
 
-/// Pick a port that's free *right now*. The fake binary will re-bind it
-/// almost immediately; on the tiny window between drop and re-bind we
-/// accept the rare flake.
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+#[path = "fixtures/fake_llama_server.rs"]
+mod fake_llama_server;
+
+/// On macOS, parallel fixture processes have inherited another test's
+/// temporary listening socket during startup. Isolate each probe/spawn/use
+/// scenario through worker teardown; disjoint port numbers alone cannot
+/// prevent an inherited descriptor from keeping a probe bound.
+#[cfg(target_os = "macos")]
+async fn fixture_process_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    GATE.lock().await
 }
 
-fn fake_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_fake-llama-server"))
+/// Keep fixture ranges disjoint across parallel tests and probe every slot.
+/// Use ports below the standard ephemeral ranges so outgoing health/request
+/// connections do not claim a fixture's not-yet-started adjacent server port.
+/// The external close-to-child-bind race remains because llama-server cannot
+/// inherit listeners, but another test cannot allocate an adjacent range here.
+fn free_port_range(span: u16) -> std::ops::Range<u16> {
+    static RESERVED: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    assert!(span > 0);
+    let mut reserved = RESERVED.get_or_init(Mutex::default).lock().unwrap();
+    for _ in 0..128 {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let start = 20_000 + first.local_addr().unwrap().port() % 10_000;
+        let Some(end) = start.checked_add(span) else {
+            continue;
+        };
+        let range = start..end;
+        if range.clone().any(|port| reserved.contains(&port)) {
+            continue;
+        }
+        let remaining = range
+            .clone()
+            .map(|port| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)))
+            .collect::<std::io::Result<Vec<_>>>();
+        if let Ok(_listeners) = remaining {
+            reserved.extend(range.clone());
+            return range;
+        }
+    }
+    panic!("could not allocate a disjoint fixture port range");
+}
+
+fn free_port() -> u16 {
+    free_port_range(1).start
+}
+
+/// Quote arbitrary UTF-8 text for a POSIX shell single-quoted word.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build an ephemeral subprocess launcher for the fixture entrypoint baked
+/// into this integration-test executable. `LlamaCppWorker` can therefore
+/// exercise its real `Command` supervision path without publishing or
+/// installing a test server binary as part of the `lucidd` package.
+fn fixture_launcher(dir: &Path) -> PathBuf {
+    let test_exe = std::env::current_exe().expect("resolve llama_worker test executable");
+    let test_exe = test_exe
+        .to_str()
+        .expect("llama_worker test executable path must be UTF-8");
+    let launcher = dir.join("llama-server-test-fixture");
+    // Opt-in persistent diagnostics survive TempDir cleanup on a failed test.
+    let diagnostics_dir = std::env::var_os("PHASE_TEST_DIAGNOSTICS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.to_path_buf());
+    std::fs::create_dir_all(&diagnostics_dir).expect("create fixture diagnostics directory");
+    let diagnostics_prefix = diagnostics_dir.join("fixture");
+    let script = format!(
+        r#"#!/bin/sh
+port=""
+host="127.0.0.1"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --port)
+            [ "$#" -ge 2 ] || exit 64
+            port="$2"
+            shift 2
+            ;;
+        --host)
+            [ "$#" -ge 2 ] || exit 64
+            host="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+[ -n "$port" ] || exit 64
+export PHASE_FAKE_LLAMA_SERVER_PROCESS=1
+export PHASE_FAKE_LLAMA_PORT="$port"
+export PHASE_FAKE_LLAMA_HOST="$host"
+exec {} --exact fixture_server_process_entrypoint --ignored --nocapture 2>> {}."$port".log
+"#,
+        shell_quote(test_exe),
+        shell_quote(diagnostics_prefix.to_str().expect("UTF-8 fixture path"))
+    );
+    std::fs::write(&launcher, script).expect("write fixture subprocess launcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture subprocess launcher executable");
+    }
+    launcher
+}
+
+/// Internal subprocess entrypoint. It is ignored during ordinary test runs
+/// and only entered by `fixture_launcher` with the explicit process marker.
+#[test]
+#[ignore = "internal llama-server fixture subprocess entrypoint"]
+fn fixture_server_process_entrypoint() {
+    if std::env::var_os("PHASE_FAKE_LLAMA_SERVER_PROCESS").is_none() {
+        eprintln!("internal fixture entrypoint unavailable outside its launcher");
+        return;
+    }
+    fake_llama_server::run();
 }
 
 fn make_manifest(model_id: &str, prompt: &str) -> SignedManifest<JobSpec> {
@@ -72,7 +182,7 @@ fn setup(model_id: &str) -> TestModel {
     std::fs::write(&model_path, b"fake").expect("touch model");
     let port = free_port();
     let config = LlamaCppConfig {
-        server_binary_path: fake_binary(),
+        server_binary_path: fixture_launcher(dir.path()),
         model_dir: dir.path().to_path_buf(),
         default_n_gpu_layers: 0,
         default_context_size: 2048,
@@ -117,13 +227,13 @@ fn multi_model_worker(
     for id in model_ids {
         std::fs::write(dir.path().join(format!("{id}.gguf")), b"fake").expect("touch model");
     }
-    let base = free_port();
+    let port_range = free_port_range(port_range_span);
     let config = LlamaCppConfig {
-        server_binary_path: fake_binary(),
+        server_binary_path: fixture_launcher(dir.path()),
         model_dir: dir.path().to_path_buf(),
         default_n_gpu_layers: 0,
         default_context_size: 2048,
-        server_port_range: base..(base + port_range_span),
+        server_port_range: port_range,
         max_loaded_models,
         model_load_timeout: Duration::from_secs(10),
         per_request_idle_timeout: Duration::from_secs(5),
@@ -138,6 +248,8 @@ fn multi_model_worker(
 
 #[tokio::test]
 async fn lru_eviction_at_cap_and_port_reused_on_reload() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // SEC-07: cap = 2, three distinct models, three ports available.
     // Loading the third evicts the LRU (the first). Reloading the evicted
     // model then succeeds — its port was freed and is reacquired cleanly.
@@ -160,6 +272,8 @@ async fn lru_eviction_at_cap_and_port_reused_on_reload() {
 
 #[tokio::test]
 async fn port_range_exhaustion_returns_capacity() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // SEC-07: a single-port range with a cap of 2 lets the first model
     // bind the only port; loading a SECOND distinct model (still resident,
     // not evicted because we're under the model cap) finds no free port and
@@ -180,6 +294,8 @@ async fn port_range_exhaustion_returns_capacity() {
 
 #[tokio::test]
 async fn happy_path_streams_tokens_and_signs_receipt() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("happy");
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
     let manifest = make_manifest(&setup.model_id, "Hello.");
@@ -204,7 +320,7 @@ async fn happy_path_streams_tokens_and_signs_receipt() {
     assert_eq!(final_completion, Some(Completion::Stop));
     assert!(!tokens.is_empty(), "expected at least one token");
     let joined: String = tokens.concat();
-    // Default token list in the fake binary is "Hello,, ,world,!".
+    // Default fixture token list is "Hello,, ,world,!".
     assert!(joined.contains("Hello"));
     assert!(joined.contains("world"));
 
@@ -217,6 +333,8 @@ async fn happy_path_streams_tokens_and_signs_receipt() {
 
 #[tokio::test]
 async fn cancellation_mid_stream_yields_cancelled_completion() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let mut setup = setup("cancel");
     // Slow tokens so we definitely cancel before the stream finishes.
     // Per-spawn env (not process env) keeps this test isolated when run
@@ -257,6 +375,8 @@ async fn cancellation_mid_stream_yields_cancelled_completion() {
 
 #[tokio::test]
 async fn hang_detection_aborts_request_and_marks_model_suspect() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("hang");
     // Tight idle window so the test runs fast.
     let mut cfg = setup.config;
@@ -293,6 +413,8 @@ async fn hang_detection_aborts_request_and_marks_model_suspect() {
 
 #[tokio::test]
 async fn crash_during_load_surfaces_as_dispatch_error() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("crash-at-load");
     // Crash before /health ever returns 200.
     let mut cfg = setup.config;
@@ -314,6 +436,8 @@ async fn crash_during_load_surfaces_as_dispatch_error() {
 
 #[tokio::test]
 async fn missing_model_file_returns_artifact_unavailable() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("present"); // Real file on disk.
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
 
@@ -332,6 +456,8 @@ async fn missing_model_file_returns_artifact_unavailable() {
 
 #[tokio::test]
 async fn embedding_streams_vectors_and_signs_receipt() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // Drive the embedding path against the fake server's canned `/embedding`
     // handler. Two inputs → two "embedding"-kind chunks, one per input,
     // ordered by `seq`, each decoding to the canned Vec<f32>. The terminal
@@ -382,22 +508,23 @@ async fn embedding_streams_vectors_and_signs_receipt() {
 }
 
 // -----------------------------------------------------------------------
-// Optional: real llama-server integration test. Skipped unless
-// `LLAMA_SERVER_PATH` is set. Marked `#[ignore]` so `cargo test` doesn't
-// run it by default — invoke with `cargo test -- --ignored` to opt in.
+// Optional: real llama-server integration test. Marked `#[ignore]` so
+// ordinary `cargo test` reports the external hardware gate without trying
+// it. An explicit run fails (rather than silently passing) unless both
+// required paths are supplied.
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore]
-async fn real_llama_server_smoke_test_when_env_set() {
-    let Ok(bin) = std::env::var("LLAMA_SERVER_PATH") else {
-        eprintln!("LLAMA_SERVER_PATH not set; skipping");
-        return;
-    };
-    let Ok(model) = std::env::var("LLAMA_TEST_MODEL_PATH") else {
-        eprintln!("LLAMA_TEST_MODEL_PATH not set; skipping");
-        return;
-    };
+async fn real_llama_server_smoke_test_requires_explicit_hardware_env() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    let bin = std::env::var("LLAMA_SERVER_PATH").expect(
+        "real llama hardware gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_MODEL_PATH",
+    );
+    let model = std::env::var("LLAMA_TEST_MODEL_PATH").expect(
+        "real llama hardware gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_MODEL_PATH",
+    );
 
     let model_path = PathBuf::from(&model);
     let model_dir = model_path

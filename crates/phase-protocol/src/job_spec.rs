@@ -141,10 +141,10 @@ pub struct InferenceJobSpec {
     #[serde(default)]
     pub resume_from: Option<ConversationToken>,
 
-    /// Sampling parameters. Backend-specific knobs that the worker passes
-    /// through; unrecognised keys are ignored. Keeping this open-ended is
-    /// what lets `top_p` / `min_p` / `temperature` / `repetition_penalty`
-    /// / `seed` / etc. land without protocol churn.
+    /// Sampling parameters. Workers MUST reject unrecognised or unsupported
+    /// keys rather than silently changing the semantics of a signed request.
+    /// The map remains extensible so supported keys can land without a wire
+    /// schema revision.
     #[serde(default)]
     pub sampling: SamplingParams,
 
@@ -152,9 +152,10 @@ pub struct InferenceJobSpec {
     #[serde(default)]
     pub max_tokens: Option<u32>,
 
-    /// If true, the worker SHOULD stream `OutputChunk`s as tokens are
-    /// produced. If false, the worker MAY still stream internally but
-    /// MUST emit only the terminal [`crate::JobEvent::Final`].
+    /// Delivery preference for the requester edge. Workers still emit ordered
+    /// `OutputChunk`s so commitments and receipts bind the exact result; an
+    /// HTTP/API edge requesting `false` buffers those chunks and returns one
+    /// terminal response.
     #[serde(default = "default_true")]
     pub stream: bool,
 }
@@ -203,15 +204,16 @@ pub enum ChatRole {
     Tool,
 }
 
-/// Open-ended sampling knobs. Workers extract what they understand and
-/// silently ignore the rest. Concrete keys consumers may set today:
+/// Extensible sampling knobs. Workers extract keys they support and reject
+/// the request if any remaining key is unknown or unsupported. Concrete keys
+/// consumers may set today:
 /// `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`,
 /// `stop` (as a JSON-encoded array).
 ///
 /// Values are JSON-encoded strings so this struct is portable across the
 /// protocol without dragging `serde_json::Value` into the wire schema —
-/// workers parse what they understand and ignore the rest. The cost is a
-/// double-encoding for numeric params (e.g. `"0.7"` instead of `0.7`),
+/// workers parse and validate before dispatch. The cost is a double-encoding
+/// for numeric params (e.g. `"0.7"` instead of `0.7`),
 /// which is negligible vs the upside of not coupling the protocol crate
 /// to a specific dynamic-JSON representation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -276,7 +278,7 @@ mod serde_bytes_field {
 /// that produced them, and re-encoding them here would either duplicate
 /// (bloat) or summarise (lossy). `JobResult` instead carries the *commitment*
 /// over the stream and the metadata a verifier needs to replay it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobResult {
     /// Hash of the [`JobSpec`] this result corresponds to. Lets a verifier
     /// link receipt → manifest without having to carry the full spec twice.
@@ -329,7 +331,7 @@ pub enum Completion {
 }
 
 /// Best-effort metrics. Not load-bearing for verification.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobMetrics {
     #[serde(default)]
     pub total_duration_ms: u64,

@@ -52,7 +52,9 @@ pub struct PeerCapabilities {
     /// Logical CPU count.
     pub cpu_count: u32,
 
-    /// Memory available, in MiB.
+    /// Memory available, in MiB. `0` means the capacity has not been measured;
+    /// schedulers must not treat an unknown value as satisfying any positive
+    /// memory requirement.
     pub memory_mb: u64,
 
     /// Job kinds this peer is willing to serve. A scheduler matches the
@@ -120,10 +122,10 @@ impl Default for PeerCapabilities {
         Self {
             arch: std::env::consts::ARCH.to_string(),
             cpu_count: num_cpus::get() as u32,
-            // TODO(M-future): detect actual RAM. The November 2025 MVP
-            // hard-coded 4096 MiB; preserved here to avoid behaviour drift
-            // during the extraction.
-            memory_mb: 4096,
+            // Capacity is unknown until a caller supplies a measured value.
+            // Zero preserves the existing wire type while ensuring the
+            // admission check rejects every positive memory requirement.
+            memory_mb: 0,
             // Default to "the workloads Plasm serves today". Other node
             // implementations (LUCID, image-gen, etc.) overwrite this in
             // their own bootstrap; phase-net does not assume a runtime.
@@ -155,13 +157,24 @@ mod tests {
         let caps = PeerCapabilities::default();
         assert!(!caps.arch.is_empty());
         assert!(caps.cpu_count > 0);
-        assert!(caps.memory_mb > 0);
+        assert_eq!(caps.memory_mb, 0);
         assert!(caps.supported_kinds.contains(&JobSpecKind::Wasm));
         // Live-load fields default to None — a fresh node has nothing measured.
         assert!(caps.measured_latency_bucket.is_none());
         assert!(caps.measured_bandwidth_bucket.is_none());
         assert!(caps.current_concurrency.is_none());
         assert!(caps.last_measured_at.is_none());
+    }
+
+    #[test]
+    fn unknown_memory_cannot_satisfy_a_positive_requirement() {
+        let caps = PeerCapabilities::default();
+        let satisfies = |required_mb| required_mb <= caps.memory_mb;
+
+        assert_eq!(caps.memory_mb, 0);
+        assert!(satisfies(0));
+        assert!(!satisfies(1));
+        assert!(!satisfies(u64::MAX));
     }
 
     #[test]

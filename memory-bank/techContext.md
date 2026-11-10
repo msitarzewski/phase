@@ -1,19 +1,19 @@
 # Technical Context: Phase Technology Stack
 
-**Last Updated**: 2026-06-09
+**Last Updated**: 2026-08-10
 **Version**: 0.2
-**Status**: Phase Core + LUCID v0.1 shipped — see "Current Stack" note below
+**Status**: Phase Core + LUCID v0.1/v0.1.1 shipped; LUCID v0.2 implementation checkpoint approved but unreleased
 
 ---
 
-> **⚠️ Current Stack (2026-06-09) — supersedes the MVP selections below.**
+> **⚠️ Current Stack (2026-08-10) — supersedes the MVP selections below.**
 > The November 2025 stack table further down reflects the *original MVP choices* (kept for historical rationale). The actual shipped stack is now:
 >
 > | Component | Now (shipped) | Was (MVP doc below) |
 > |---|---|---|
-> | WASM engine | **wasmtime 36.0.10 LTS** (plasm) — wasm3 fully retired | "wasm3 (MVP), wasmtime (future)" |
-> | libp2p | **0.56** (Kademlia, mDNS, Noise+QUIC, request_response) | 0.53 |
-> | Inference backend | **llama.cpp** via `llama-server` subprocess (lucidd); echo worker for dev | n/a (no inference at MVP) |
+> | WASM engine | **wasmtime 36.0.13 LTS** (plasm) — wasm3 fully retired | "wasm3 (MVP), wasmtime (future)" |
+> | libp2p | **0.56** plus `libp2p-stream` 0.4.0-alpha (Kademlia, mDNS, Noise, TCP/QUIC, request-response, opaque live/blob substreams, relay, AutoNAT, DCUtR, rendezvous surfaces) | 0.53 |
+> | Inference backend | **llama.cpp** via `llama-server`; echo worker for development; experimental pinned **MLX** subprocess adapter awaiting real-device acceptance | n/a (no inference at MVP) |
 > | HTTP | **axum 0.7** (artifact-server + lucidd Ollama API) | n/a |
 > | DHT advertisement encoding | **postcard** (schema v2, SEC-12) — bincode retired | n/a |
 > | DNS resolver | **hickory-resolver 0.26** (lucidd DNS bootstrap) | n/a |
@@ -21,8 +21,8 @@
 > | Rust edition / MSRV | 2021 / **1.88** (libp2p 0.56) | — |
 > | Safety | `#![deny(unsafe_code)]` on all 8 crates; `cargo audit` + `cargo deny` CI gate | — |
 >
-> **New since MVP:** the LUCID inference flagship (`crates/lucidd`) — Ollama-compatible API (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/pull`, `/api/tags`, …), llama.cpp + echo workers (both serve Inference *and* Embedding jobs), a local-or-DHT router with multi-peer failover, SEC-05 receipt verify+bind, and a hot-reloadable operator policy engine.
-> **Aspirational backends (not yet built):** MLX (Apple Silicon, `mlx-lm`), CoreAIWorker (Apple Neural Engine), and the LUMEN diffusion node — see `decisions.md` + the root README roadmap.
+> **New since MVP:** the LUCID inference flagship (`crates/lucidd`) — Ollama-compatible API (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/pull`, `/api/tags`, …), verified content-derived pull/catalog/alias/provider paths, llama.cpp + echo workers, an experimental MLX adapter, local/DHT routing with multi-peer failover, live peer streams with cancellation and signed terminal receipts, explicit relay infrastructure roles, local evidence/reputation, and hot-reloadable operator policy.
+> **Not release-qualified:** the v0.2 code has approved macOS ARM64 and Ubuntu x86_64 checkpoint evidence, but real multi-network/NAT inference, real multi-GB pull/resume, real Apple Silicon MLX, Linux ARM64, public rendezvous admission, and the remaining release matrix are open. CoreAIWorker remains research-only. LUMEN remains a separate planned diffusion node and release.
 
 ---
 

@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
         fs::read(key_path).map_err(|e| anyhow::anyhow!("Failed to read key file: {}", e))?
     } else {
         // Use embedded key
-        if EMBEDDED_ROOT_KEY.is_empty() || EMBEDDED_ROOT_KEY == b"PLACEHOLDER" {
+        if EMBEDDED_ROOT_KEY == b"PLACEHOLDER" {
             if !args.quiet {
                 warn!("No embedded key and no --key provided");
             }
@@ -326,18 +326,16 @@ fn output_result(args: &Args, result: &VerificationResult) -> anyhow::Result<()>
 
     if args.format == "json" {
         println!("{}", serde_json::to_string_pretty(result)?);
+    } else if result.status == "VERIFIED" {
+        println!("VERIFIED");
+        println!("  Version: {}", result.manifest_version);
+        println!("  Channel: {}", result.channel);
+        println!("  Arch:    {}", result.arch);
+        println!("  Key:     {}", result.key_id);
     } else {
-        if result.status == "VERIFIED" {
-            println!("VERIFIED");
-            println!("  Version: {}", result.manifest_version);
-            println!("  Channel: {}", result.channel);
-            println!("  Arch:    {}", result.arch);
-            println!("  Key:     {}", result.key_id);
-        } else {
-            println!("FAILED");
-            if let Some(error) = &result.error {
-                println!("  Error: {}", error);
-            }
+        println!("FAILED");
+        if let Some(error) = &result.error {
+            println!("  Error: {}", error);
         }
     }
 

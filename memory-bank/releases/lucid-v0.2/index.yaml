@@ -1,0 +1,157 @@
+release: lucid
+version: "0.2.0"
+status: implementation_active
+tracker: README.md
+owner: Michael S.
+license: AGPL-3.0-or-later
+tagline: "The real public-network path for open inference."
+
+description: |
+  Make LUCID's end-to-end network experience real: content-addressed model
+  distribution, verified cross-peer name resolution, live token relay,
+  NAT reachability, operated foundation relays, attributable reputation,
+  research-gated sharding, and an Apple Silicon MLX backend. Core AI remains
+  a non-blocking feasibility gate. LUMEN is planned as a separate node and
+  release.
+
+status_vocabulary:
+  not_started: "No implementation approved or begun"
+  in_progress: "Approved implementation active"
+  blocked: "Named dependency or decision prevents progress"
+  review: "Implementation and QA complete; human approval pending"
+  complete: "Acceptance criteria passed and completion approved"
+  deferred: "Removed from release by approved decision"
+
+tracks:
+  intended_stream:
+    required: true
+    outcome: "Fresh node pulls verified content and receives live remote inference through real network reachability"
+  trust_and_scale:
+    required: true
+    outcome: "Routing incorporates attributable evidence; sharding outcome remains honest about partial-compute verification"
+  backends:
+    required: true
+    outcome: "MLX serves real Apple Silicon inference; Core AI receives a documented go/no-go decision"
+  qualification:
+    required: true
+    outcome: "Security, interoperability, operations, and claims verified end to end"
+
+milestones:
+  - slug: content-plane
+    name: Content Plane
+    sequence: 1
+    track: intended_stream
+    status: in_progress
+    spec: content-plane.md
+    depends_on: []
+    blocking: true
+  - slug: live-relay-plane
+    name: Live Relay Plane
+    sequence: 2
+    track: intended_stream
+    status: in_progress
+    spec: live-relay-plane.md
+    depends_on: []
+    blocking: true
+  - slug: reachability-plane
+    name: Reachability Plane
+    sequence: 3
+    track: intended_stream
+    status: in_progress
+    spec: reachability-plane.md
+    depends_on: []
+    blocking: true
+  - slug: network-operations
+    name: Network Operations
+    sequence: 4
+    track: intended_stream
+    status: in_progress
+    spec: network-operations.md
+    depends_on: [reachability-plane]
+    blocking: true
+  - slug: intended-stream-vertical-slice
+    name: Intended-Stream Vertical Slice
+    sequence: 5
+    track: intended_stream
+    status: blocked
+    spec: intended-stream-vertical-slice.md
+    depends_on: [content-plane, live-relay-plane, reachability-plane, network-operations]
+    blocking: true
+  - slug: reputation-and-redundant-verification
+    name: Reputation and Redundant Verification
+    sequence: 6
+    track: trust_and_scale
+    status: in_progress
+    spec: reputation-and-redundant-verification.md
+    depends_on: [live-relay-plane, intended-stream-vertical-slice]
+    blocking: true
+  - slug: shardworker
+    name: ShardWorker
+    sequence: 7
+    track: trust_and_scale
+    status: blocked
+    spec: shardworker.md
+    depends_on: [reputation-and-redundant-verification]
+    blocking: true
+    design_gate: "Approved partial-compute verification ADR"
+  - slug: mlx-backend
+    name: MLX Backend
+    sequence: 8
+    track: backends
+    status: in_progress
+    spec: mlx-backend.md
+    depends_on: [content-plane]
+    blocking: true
+  - slug: core-ai-feasibility-gate
+    name: Core AI Feasibility Gate
+    sequence: 9
+    track: backends
+    status: not_started
+    spec: core-ai-feasibility-gate.md
+    depends_on: [mlx-backend]
+    blocking: false
+    implementation_authorized: false
+  - slug: release-qualification
+    name: Release Qualification
+    sequence: 10
+    track: qualification
+    status: in_progress
+    spec: release-qualification.md
+    depends_on:
+      - content-plane
+      - live-relay-plane
+      - reachability-plane
+      - network-operations
+      - intended-stream-vertical-slice
+      - reputation-and-redundant-verification
+      - shardworker
+      - mlx-backend
+    blocking: true
+
+release_gates:
+  - "Content identifiers derive from verified bytes, never aliases"
+  - "Cross-peer name resolution uses signed, expiring, conflict-aware records"
+  - "Remote first token arrives before serving generation completes"
+  - "Cancellation and backpressure propagate across the peer stream"
+  - "Circuit relay, DCUtR, rendezvous, and bootstrap paths are exercised on real networks"
+  - "Signed receipt binds manifest, delivered output, and serving PeerId"
+  - "Reputation stores attributable evidence and has an approved Sybil/decay policy"
+  - "ShardWorker outcome is bounded by an approved partial-compute verification decision"
+  - "MLX passes real Apple Silicon inference and receipt verification"
+  - "Clean-machine consumer and relay-operator runbooks pass"
+  - "Workspace tests, clippy -D warnings, audit, and release builds pass"
+
+explicit_non_goals:
+  - "Cryptographic prompt privacy (separate v0.3 direction)"
+  - "Payments, tokens, marketplace, KYC, or blockchain"
+  - "Apple Foundation Models backend"
+  - "Diffusion or LUMEN functionality inside lucidd"
+  - "Unqualified claims of verifiable partial tensor computation"
+
+references:
+  public_roadmap: ../../../README.md
+  active_context: ../../activeContext.md
+  architecture_decisions: ../../decisions.md
+  security_content_gate: ../../plans/security-hardening/SEC-13-content-addressed-cid.md
+  previous_release: ../lucid/index.yaml
+  lumen_release: ../lumen/index.yaml

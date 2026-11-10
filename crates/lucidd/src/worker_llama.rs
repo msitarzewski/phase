@@ -64,14 +64,42 @@ use phase_identity::NodeIdentity;
 use phase_protocol::{
     ChatRole, CommitmentAccumulator, Completion, EmbeddingJobSpec, InferenceJobSpec, JobEvent,
     JobHandle, JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream,
-    OutputChunk, SignedManifest, Worker, WorkerError,
+    OutputChunk, SamplingParams, SignedManifest, Worker, WorkerError,
 };
 use phase_receipt::ReceiptBuilder;
 use serde::Deserialize;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
+
+/// Defense-in-depth ceiling enforced by the worker even when a caller bypasses
+/// the router's operator-configured `max_tokens_ceiling`.
+const MAX_N_PREDICT: u32 = 8192;
+
+/// A missing client limit must never inherit llama.cpp's backend default,
+/// which may be unlimited. Keep the default modest while allowing an explicit
+/// request up to [`MAX_N_PREDICT`].
+const DEFAULT_N_PREDICT: u32 = 512;
+
+const MAX_TOP_K: u64 = 1_000;
+const MAX_SEED: u64 = i32::MAX as u64;
+const MAX_STOP_SEQUENCES: usize = 16;
+const MAX_STOP_SEQUENCE_CHARS: usize = 256;
+
+/// Native llama.cpp responses cross a process boundary and are untrusted even
+/// though the HTTP socket is loopback-only.
+const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
+const SSE_INGEST_SLICE_BYTES: usize = 4 * 1024;
+const MAX_BACKEND_ERROR_BODY_BYTES: usize = 16 * 1024;
+const MAX_BACKEND_ERROR_TEXT_CHARS: usize = 1_024;
+const MAX_EMBEDDING_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EMBEDDING_INPUTS: usize = 128;
+const MAX_EMBEDDING_ENTRY_CHARS: usize = 64 * 1024;
+const MAX_EMBEDDING_TOTAL_CHARS: usize = 256 * 1024;
+const MAX_CHILD_LOG_LINE_BYTES: usize = 4 * 1024;
+const MAX_CHILD_LOG_TEXT_CHARS: usize = 4 * 1024;
+const CHILD_LOG_READ_BUFFER_BYTES: usize = 1_024;
 
 /// Configuration for [`LlamaCppWorker`].
 ///
@@ -153,16 +181,8 @@ impl Default for LlamaCppConfig {
 struct LoadedModel {
     /// Bound port — used to construct `http://127.0.0.1:{port}/completion`.
     port: u16,
-    /// Model alias the caller used to request this load. Stable for the
-    /// life of the LoadedModel; eviction creates a new entry.
-    #[allow(dead_code)] // surfaced via metrics in LUCID M6
-    model_id: String,
-    /// First time the worker saw this model. Useful for "uptime since
-    /// load" telemetry and stale-state debugging.
-    #[allow(dead_code)]
-    loaded_at: Instant,
-    /// Updated on every successful inference. The eviction policy in
-    /// LUCID M6 reads this to decide what to unload first.
+    /// Updated on every successful inference for the current LRU eviction
+    /// policy.
     last_used: Mutex<Instant>,
     /// Signalled when the supervisor task has given up (3 crashes in 60s,
     /// or unload requested). All in-flight requests should bail.
@@ -203,6 +223,11 @@ struct Inner {
     loaded_models: DashMap<String, Arc<LoadedModel>>,
     config: LlamaCppConfig,
     client: reqwest::Client,
+    /// Serializes the check/evict/port-reserve/spawn/insert transaction.
+    /// Model loads are rare and expensive, so this global single-flight gate
+    /// is preferable to allowing concurrent cold starts to bypass the
+    /// resident-model cap or replace one another in `loaded_models`.
+    load_gate: Mutex<()>,
     /// Set of ports currently bound by live `llama-server` children. A
     /// port is inserted in [`LlamaCppWorker::allocate_port`] and removed on
     /// unload/evict so the range can't wrap onto a live port (SEC-07).
@@ -216,6 +241,12 @@ impl LlamaCppWorker {
     /// first inference request for a given model.
     pub fn new(identity: NodeIdentity, config: LlamaCppConfig) -> Self {
         let client = reqwest::Client::builder()
+            // Loopback subprocess traffic must never inherit HTTP(S)_PROXY.
+            // A hostile local proxy could impersonate `/health` or exfiltrate
+            // prompt bodies. Likewise, no llama endpoint is allowed to turn a
+            // loopback request into a redirect to another origin.
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             // The default 30s connection timeout would surface on first
             // load; we manage our own timeout via `model_load_timeout`.
             // Per-request response read timeout is unbounded — streaming
@@ -230,6 +261,7 @@ impl LlamaCppWorker {
                 loaded_models: DashMap::new(),
                 config,
                 client,
+                load_gate: Mutex::new(()),
                 ports_in_use: Mutex::new(std::collections::HashSet::new()),
             }),
         }
@@ -262,6 +294,13 @@ impl LlamaCppWorker {
         } else {
             model_id.to_string()
         };
+
+        // This covers every mutation involved in a cold load. It also acts as
+        // same-key single-flight: a waiter re-checks the map after the winner
+        // inserts and returns that exact process instead of spawning a
+        // duplicate. Loading is serialized intentionally because each cold
+        // start can consume gigabytes of RAM.
+        let _load_guard = self.inner.load_gate.lock().await;
 
         if let Some(existing) = self.inner.loaded_models.get(&load_key) {
             if !existing
@@ -306,7 +345,7 @@ impl LlamaCppWorker {
         self.evict_lru_if_at_cap(&load_key).await;
 
         let port = self.allocate_port().await?;
-        let child = match spawn_llama_server(
+        let mut child = match spawn_llama_server(
             &self.inner.config.server_binary_path,
             &model_path,
             port,
@@ -327,6 +366,7 @@ impl LlamaCppWorker {
             &self.inner.client,
             port,
             self.inner.config.model_load_timeout,
+            &mut child,
         )
         .await
         {
@@ -364,18 +404,14 @@ impl LlamaCppWorker {
 
         let loaded = Arc::new(LoadedModel {
             port,
-            model_id: model_id_owned.clone(),
-            loaded_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
             failed,
             failed_flag,
             supervisor,
         });
-        // A concurrent `ensure_loaded` for the same id could have raced us
-        // to a winning load; if `insert` replaces a live entry, shut the
-        // loser down and free its port so we don't leak a subprocess. Keyed
-        // by `load_key` so chat and embedding instances of one model occupy
-        // separate slots.
+        // `load_gate` makes this insert a single-flight commit. Keep the
+        // replacement guard as defense in depth if the synchronization model
+        // changes later.
         if let Some(prev) = self.inner.loaded_models.insert(load_key, loaded.clone()) {
             if prev.port != port {
                 prev.shutdown();
@@ -394,7 +430,17 @@ impl LlamaCppWorker {
         let range = self.inner.config.server_port_range.clone();
         let mut in_use = self.inner.ports_in_use.lock().await;
         for port in range.clone() {
-            if in_use.insert(port) {
+            if in_use.contains(&port) {
+                continue;
+            }
+            // Prove that the OS currently considers the loopback address
+            // bindable, not merely that this process has not recorded it.
+            // llama-server cannot inherit this listener, so a narrow
+            // close-to-child-bind race remains; child liveness checks around
+            // `/health` below prevent a normally failing child from accepting
+            // an unrelated listener as healthy.
+            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                in_use.insert(port);
                 return Ok(port);
             }
         }
@@ -479,6 +525,28 @@ impl Worker for LlamaCppWorker {
             JobSpec::Inference(spec) => {
                 let inference = spec.clone();
 
+                // The native `/completion` path below is text-only. Silently
+                // discarding protocol-level images would execute a different
+                // job than the signed manifest describes, so reject before
+                // either model loading or backend dispatch.
+                if inference
+                    .messages
+                    .iter()
+                    .any(|message| !message.images.is_empty())
+                {
+                    return Err(WorkerError::BadManifest(
+                        "multimodal images are not supported by the llama.cpp text backend"
+                            .to_string(),
+                    ));
+                }
+
+                // Validate and freeze the exact backend request before model
+                // loading. Sampling fields cross a trust boundary here: they
+                // must not overwrite server-owned fields or rely on
+                // llama.cpp-specific permissive defaults.
+                let request = build_completion_request(&inference)
+                    .map_err(|e| WorkerError::BadManifest(format!("invalid sampling: {e}")))?;
+
                 // Load the model up front so dispatch-time errors are
                 // returned through `WorkerError` rather than as a single
                 // `Final::Error` event with no chunks. Once we get past
@@ -494,7 +562,7 @@ impl Worker for LlamaCppWorker {
                 let stream: JobStream = Box::pin(run_inference(
                     client,
                     model,
-                    inference,
+                    request,
                     manifest_hash,
                     producer,
                     identity,
@@ -504,6 +572,7 @@ impl Worker for LlamaCppWorker {
             }
             JobSpec::Embedding(spec) => {
                 let embedding = spec.clone();
+                validate_embedding_spec(&embedding).map_err(WorkerError::BadManifest)?;
 
                 // Embedding loads spin up a *separate* llama-server with
                 // `--embeddings`, keyed apart from any chat instance of the
@@ -530,6 +599,39 @@ impl Worker for LlamaCppWorker {
             other => Err(WorkerError::Unsupported { kind: other.kind() }),
         }
     }
+}
+
+fn validate_embedding_spec(spec: &EmbeddingJobSpec) -> Result<(), String> {
+    if spec.input.is_empty() {
+        return Err("embedding input must contain at least one non-empty entry".to_string());
+    }
+    if spec.input.len() > MAX_EMBEDDING_INPUTS {
+        return Err(format!(
+            "embedding input count {} exceeds {MAX_EMBEDDING_INPUTS}",
+            spec.input.len()
+        ));
+    }
+    let mut total_chars = 0_usize;
+    for (index, entry) in spec.input.iter().enumerate() {
+        let entry_chars = entry.chars().count();
+        if entry_chars == 0 {
+            return Err(format!("embedding input {index} is empty"));
+        }
+        if entry_chars > MAX_EMBEDDING_ENTRY_CHARS {
+            return Err(format!(
+                "embedding input {index} exceeds {MAX_EMBEDDING_ENTRY_CHARS} characters"
+            ));
+        }
+        total_chars = total_chars
+            .checked_add(entry_chars)
+            .ok_or_else(|| "embedding input character count overflow".to_string())?;
+        if total_chars > MAX_EMBEDDING_TOTAL_CHARS {
+            return Err(format!(
+                "embedding input exceeds {MAX_EMBEDDING_TOTAL_CHARS} aggregate characters"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -672,19 +774,47 @@ async fn wait_for_health(
     client: &reqwest::Client,
     port: u16,
     deadline: Duration,
+    child: &mut Child,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{port}/health");
     let started = Instant::now();
     let poll_interval = Duration::from_millis(200);
     let mut last_err = String::from("never responded");
     while started.elapsed() < deadline {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("check child liveness: {error}"))?
+        {
+            return Err(format!(
+                "llama-server exited before health check completed ({status})"
+            ));
+        }
         match client
             .get(&url)
             .timeout(Duration::from_secs(2))
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) if resp.status().is_success() => {
+                // Re-check after receiving the response. This closes the
+                // practical impostor case where llama-server lost its bind
+                // race and exited while another loopback process answered.
+                // A short settlement window gives the spawned process time
+                // to report an asynchronous bind failure before we trust the
+                // health response. Direct socket-owner attestation is not
+                // portable, so the close→bind race remains a narrow,
+                // explicitly documented residual.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|error| format!("check child liveness: {error}"))?
+                {
+                    return Err(format!(
+                        "llama-server exited while health endpoint responded ({status})"
+                    ));
+                }
+                return Ok(());
+            }
             Ok(resp) => {
                 // 503 = still loading; anything else = real failure.
                 last_err = format!("status {}", resp.status());
@@ -833,32 +963,27 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                     Ok(c) => {
                         let mut respawned_opt = Some(c);
                         drain_child_io(&mut respawned_opt);
-                        current_child = respawned_opt;
-                        // Wait for /health on the respawned child.
+                        let mut c = respawned_opt.expect("respawned child remains present");
                         if let Err(e) =
-                            wait_for_health(&client, port, config.model_load_timeout).await
+                            wait_for_health(&client, port, config.model_load_timeout, &mut c).await
                         {
                             tracing::warn!(
                                 model = %model_id,
                                 error = %e,
                                 "respawned llama-server failed health check"
                             );
-                            if let Some(mut c) = current_child.take() {
-                                let _ = c.kill().await;
-                            }
+                            let _ = c.kill().await;
                             crash_times.push(Instant::now());
                             if crash_times.len() >= 3 {
                                 failed_flag.store(true, std::sync::atomic::Ordering::Release);
                                 failed.notify_waiters();
                                 return;
                             }
-                            // Loop will fall through to the next iteration;
-                            // `current_child` is None, so we break out of
-                            // the outer loop and stop supervising.
                             failed_flag.store(true, std::sync::atomic::Ordering::Release);
                             failed.notify_waiters();
                             return;
                         }
+                        current_child = Some(c);
                     }
                     Err(e) => {
                         tracing::error!(model = %model_id, error = %e, "failed to respawn");
@@ -884,28 +1009,341 @@ enum ChildExit {
 fn drain_child_io(child: &mut Option<Child>) {
     let Some(child) = child.as_mut() else { return };
     if let Some(stdout) = child.stdout.take() {
-        let reader = tokio::io::BufReader::new(stdout);
-        tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::trace!(target: "lucidd::llama_server", "stdout: {line}");
-            }
-        });
+        tokio::spawn(drain_child_reader(stdout, "stdout"));
     }
     if let Some(stderr) = child.stderr.take() {
-        let reader = tokio::io::BufReader::new(stderr);
-        tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::trace!(target: "lucidd::llama_server", "stderr: {line}");
-            }
-        });
+        tokio::spawn(drain_child_reader(stderr, "stderr"));
     }
+}
+
+/// Drain a child pipe without `AsyncBufReadExt::lines()`: that convenience API
+/// grows its internal `String` until a newline and therefore lets a malformed
+/// subprocess allocate unbounded memory. This loop keeps at most one bounded
+/// line and discards overflow until the next newline.
+async fn drain_child_reader<R>(mut reader: R, child_stream: &'static str)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut read_buf = [0u8; CHILD_LOG_READ_BUFFER_BYTES];
+    let mut line = Vec::with_capacity(MAX_CHILD_LOG_LINE_BYTES.min(1_024));
+    let mut truncated = false;
+
+    loop {
+        let read = match reader.read(&mut read_buf).await {
+            Ok(0) => {
+                if !line.is_empty() || truncated {
+                    log_child_line(child_stream, &line, truncated);
+                }
+                return;
+            }
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(
+                    target: "lucidd::llama_server",
+                    stream = child_stream,
+                    error = %error,
+                    "failed reading bounded child output"
+                );
+                return;
+            }
+        };
+
+        for byte in &read_buf[..read] {
+            if *byte == b'\n' {
+                log_child_line(child_stream, &line, truncated);
+                line.clear();
+                truncated = false;
+            } else if line.len() < MAX_CHILD_LOG_LINE_BYTES {
+                line.push(*byte);
+            } else {
+                truncated = true;
+            }
+        }
+    }
+}
+
+fn log_child_line(child_stream: &'static str, line: &[u8], truncated: bool) {
+    let sanitized = sanitize_bounded_log_text(line, MAX_CHILD_LOG_TEXT_CHARS, truncated);
+    tracing::trace!(
+        target: "lucidd::llama_server",
+        stream = child_stream,
+        line = %sanitized,
+        truncated,
+        "llama-server output"
+    );
+}
+
+fn sanitize_bounded_log_text(input: &[u8], max_chars: usize, truncated: bool) -> String {
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    let suffix_chars = TRUNCATED_SUFFIX.chars().count();
+    let content_limit = if truncated {
+        max_chars.saturating_sub(suffix_chars)
+    } else {
+        max_chars
+    };
+    let decoded = String::from_utf8_lossy(input);
+    let mut sanitized = String::with_capacity(input.len().min(max_chars));
+    let mut source_chars = decoded.chars();
+
+    for character in source_chars.by_ref().take(content_limit) {
+        if character.is_control() {
+            sanitized.push('\u{fffd}');
+        } else {
+            sanitized.push(character);
+        }
+    }
+
+    let was_truncated = truncated || source_chars.next().is_some();
+    if was_truncated && max_chars >= suffix_chars {
+        // If the character cap, rather than the byte reader, caused
+        // truncation, reserve room for the visible marker.
+        while sanitized.chars().count() > max_chars - suffix_chars {
+            sanitized.pop();
+        }
+        sanitized.push_str(TRUNCATED_SUFFIX);
+    }
+    sanitized
 }
 
 // ---------------------------------------------------------------------------
 // Inference path
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackendBodyReadError {
+    TooLarge { limit: usize },
+    Transport(String),
+}
+
+impl std::fmt::Display for BackendBodyReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { limit } => {
+                write!(
+                    formatter,
+                    "backend response body exceeded {limit} byte limit"
+                )
+            }
+            Self::Transport(error) => write!(formatter, "backend response read failed: {error}"),
+        }
+    }
+}
+
+fn extend_limited_body(
+    body: &mut BytesMut,
+    chunk: &[u8],
+    limit: usize,
+) -> Result<(), BackendBodyReadError> {
+    if chunk.len() > limit.saturating_sub(body.len()) {
+        return Err(BackendBodyReadError::TooLarge { limit });
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_limited_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, BackendBodyReadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(BackendBodyReadError::TooLarge { limit });
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(limit);
+    let mut body = BytesMut::with_capacity(initial_capacity);
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| BackendBodyReadError::Transport(error.to_string()))?;
+        extend_limited_body(&mut body, &chunk, limit)?;
+    }
+    Ok(body.freeze())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SseFrameTooLarge;
+
+impl std::fmt::Display for SseFrameTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "llama-server SSE frame exceeded {MAX_SSE_FRAME_BYTES} byte limit"
+        )
+    }
+}
+
+/// Refuse an oversized first frame before copying a delimiter-free chunk into
+/// the accumulation buffer. A subsequent frame in a multi-frame chunk is
+/// checked by [`take_next_sse_frame`] after its predecessor is removed.
+fn append_sse_chunk(buffer: &mut BytesMut, chunk: &[u8]) -> Result<(), SseFrameTooLarge> {
+    let first_boundary = if buffer.last() == Some(&b'\n') && chunk.first() == Some(&b'\n') {
+        Some(buffer.len().saturating_sub(1))
+    } else {
+        find_double_newline(chunk).map(|position| buffer.len().saturating_add(position))
+    };
+    let accumulated = buffer.len().saturating_add(chunk.len());
+    if first_boundary
+        .map(|position| position > MAX_SSE_FRAME_BYTES)
+        .unwrap_or(accumulated > MAX_SSE_FRAME_BYTES)
+    {
+        return Err(SseFrameTooLarge);
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn take_next_sse_frame(buffer: &mut BytesMut) -> Result<Option<Bytes>, SseFrameTooLarge> {
+    match find_double_newline(buffer) {
+        Some(position) if position > MAX_SSE_FRAME_BYTES => Err(SseFrameTooLarge),
+        Some(position) => {
+            let mut framed = buffer.split_to(position + 2);
+            framed.truncate(position);
+            Ok(Some(framed.freeze()))
+        }
+        None if buffer.len() > MAX_SSE_FRAME_BYTES => Err(SseFrameTooLarge),
+        None => Ok(None),
+    }
+}
+
+/// Build the native llama.cpp completion request from a validated allowlist.
+///
+/// `SamplingParams` is intentionally extensible at the protocol layer, but the
+/// backend boundary must be closed: an unknown key could become meaningful in
+/// a future llama.cpp release, and a reserved key could overwrite prompt or
+/// resource controls. Server-owned fields are therefore inserted only after
+/// every client field has been validated.
+#[derive(Debug)]
+struct CompletionRequest {
+    body: serde_json::Value,
+    prompt_chars: u64,
+}
+
+fn build_completion_request(inference: &InferenceJobSpec) -> Result<CompletionRequest, String> {
+    let prompt = render_prompt(inference);
+    let prompt_chars = prompt.chars().count() as u64;
+    let mut body = validated_sampling_params(&inference.sampling)?;
+
+    body.insert("prompt".to_string(), serde_json::Value::String(prompt));
+    body.insert("stream".to_string(), serde_json::Value::Bool(true));
+    body.insert("cache_prompt".to_string(), serde_json::Value::Bool(true));
+
+    // Never omit `n_predict`: llama.cpp may interpret omission as unlimited.
+    // Clamp here as defense in depth for callers that invoke the worker
+    // directly without passing through the router's operator policy.
+    let n_predict = inference
+        .max_tokens
+        .unwrap_or(DEFAULT_N_PREDICT)
+        .clamp(1, MAX_N_PREDICT);
+    body.insert("n_predict".to_string(), serde_json::json!(n_predict));
+
+    Ok(CompletionRequest {
+        body: serde_json::Value::Object(body),
+        prompt_chars,
+    })
+}
+
+fn validated_sampling_params(
+    sampling: &SamplingParams,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut validated = serde_json::Map::new();
+
+    for (key, raw) in &sampling.params {
+        if matches!(
+            key.as_str(),
+            "n_predict" | "prompt" | "messages" | "stream" | "cache_prompt"
+        ) {
+            return Err(format!("sampling parameter '{key}' is server-owned"));
+        }
+        if !matches!(
+            key.as_str(),
+            "temperature" | "top_p" | "top_k" | "min_p" | "repetition_penalty" | "seed" | "stop"
+        ) {
+            // Do not reflect an attacker-controlled unknown key into API
+            // errors or logs. Known keys below are fixed safe literals.
+            return Err("unsupported sampling parameter".to_string());
+        }
+
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|_| format!("sampling parameter '{key}' is not valid JSON"))?;
+
+        match key.as_str() {
+            "temperature" => validate_number_range(key, &value, 0.0, 2.0, true)?,
+            "top_p" | "min_p" => validate_number_range(key, &value, 0.0, 1.0, true)?,
+            "repetition_penalty" => validate_number_range(key, &value, 0.0, 2.0, false)?,
+            "top_k" => validate_unsigned_integer(key, &value, MAX_TOP_K)?,
+            "seed" => validate_unsigned_integer(key, &value, MAX_SEED)?,
+            "stop" => validate_stop_sequences(&value)?,
+            _ => return Err("unsupported sampling parameter".to_string()),
+        }
+
+        validated.insert(key.clone(), value);
+    }
+
+    Ok(validated)
+}
+
+fn validate_number_range(
+    key: &str,
+    value: &serde_json::Value,
+    min: f64,
+    max: f64,
+    include_min: bool,
+) -> Result<(), String> {
+    let Some(number) = value.as_f64() else {
+        return Err(format!("sampling parameter '{key}' must be a number"));
+    };
+    let above_min = if include_min {
+        number >= min
+    } else {
+        number > min
+    };
+    if !number.is_finite() || !above_min || number > max {
+        let lower = if include_min {
+            "inclusive"
+        } else {
+            "exclusive"
+        };
+        return Err(format!(
+            "sampling parameter '{key}' must be between {min} ({lower}) and {max} (inclusive)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unsigned_integer(key: &str, value: &serde_json::Value, max: u64) -> Result<(), String> {
+    match value.as_u64() {
+        Some(number) if number <= max => Ok(()),
+        _ => Err(format!(
+            "sampling parameter '{key}' must be an integer between 0 and {max}"
+        )),
+    }
+}
+
+fn validate_stop_sequences(value: &serde_json::Value) -> Result<(), String> {
+    let Some(sequences) = value.as_array() else {
+        return Err("sampling parameter 'stop' must be an array of strings".to_string());
+    };
+    if sequences.len() > MAX_STOP_SEQUENCES {
+        return Err(format!(
+            "sampling parameter 'stop' exceeds {MAX_STOP_SEQUENCES} sequences"
+        ));
+    }
+    if sequences.iter().any(|sequence| {
+        sequence
+            .as_str()
+            .is_none_or(|text| text.chars().count() > MAX_STOP_SEQUENCE_CHARS)
+    }) {
+        return Err(format!(
+            "sampling parameter 'stop' entries must be strings of at most {MAX_STOP_SEQUENCE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
 
 /// Drive a single inference: render the prompt, fire `POST /completion`
 /// with `stream: true`, decode SSE frames into [`JobEvent::Output`], and
@@ -913,7 +1351,7 @@ fn drain_child_io(child: &mut Option<Child>) {
 fn run_inference(
     client: reqwest::Client,
     model: Arc<LoadedModel>,
-    inference: InferenceJobSpec,
+    request: CompletionRequest,
     manifest_hash: [u8; 32],
     mut producer: JobHandleProducer,
     identity: NodeIdentity,
@@ -921,35 +1359,39 @@ fn run_inference(
 ) -> impl futures::Stream<Item = JobEvent> + Send + 'static {
     stream! {
         let started_at = Instant::now();
-        let prompt = render_prompt(&inference);
-        let prompt_chars = prompt.chars().count() as u64;
+        let CompletionRequest { body, prompt_chars } = request;
         let url = format!("http://127.0.0.1:{}/completion", model.port);
-        let mut body = serde_json::json!({
-            "prompt": prompt,
-            "stream": true,
-            "cache_prompt": true,
-        });
-        if let Some(map) = body.as_object_mut() {
-            if let Some(n_predict) = inference.max_tokens {
-                map.insert("n_predict".to_string(), serde_json::json!(n_predict));
-            }
-            // Pass-through of sampling params. We only forward keys with
-            // numeric/string values that JSON-decode cleanly; anything we
-            // can't parse is silently dropped (server tolerates unknown
-            // sampler names but not malformed JSON).
-            for (k, v) in &inference.sampling.params {
-                if let Ok(json_v) = serde_json::from_str::<serde_json::Value>(v) {
-                    map.insert(k.clone(), json_v);
-                }
-            }
-        }
 
         let response = client.post(&url).json(&body).send().await;
         let resp = match response {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 let status = r.status();
-                let body = r.text().await.unwrap_or_default();
+                let body = match read_limited_body(r, MAX_BACKEND_ERROR_BODY_BYTES).await {
+                    Ok(body) => sanitize_bounded_log_text(
+                        &body,
+                        MAX_BACKEND_ERROR_TEXT_CHARS,
+                        false,
+                    ),
+                    Err(error) => {
+                        if matches!(error, BackendBodyReadError::TooLarge { .. }) {
+                            // A backend that violates its response envelope is
+                            // not safe to reuse. Dropping the response cancels
+                            // the request; shutdown also terminates the child.
+                            model.shutdown();
+                        }
+                        yield emit_final_error(
+                            &mut producer,
+                            &identity,
+                            manifest_hash,
+                            prompt_chars,
+                            0,
+                            started_at,
+                            format!("llama-server returned {status}; {error}"),
+                        );
+                        return;
+                    }
+                };
                 yield emit_final_error(
                     &mut producer,
                     &identity,
@@ -984,6 +1426,7 @@ fn run_inference(
         let mut seq: u64 = 0;
         let mut completion_tokens: u64 = 0;
         let mut cancelled = false;
+        let mut saw_terminal_stop = false;
         let mut final_stop_type: Option<String> = None;
 
         'outer: loop {
@@ -998,7 +1441,7 @@ fn run_inference(
             let chunk = match next {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => {
-                    yield emit_final_error(
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
@@ -1006,17 +1449,30 @@ fn run_inference(
                         completion_tokens,
                         started_at,
                         format!("SSE stream broke: {e}"),
+                        acc.peek(),
                     );
                     return;
                 }
                 Ok(None) => {
-                    // Stream ended without a `stop:true` frame. Treat
-                    // as Stop with an empty terminal — same path as
-                    // happy completion, just no token left to flush.
-                    break;
+                    let reason = match validate_completion_eof(saw_terminal_stop, &buf) {
+                        Ok(()) => break,
+                        Err(reason) => reason,
+                    };
+                    model.shutdown();
+                    yield emit_final_error_with_output(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        completion_tokens,
+                        started_at,
+                        reason,
+                        acc.peek(),
+                    );
+                    return;
                 }
                 Err(_elapsed) => {
-                    yield emit_final_error(
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
@@ -1024,6 +1480,7 @@ fn run_inference(
                         completion_tokens,
                         started_at,
                         format!("no token within {:?} (hang detected)", idle_timeout),
+                        acc.peek(),
                     );
                     // Mark the model suspect so the next request will
                     // re-check health rather than reusing a wedged
@@ -1035,35 +1492,80 @@ fn run_inference(
                     return;
                 }
             };
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = find_double_newline(&buf) {
-                let frame_bytes = buf.split_to(pos + 2);
-                // Two `\n\n` → drop the second one (we kept it as the
-                // record boundary).
-                let frame = &frame_bytes[..frame_bytes.len().saturating_sub(2)];
-                if let Some(json_part) = strip_sse_data_prefix(frame) {
-                    match serde_json::from_slice::<CompletionFrame>(json_part) {
-                        Ok(f) => {
-                            if !f.content.is_empty() {
-                                let chunk = OutputChunk {
-                                    kind: "token".to_string(),
-                                    data: Bytes::copy_from_slice(f.content.as_bytes()),
-                                    seq,
-                                };
-                                acc.update(&chunk);
-                                seq += 1;
-                                completion_tokens += 1;
-                                yield JobEvent::Output(chunk);
-                            }
-                            if f.stop {
-                                if let Some(st) = f.stop_type {
-                                    final_stop_type = Some(st);
-                                }
-                                break 'outer;
-                            }
+            // A transport chunk may coalesce many SSE frames. Feed it through
+            // bounded slices so the accumulation buffer never duplicates an
+            // arbitrarily large reqwest chunk even when early delimiters are
+            // present.
+            for segment in chunk.chunks(SSE_INGEST_SLICE_BYTES) {
+                if let Err(error) = append_sse_chunk(&mut buf, segment) {
+                    model.shutdown();
+                    yield emit_final_error_with_output(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        completion_tokens,
+                        started_at,
+                        error.to_string(),
+                        acc.peek(),
+                    );
+                    return;
+                }
+                loop {
+                    let frame = match take_next_sse_frame(&mut buf) {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(error) => {
+                            model.shutdown();
+                            yield emit_final_error_with_output(
+                                &mut producer,
+                                &identity,
+                                manifest_hash,
+                                prompt_chars,
+                                completion_tokens,
+                                started_at,
+                                error.to_string(),
+                                acc.peek(),
+                            );
+                            return;
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "skipping malformed SSE frame");
+                    };
+                    if let Some(json_part) = strip_sse_data_prefix(&frame) {
+                        match decode_completion_frame(json_part) {
+                            Ok(f) => {
+                                if !f.content.is_empty() {
+                                    let chunk = OutputChunk {
+                                        kind: "token".to_string(),
+                                        data: Bytes::copy_from_slice(f.content.as_bytes()),
+                                        seq,
+                                    };
+                                    acc.update(&chunk);
+                                    seq += 1;
+                                    completion_tokens += 1;
+                                    yield JobEvent::Output(chunk);
+                                }
+                                if f.stop {
+                                    saw_terminal_stop = true;
+                                    if let Some(st) = f.stop_type {
+                                        final_stop_type = Some(st);
+                                    }
+                                    break 'outer;
+                                }
+                            }
+                            Err(e) => {
+                                model.shutdown();
+                                yield emit_final_error_with_output(
+                                    &mut producer,
+                                    &identity,
+                                    manifest_hash,
+                                    prompt_chars,
+                                    completion_tokens,
+                                    started_at,
+                                    e,
+                                    acc.peek(),
+                                );
+                                return;
+                            }
                         }
                     }
                 }
@@ -1075,15 +1577,29 @@ fn run_inference(
             *last = Instant::now();
         }
 
-        let (commitment, count) = acc.finalize();
         let completion = if cancelled {
             Completion::Cancelled
+        } else if !saw_terminal_stop {
+            // This is unreachable through the transport loop above, but keep
+            // the success receipt boundary fail-closed if that loop changes.
+            yield emit_final_error_with_output(
+                &mut producer,
+                &identity,
+                manifest_hash,
+                prompt_chars,
+                completion_tokens,
+                started_at,
+                "llama-server stream ended without explicit stop:true terminal frame".to_string(),
+                acc.peek(),
+            );
+            return;
         } else {
             match final_stop_type.as_deref() {
                 Some("limit") | Some("length") => Completion::Length,
                 _ => Completion::Stop,
             }
         };
+        let (commitment, count) = acc.finalize();
 
         let result = JobResult {
             job_spec_hash: manifest_hash,
@@ -1169,8 +1685,32 @@ fn run_embedding(
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
                     let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
-                    yield emit_final_error(
+                    let body = match read_limited_body(r, MAX_BACKEND_ERROR_BODY_BYTES).await {
+                        Ok(body) => sanitize_bounded_log_text(
+                            &body,
+                            MAX_BACKEND_ERROR_TEXT_CHARS,
+                            false,
+                        ),
+                        Err(error) => {
+                            if matches!(error, BackendBodyReadError::TooLarge { .. }) {
+                                model.shutdown();
+                            }
+                            yield emit_final_error_with_output(
+                                &mut producer,
+                                &identity,
+                                manifest_hash,
+                                prompt_chars,
+                                0,
+                                started_at,
+                                format!(
+                                    "llama-server /embedding returned {status} for input {i}; {error}"
+                                ),
+                                acc.peek(),
+                            );
+                            return;
+                        }
+                    };
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
@@ -1178,11 +1718,12 @@ fn run_embedding(
                         0,
                         started_at,
                         format!("llama-server /embedding returned {status} for input {i}: {body}"),
+                        acc.peek(),
                     );
                     return;
                 }
                 Err(e) => {
-                    yield emit_final_error(
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
@@ -1190,22 +1731,27 @@ fn run_embedding(
                         0,
                         started_at,
                         format!("request to llama-server /embedding failed for input {i}: {e}"),
+                        acc.peek(),
                     );
                     return;
                 }
             };
 
-            let raw = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    yield emit_final_error(
+            let raw = match read_limited_body(resp, MAX_EMBEDDING_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(error) => {
+                    if matches!(error, BackendBodyReadError::TooLarge { .. }) {
+                        model.shutdown();
+                    }
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
                         prompt_chars,
                         0,
                         started_at,
-                        format!("reading /embedding body for input {i} failed: {e}"),
+                        format!("reading /embedding body for input {i} failed: {error}"),
+                        acc.peek(),
                     );
                     return;
                 }
@@ -1214,7 +1760,7 @@ fn run_embedding(
             let vector = match parse_embedding_response(&raw) {
                 Some(v) => v,
                 None => {
-                    yield emit_final_error(
+                    yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
                         manifest_hash,
@@ -1222,6 +1768,7 @@ fn run_embedding(
                         0,
                         started_at,
                         format!("could not parse embedding from /embedding response for input {i}"),
+                        acc.peek(),
                     );
                     return;
                 }
@@ -1348,7 +1895,29 @@ fn emit_final_error(
     started_at: Instant,
     error: String,
 ) -> JobEvent {
-    let (commitment, count) = CommitmentAccumulator::new().finalize();
+    emit_final_error_with_output(
+        producer,
+        identity,
+        manifest_hash,
+        prompt_tokens,
+        completion_tokens,
+        started_at,
+        error,
+        CommitmentAccumulator::new().finalize(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_final_error_with_output(
+    producer: &mut JobHandleProducer,
+    identity: &NodeIdentity,
+    manifest_hash: [u8; 32],
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    started_at: Instant,
+    error: String,
+    (commitment, count): ([u8; 32], u64),
+) -> JobEvent {
     let result = JobResult {
         job_spec_hash: manifest_hash,
         output_commitment: commitment,
@@ -1381,6 +1950,25 @@ struct CompletionFrame {
     stop: bool,
     #[serde(default)]
     stop_type: Option<String>,
+}
+
+fn decode_completion_frame(json: &[u8]) -> Result<CompletionFrame, String> {
+    serde_json::from_slice(json)
+        .map_err(|error| format!("malformed llama-server SSE data frame: {error}"))
+}
+
+fn validate_completion_eof(saw_terminal_stop: bool, buffered: &[u8]) -> Result<(), String> {
+    if saw_terminal_stop {
+        return Ok(());
+    }
+    if buffered.is_empty() {
+        Err("llama-server SSE stream ended without explicit stop:true terminal frame".to_string())
+    } else {
+        Err(format!(
+            "llama-server SSE stream ended with {} unterminated byte(s) and no stop:true terminal frame",
+            buffered.len()
+        ))
+    }
 }
 
 /// Find the first `\n\n` separator in a buffer (the SSE record boundary).
@@ -1476,7 +2064,406 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phase_protocol::ChatMessage;
+    use phase_manifest::ManifestBuilder;
+    use phase_protocol::{ChatMessage, SignedReceipt};
+
+    async fn exercise_raw_sse(body: &'static [u8]) -> (Vec<JobEvent>, SignedReceipt<JobResult>) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test backend");
+        let port = listener.local_addr().expect("test backend address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            socket.write_all(body).await.expect("write SSE body");
+            socket.shutdown().await.expect("close response");
+        });
+
+        let failed = Arc::new(Notify::new());
+        let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let model = Arc::new(LoadedModel {
+            port,
+            last_used: Mutex::new(Instant::now()),
+            failed,
+            failed_flag,
+            supervisor: tokio::spawn(std::future::pending::<()>()),
+        });
+        let manifest_hash = [0x61; 32];
+        let (handle, producer) = JobHandle::new(JobId(manifest_hash));
+        let events = run_inference(
+            reqwest::Client::new(),
+            model,
+            CompletionRequest {
+                body: serde_json::json!({"prompt": "test", "stream": true}),
+                prompt_chars: 4,
+            },
+            manifest_hash,
+            producer,
+            NodeIdentity::generate(),
+            Duration::from_secs(1),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let receipt = handle.finish().await.expect("signed failure receipt");
+        server.await.expect("test backend exits");
+        (events, receipt)
+    }
+
+    fn inference_with_sampling(
+        entries: &[(&str, &str)],
+        max_tokens: Option<u32>,
+    ) -> InferenceJobSpec {
+        let mut sampling = SamplingParams::default();
+        for (key, value) in entries {
+            sampling
+                .params
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        InferenceJobSpec {
+            model_cid: "test-model".to_string(),
+            messages: Vec::new(),
+            prompt: Some("trusted prompt".to_string()),
+            resume_from: None,
+            sampling,
+            max_tokens,
+            stream: true,
+        }
+    }
+
+    #[test]
+    fn completion_request_rejects_server_owned_sampling_fields() {
+        for key in ["n_predict", "prompt", "messages", "stream", "cache_prompt"] {
+            let spec = inference_with_sampling(&[(key, "1")], Some(32));
+            let error = build_completion_request(&spec).expect_err("reserved key must fail");
+            assert!(
+                error.contains("server-owned"),
+                "unexpected error for {key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_request_always_sets_bounded_server_n_predict() {
+        let absent = inference_with_sampling(&[], None);
+        let request = build_completion_request(&absent).expect("default request");
+        assert_eq!(
+            request.body["n_predict"],
+            serde_json::json!(DEFAULT_N_PREDICT)
+        );
+
+        let oversized = inference_with_sampling(&[], Some(u32::MAX));
+        let request = build_completion_request(&oversized).expect("clamped request");
+        assert_eq!(request.body["n_predict"], serde_json::json!(MAX_N_PREDICT));
+
+        let zero = inference_with_sampling(&[], Some(0));
+        let request = build_completion_request(&zero).expect("minimum request");
+        assert_eq!(request.body["n_predict"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn completion_request_rejects_negative_oversized_and_unknown_sampling() {
+        for (key, value) in [
+            ("temperature", "-0.1"),
+            ("temperature", "2.1"),
+            ("top_p", "1.1"),
+            ("min_p", "-0.1"),
+            ("repetition_penalty", "0"),
+            ("top_k", "-1"),
+            ("top_k", "1001"),
+            ("seed", "-1"),
+            ("seed", "2147483648"),
+            ("temperature", r#""0.7""#),
+            ("top_k", "1.5"),
+            ("stop", r#""END""#),
+            ("future_llama_flag", "true"),
+        ] {
+            let spec = inference_with_sampling(&[(key, value)], Some(32));
+            assert!(
+                build_completion_request(&spec).is_err(),
+                "expected {key}={value} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_reserved_sampling_before_model_load() {
+        let spec = inference_with_sampling(&[("n_predict", "-1")], Some(u32::MAX));
+        let manifest = ManifestBuilder::new(JobSpec::Inference(spec))
+            .sign_with(&NodeIdentity::generate())
+            .expect("sign manifest");
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+
+        let error = match worker.execute(manifest).await {
+            Ok(_) => panic!("reserved sampling key must fail dispatch"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, WorkerError::BadManifest(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_multimodal_images_before_model_load() {
+        let mut spec = inference_with_sampling(&[], Some(32));
+        spec.messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "describe this".to_string(),
+            images: vec!["not-decoded-or-forwarded".to_string()],
+        });
+        let manifest = ManifestBuilder::new(JobSpec::Inference(spec))
+            .sign_with(&NodeIdentity::generate())
+            .expect("sign manifest");
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+
+        let error = match worker.execute(manifest).await {
+            Ok(_) => panic!("multimodal input must fail before model lookup"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, WorkerError::BadManifest(message) if message.contains("multimodal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_bounds_fail_before_model_load() {
+        let identity = NodeIdentity::generate();
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+        for input in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["x".repeat(MAX_EMBEDDING_ENTRY_CHARS + 1)],
+            vec!["x".to_string(); MAX_EMBEDDING_INPUTS + 1],
+            vec!["x".repeat(MAX_EMBEDDING_ENTRY_CHARS); 5],
+        ] {
+            let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+                model_cid: "does-not-load".to_string(),
+                input,
+            }))
+            .sign_with(&identity)
+            .expect("sign manifest");
+            let error = match worker.execute(manifest).await {
+                Ok(_) => panic!("invalid embedding must fail before model lookup"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, WorkerError::BadManifest(_)));
+        }
+
+        assert!(validate_embedding_spec(&EmbeddingJobSpec {
+            model_cid: "cid".to_string(),
+            input: vec!["ok".to_string()],
+        })
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn occupied_loopback_port_is_never_reserved_for_llama() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("occupy loopback port");
+        let port = listener.local_addr().expect("occupied address").port();
+        assert!(port < u16::MAX, "ephemeral port must have a successor");
+        let worker = LlamaCppWorker::new(
+            NodeIdentity::generate(),
+            LlamaCppConfig {
+                server_port_range: port..port + 1,
+                ..LlamaCppConfig::default()
+            },
+        );
+
+        assert!(matches!(
+            worker.allocate_port().await,
+            Err(WorkerError::Capacity)
+        ));
+        assert!(worker.inner.ports_in_use.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_client_refuses_backend_redirects() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect server");
+        let port = listener.local_addr().expect("redirect address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://192.0.2.1/exfiltrate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write redirect");
+        });
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+
+        let response = worker
+            .inner
+            .client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .expect("receive redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.expect("redirect server exits");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loopback_client_ignores_environment_proxy() {
+        use tokio::io::AsyncWriteExt as _;
+
+        const CHILD_MARKER: &str = "LUCID_LLAMA_NO_PROXY_CHILD";
+        const TARGET_URL: &str = "LUCID_LLAMA_NO_PROXY_TARGET";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+            let response = worker
+                .inner
+                .client
+                .get(std::env::var(TARGET_URL).expect("child target URL"))
+                .send()
+                .await
+                .expect("direct loopback request");
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+            return;
+        }
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind direct target");
+        let target_port = target.local_addr().expect("target address").port();
+        let target_task = tokio::spawn(async move {
+            let (mut socket, _) = target.accept().await.expect("accept direct request");
+            let mut request = [0_u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read direct request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write direct response");
+        });
+        let hostile_proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hostile proxy");
+        let proxy_port = hostile_proxy.local_addr().expect("proxy address").port();
+        let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+        let test_name = "worker_llama::tests::loopback_client_ignores_environment_proxy";
+        let output =
+            tokio::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .env(TARGET_URL, format!("http://127.0.0.1:{target_port}/health"))
+                .env("HTTP_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env("all_proxy", &proxy_url)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .output()
+                .await
+                .expect("run isolated proxy child test");
+        assert!(
+            output.status.success(),
+            "proxy child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::timeout(Duration::from_secs(2), target_task)
+            .await
+            .expect("client bypasses proxy and reaches target")
+            .expect("target task exits");
+        drop(hostile_proxy);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_loads_are_serialized_before_capacity_mutation() {
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+        let guard = worker.inner.load_gate.lock().await;
+        let contender = worker.clone();
+        let task =
+            tokio::spawn(async move { contender.ensure_loaded("missing-model", false).await });
+
+        assert!(tokio::time::timeout(Duration::from_millis(25), task)
+            .await
+            .is_err());
+        drop(guard);
+
+        // The timed-out JoinHandle was dropped, not the underlying task. A
+        // second direct call proves the gate is usable and fails at the model
+        // boundary rather than leaking a port reservation.
+        assert!(matches!(
+            worker.ensure_loaded("missing-model", false).await,
+            Err(WorkerError::ArtifactUnavailable(_))
+        ));
+        assert!(worker.inner.ports_in_use.lock().await.is_empty());
+    }
+
+    #[test]
+    fn completion_request_rejects_oversized_stop_sequences() {
+        let too_many = serde_json::to_string(&vec!["x"; MAX_STOP_SEQUENCES + 1]).unwrap();
+        let spec = inference_with_sampling(&[("stop", &too_many)], Some(32));
+        assert!(build_completion_request(&spec).is_err());
+
+        let too_long = "x".repeat(MAX_STOP_SEQUENCE_CHARS + 1);
+        let encoded = serde_json::to_string(&vec![too_long]).unwrap();
+        let spec = inference_with_sampling(&[("stop", &encoded)], Some(32));
+        assert!(build_completion_request(&spec).is_err());
+    }
+
+    #[test]
+    fn completion_request_forwards_only_validated_sampling() {
+        let spec = inference_with_sampling(
+            &[
+                ("temperature", "0.7"),
+                ("top_p", "0.9"),
+                ("top_k", "40"),
+                ("min_p", "0.05"),
+                ("repetition_penalty", "1.1"),
+                ("seed", "42"),
+                ("stop", r#"["END","STOP"]"#),
+            ],
+            Some(64),
+        );
+        let request = build_completion_request(&spec).expect("valid request");
+        let body = request.body;
+
+        assert_eq!(body["prompt"], serde_json::json!("trusted prompt"));
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["cache_prompt"], serde_json::json!(true));
+        assert_eq!(body["n_predict"], serde_json::json!(64));
+        assert_eq!(body["temperature"], serde_json::json!(0.7));
+        assert_eq!(body["top_p"], serde_json::json!(0.9));
+        assert_eq!(body["top_k"], serde_json::json!(40));
+        assert_eq!(body["min_p"], serde_json::json!(0.05));
+        assert_eq!(body["repetition_penalty"], serde_json::json!(1.1));
+        assert_eq!(body["seed"], serde_json::json!(42));
+        assert_eq!(body["stop"], serde_json::json!(["END", "STOP"]));
+        assert_eq!(request.prompt_chars, 14);
+    }
 
     #[test]
     fn resolve_model_path_accepts_real_file_in_dir() {
@@ -1558,9 +2545,131 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sse_data_frame_is_a_terminal_protocol_error() {
+        let error = decode_completion_frame(br#"{"content":"partial","stop":tru}"#)
+            .expect_err("malformed JSON must never be skipped");
+        assert!(error.contains("malformed llama-server SSE data frame"));
+    }
+
+    #[test]
+    fn eof_without_explicit_stop_frame_can_never_be_success() {
+        assert_eq!(validate_completion_eof(true, b""), Ok(()));
+
+        let clean_eof = validate_completion_eof(false, b"")
+            .expect_err("clean transport EOF is not a model terminal event");
+        assert!(clean_eof.contains("without explicit stop:true"));
+
+        let partial_eof = validate_completion_eof(false, br#"data: {"content":"partial"}"#)
+            .expect_err("unterminated frame must fail closed");
+        assert!(partial_eof.contains("unterminated byte(s)"));
+        assert!(partial_eof.contains("no stop:true terminal frame"));
+    }
+
+    #[tokio::test]
+    async fn backend_eof_without_stop_emits_only_signed_error_terminal() {
+        let (events, receipt) =
+            exercise_raw_sse(b"data: {\"content\":\"partial\",\"stop\":false}\n\n").await;
+        assert!(matches!(events.first(), Some(JobEvent::Output(_))));
+        assert!(matches!(
+            events.last(),
+            Some(JobEvent::Final {
+                result: JobResult {
+                    completion: Completion::Error,
+                    ..
+                },
+                error: Some(error),
+            }) if error.contains("without explicit stop:true")
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            JobEvent::Final {
+                result: JobResult {
+                    completion: Completion::Stop | Completion::Length,
+                    ..
+                },
+                ..
+            }
+        )));
+        assert_eq!(receipt.result.completion, Completion::Error);
+        let mut replay = CommitmentAccumulator::new();
+        for event in &events {
+            if let JobEvent::Output(chunk) = event {
+                replay.update(chunk);
+            }
+        }
+        let (commitment, count) = replay.finalize();
+        assert_eq!(receipt.result.output_commitment, commitment);
+        assert_eq!(receipt.result.output_chunk_count, count);
+    }
+
+    #[tokio::test]
+    async fn malformed_backend_sse_emits_only_signed_error_terminal() {
+        let (events, receipt) =
+            exercise_raw_sse(b"data: {\"content\":\"partial\",\"stop\":tru}\n\n").await;
+        assert!(matches!(
+            events.as_slice(),
+            [JobEvent::Final {
+                result: JobResult {
+                    completion: Completion::Error,
+                    ..
+                },
+                error: Some(error),
+            }] if error.contains("malformed llama-server SSE data frame")
+        ));
+        assert_eq!(receipt.result.completion, Completion::Error);
+    }
+
+    #[test]
     fn find_double_newline_finds_first() {
         let buf = b"hello\n\nworld\n\nbye";
         assert_eq!(find_double_newline(buf), Some(5));
+    }
+
+    #[test]
+    fn delimiter_free_oversized_sse_is_rejected_before_buffer_growth() {
+        let existing = vec![b'x'; MAX_SSE_FRAME_BYTES];
+        let mut buffer = BytesMut::from(existing.as_slice());
+
+        assert_eq!(append_sse_chunk(&mut buffer, b"x"), Err(SseFrameTooLarge));
+        assert_eq!(buffer.len(), MAX_SSE_FRAME_BYTES);
+
+        let mut oversized_frame = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
+        oversized_frame.extend_from_slice(b"\n\n");
+        let mut empty = BytesMut::new();
+        assert_eq!(
+            append_sse_chunk(&mut empty, &oversized_frame),
+            Err(SseFrameTooLarge)
+        );
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn limited_body_rejects_oversized_chunks_without_partial_append() {
+        let mut body = BytesMut::new();
+        extend_limited_body(&mut body, b"12345678", 8).expect("exact limit is accepted");
+        assert_eq!(&body[..], b"12345678");
+
+        assert_eq!(
+            extend_limited_body(&mut body, b"9", 8),
+            Err(BackendBodyReadError::TooLarge { limit: 8 })
+        );
+        assert_eq!(&body[..], b"12345678");
+    }
+
+    #[test]
+    fn child_log_text_is_control_safe_and_character_bounded() {
+        let mut hostile = b"prefix\r\n\x1b[31m\0".to_vec();
+        hostile.extend(std::iter::repeat_n(b'x', 128));
+
+        let sanitized = sanitize_bounded_log_text(&hostile, 32, false);
+        assert!(sanitized.chars().count() <= 32);
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+        assert!(sanitized.ends_with("...[truncated]"));
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\n'));
+
+        let explicitly_truncated = sanitize_bounded_log_text(b"short", 32, true);
+        assert!(explicitly_truncated.ends_with("...[truncated]"));
     }
 
     #[test]
@@ -1588,7 +2697,7 @@ mod tests {
     fn parse_embedding_accepts_nested_array_of_objects() {
         // The REAL llama.cpp native /embedding endpoint wraps the pooled
         // vector in an OUTER array: `[{"index":0,"embedding":[[...]]}]`. The
-        // fake-stub test above used a flat array and missed this; a live
+        // Earlier fixture coverage used a flat array and missed this; a live
         // nomic-embed run returned zero vectors until the parser descended one
         // level. Take row 0 (the pooled vector).
         let raw = br#"[{"index":0,"embedding":[[7.0,8.0,9.0]]}]"#;

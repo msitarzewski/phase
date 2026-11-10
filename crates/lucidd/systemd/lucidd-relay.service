@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 [Unit]
-Description=lucidd — LUCID inference daemon (relay mode)
+Description=lucidd — bounded Phase relay/AutoNAT infrastructure node
 Documentation=https://github.com/msitarzewski/phase
 After=network-online.target
 Wants=network-online.target
@@ -11,14 +12,20 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-ExecStart=%h/bin/lucidd --mode relay --libp2p-port 4001
+UMask=0077
+# Required operator configuration:
+#   LUCIDD_EXTERNAL_ADDRESS=/ip4/<public-ip>/tcp/4001
+# Keep identity paths host-local; never copy one live identity between sites.
+Environment=LUCIDD_LIBP2P_PORT=4001
+EnvironmentFile=%h/.config/lucidd/infrastructure.env
+ExecStart=%h/bin/lucidd --mode infrastructure --libp2p-port ${LUCIDD_LIBP2P_PORT} --external-address ${LUCIDD_EXTERNAL_ADDRESS}
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lucidd
 
-# Bind the Ollama API to loopback — relays don't expose a useful local
+# Bind the Ollama API to loopback — infrastructure nodes don't expose a useful local
 # API surface, and this prevents accidental WAN exposure if a future
 # reverse-proxy rule drifts.
 Environment=LUCIDD_PORT=11434
@@ -28,6 +35,28 @@ Environment=RUST_LOG=info,phase_net=info,lucidd=info
 # libp2p maintains many concurrent connections + Kademlia routing
 # tables; bump the default file-descriptor limit.
 LimitNOFILE=65536
+TasksMax=512
+MemoryMax=1G
+CPUQuota=200%
+
+# User-service sandbox. The dedicated operator account retains write access
+# only to Phase/LUCID configuration and identity state; the daemon needs no
+# device, kernel, namespace-creation, set-id, or executable-memory privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/lucidd %h/.config/phase
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
 
 [Install]
 # `default.target` for a user-level service is the equivalent of

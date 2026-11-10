@@ -7,9 +7,8 @@
 //! HTTP service advertisement so clients can discover boot images via:
 //!   `avahi-browse _phase-image._tcp` or `dns-sd -B _phase-image._tcp`
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::HashMap;
-use tracing::{info, warn};
 
 /// mDNS service type for Phase boot providers
 pub const MDNS_SERVICE_TYPE: &str = "_phase-image._tcp.local.";
@@ -86,81 +85,27 @@ fn hostname() -> String {
     "unknown".to_string()
 }
 
-/// mDNS service advertiser
+/// Legacy DNS-SD artifact advertiser surface.
 ///
-/// NOTE: This is a placeholder for the actual mDNS implementation.
-/// Full DNS-SD service advertisement requires the `mdns-sd` crate,
-/// which should be added to Cargo.toml:
-///
-/// ```toml
-/// mdns-sd = "0.11"
-/// ```
-///
-/// Then implement using mdns_sd::ServiceDaemon:
-/// ```rust,ignore
-/// use mdns_sd::{ServiceDaemon, ServiceInfo};
-///
-/// pub struct MdnsAdvertiser {
-///     daemon: ServiceDaemon,
-///     service_info: ServiceInfo,
-/// }
-///
-/// impl MdnsAdvertiser {
-///     pub fn new(config: MdnsConfig) -> Result<Self> {
-///         let daemon = ServiceDaemon::new()?;
-///
-///         let service_info = ServiceInfo::new(
-///             MDNS_SERVICE_TYPE,
-///             &config.service_name,
-///             &format!("{}.local.", hostname()),
-///             "",
-///             config.http_port,
-///             config.txt_records(),
-///         )?;
-///
-///         daemon.register(service_info.clone())?;
-///
-///         Ok(Self { daemon, service_info })
-///     }
-///
-///     pub fn shutdown(self) -> Result<()> {
-///         self.daemon.unregister(&self.service_info.get_fullname())?;
-///         self.daemon.shutdown()?;
-///         Ok(())
-///     }
-/// }
-/// ```
+/// Phase peer discovery is provided by the authenticated `phase-net` swarm.
+/// This older HTTP DNS-SD surface has no implementation and therefore fails
+/// closed instead of claiming that an advertisement was registered.
 #[derive(Debug)]
 pub struct MdnsAdvertiser {
     config: MdnsConfig,
 }
 
 impl MdnsAdvertiser {
-    /// Create and start mDNS advertisement
-    ///
-    /// This currently logs the configuration but does not perform actual
-    /// DNS-SD advertisement. To enable full functionality, add the `mdns-sd`
-    /// crate to Cargo.toml and implement using ServiceDaemon (see above).
+    /// Return an explicit unsupported error. Callers must use authenticated
+    /// Phase peer discovery or provide a real DNS-SD implementation before
+    /// exposing this legacy surface.
     pub fn new(config: MdnsConfig) -> Result<Self> {
-        info!(
-            "mDNS configuration: service={} port={} channel={} arch={}",
-            config.service_name, config.http_port, config.channel, config.arch
-        );
-
-        warn!("mDNS service advertisement not yet implemented - requires 'mdns-sd' crate");
-        warn!("To enable: add 'mdns-sd = \"0.11\"' to Cargo.toml and implement ServiceDaemon");
-
-        info!(
-            "Clients can discover via: avahi-browse {} or dns-sd -B {}",
-            MDNS_SERVICE_TYPE, MDNS_SERVICE_TYPE
-        );
-
-        Ok(Self { config })
+        let _ = config;
+        bail!("artifact DNS-SD advertisement is unsupported; use authenticated phase-net discovery")
     }
 
     /// Shutdown advertisement
     pub fn shutdown(self) -> Result<()> {
-        info!("mDNS advertiser shutdown (placeholder)");
         Ok(())
     }
 
@@ -205,17 +150,9 @@ mod tests {
     }
 
     #[test]
-    fn test_advertiser_creation() {
+    fn test_advertiser_fails_closed_until_dns_sd_is_implemented() {
         let config = MdnsConfig::new(8080, "stable", "x86_64");
         let advertiser = MdnsAdvertiser::new(config.clone());
-
-        // Should succeed even though it's a placeholder
-        assert!(advertiser.is_ok());
-
-        let adv = advertiser.unwrap();
-        assert_eq!(adv.config().http_port, 8080);
-
-        // Shutdown should succeed
-        assert!(adv.shutdown().is_ok());
+        assert!(advertiser.is_err());
     }
 }

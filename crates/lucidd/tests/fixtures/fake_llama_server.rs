@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Test fixture: a tiny stand-in for `llama-server` used by
-//! `worker_llama`'s integration tests. NOT for production use.
+//! Test-only protocol fixture for `worker_llama` integration tests.
+//!
+//! This file is included as a module of `tests/llama_worker.rs`; it is not
+//! declared as a Cargo binary target. The integration-test executable
+//! re-enters a single ignored harness entrypoint when a worker subprocess is
+//! needed, which keeps this fixture out of `cargo install` and release bins.
 //!
 //! Mirrors just enough of the llama-server surface that `LlamaCppWorker`
 //! can drive it end-to-end:
 //!
-//! - Parses `--model`, `--port`, `--host`, `--n-gpu-layers`, `--ctx-size`,
-//!   `--jinja` (and silently accepts anything else — llama-server is
-//!   permissive about unknown args in our tests).
+//! - Receives the worker's parsed `--port` and `--host` through the temporary
+//!   launcher; other llama-server arguments are intentionally ignored there.
 //! - Serves `GET /health` → `{"status":"ok"}` (or 503 for a configurable
 //!   warmup period).
 //! - Serves `POST /completion` returning SSE frames the worker can decode.
@@ -52,48 +55,20 @@ struct Config {
     boot_at: std::time::Instant,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut port: u16 = 8080;
-    let mut host: String = "127.0.0.1".to_string();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" => {
-                if let Some(v) = args.get(i + 1) {
-                    port = v.parse().unwrap_or(8080);
-                    i += 2;
-                    continue;
-                }
-            }
-            "--host" => {
-                if let Some(v) = args.get(i + 1) {
-                    host = v.clone();
-                    i += 2;
-                    continue;
-                }
-            }
-            // Silently accept anything that looks like a flag-value pair
-            // (--model PATH, --ctx-size N, --n-gpu-layers N, …) so real
-            // llama-server flag strings don't trip the fixture.
-            s if s.starts_with("--") => {
-                if args
-                    .get(i + 1)
-                    .map(|v| !v.starts_with("--"))
-                    .unwrap_or(false)
-                {
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
+pub(crate) fn run() -> ! {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build fixture runtime");
+    runtime.block_on(run_server())
+}
+
+async fn run_server() -> ! {
+    let port: u16 = std::env::var("PHASE_FAKE_LLAMA_PORT")
+        .expect("fixture wrapper must set PHASE_FAKE_LLAMA_PORT")
+        .parse()
+        .expect("fixture port must be a u16");
+    let host = std::env::var("PHASE_FAKE_LLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     let cfg = Config {
         tokens: std::env::var("FAKE_LLAMA_TOKENS")
@@ -158,7 +133,11 @@ async fn main() {
         }
     };
     eprintln!("fake-llama-server listening on {addr}");
-    let _ = axum::serve(listener, app).await;
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("fake-llama-server stopped: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0)
 }
 
 async fn handle_health(State(cfg): State<Arc<Config>>) -> Response {

@@ -4,43 +4,48 @@
 //! substrate. Implements the `phase-protocol::Worker` trait for inference
 //! workloads.
 //!
-//! ## Current status: spike
-//!
-//! This crate currently ships a minimal Ollama-compatible `/api/chat`
-//! endpoint backed by an in-tree `EchoWorker` that reverses the user's last
-//! message. It exists to validate the `phase-protocol::Worker` trait against
-//! a real external boundary (the Ollama wire format + a real Ollama client)
-//! *before* the full LUCID M4 surface lands.
-//!
-//! Real inference (llama.cpp / MLX) and the full Ollama API surface are
-//! LUCID M2 / M4 territory.
+//! The production path supports verified llama.cpp inference, signed
+//! alias/CID and provider records, resumable content transfer, live libp2p
+//! relay streaming, bounded reachability infrastructure, policy gating, and
+//! signed receipt verification. [`echo`] is retained only as an explicit
+//! development/test worker.
 
 // SEC-11 (L7): forbid `unsafe` in lucidd's own code. Per-crate — wasmtime /
 // libp2p pulled transitively still use `unsafe` internally; this only guards
 // lucidd's source against an `unsafe` regression.
 #![deny(unsafe_code)]
 
+pub mod content;
 pub mod dht_transport;
 pub mod echo;
 pub mod ollama;
 pub mod policy;
 pub mod registry;
+pub mod reputation;
 pub mod router;
 pub mod worker_llama;
+pub mod worker_mlx;
 
 // LUCID M2: the production inference worker. Shells out to `llama-server`,
 // streams tokens back through the protocol, and signs receipts. Exported at
 // the crate root so the binary can switch between EchoWorker (no GPU
 // required, used by CI) and LlamaCppWorker (production path) via CLI flag.
 pub use worker_llama::{LlamaCppConfig, LlamaCppWorker};
+pub use worker_mlx::{
+    inspect_mlx_bundle, MlxBundleMetadata, MlxConfig, MlxWorker, MLX_BUNDLE_FORMAT,
+    MLX_BUNDLE_ROOT_ALGORITHM, MLX_HARDWARE_ACCEPTANCE, MLX_PORT_BINDING_STATUS,
+    MLX_RUNTIME_ATTESTATION, TARGET_MLX_LM_VERSION, TARGET_MLX_VERSION,
+};
 
 // Public re-exports for the M6 model registry. Downstream code (the
 // router in M5, the Ollama `/api/tags` handler in M4) consumes these as
 // `lucidd::ModelRegistry` etc. without having to know about the module
 // layout. See `registry` module docs for the trust model and TTL story.
 pub use registry::{
-    DhtTransport, ModelCapabilities, ModelCid, ModelRegistry, SignedModelAdvertisement,
-    ADVERTISEMENT_SCHEMA_VERSION, ADVERTISEMENT_TTL, MODEL_KEY_PREFIX, TTL_REFRESH_INTERVAL,
+    alias_dht_key, normalize_model_alias, AliasRecord, DhtTransport, ModelCapabilities, ModelCid,
+    ModelRegistry, ResolvedAlias, SignedAliasRecord, SignedModelAdvertisement,
+    ADVERTISEMENT_SCHEMA_VERSION, ADVERTISEMENT_TTL, ALIAS_KEY_PREFIX, ALIAS_SCHEMA_VERSION,
+    MAX_ALIAS_TTL, MAX_MODEL_SIZE_BYTES, MODEL_KEY_PREFIX, TTL_REFRESH_INTERVAL,
 };
 
 // Public re-exports for the M7 policy surface. The router (M5) calls
@@ -58,6 +63,8 @@ pub use policy::{
 // `/phase/job-relay/1.0.0`, or refuse.
 pub use dht_transport::PhaseNetDhtTransport;
 pub use router::{
-    make_inbound_relay_handler, ReceiptVerification, RouteDecision, RouteVia, Router, RouterError,
-    RELAY_TIMEOUT,
+    make_inbound_relay_handler, make_inbound_relay_handlers, make_inbound_relay_stream_handler,
+    DeterministicVerificationEligibility, InboundRelayHandlers, ReceiptVerification,
+    RedundantCheckResult, RedundantVerificationConfig, RouteDecision, RouteVia, Router,
+    RouterError, RELAY_TIMEOUT,
 };

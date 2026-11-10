@@ -15,7 +15,7 @@ use crate::error::ReceiptError;
 /// a receipt.
 pub const SIGNING_DOMAIN: &[u8] = b"phase-receipt:v1:";
 
-/// Highest schema version this crate understands.
+/// Exact schema version this crate understands.
 pub const SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ where
 {
     /// Verify the receipt's signature.
     pub fn verify(&self) -> Result<(), ReceiptError> {
-        if self.schema_version > SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION {
             return Err(ReceiptError::UnsupportedSchema {
                 found: self.schema_version,
                 supported: SCHEMA_VERSION,
@@ -322,6 +322,23 @@ mod tests {
         assert!(matches!(
             signed.verify(),
             Err(ReceiptError::UnsupportedSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_version_zero_is_rejected_even_with_valid_signature() {
+        let id = NodeIdentity::generate();
+        let signed = ReceiptBuilder::new(sample_result(), JOB_ID)
+            .schema_version(0)
+            .sign_with(&id)
+            .expect("sign v0 receipt");
+
+        assert!(matches!(
+            signed.verify(),
+            Err(ReceiptError::UnsupportedSchema {
+                found: 0,
+                supported: SCHEMA_VERSION,
+            })
         ));
     }
 

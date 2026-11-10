@@ -1,6 +1,6 @@
 [package]
 name = "lucidd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
@@ -8,6 +8,13 @@ description = "LUCID inference daemon — open GPU inference flagship built on t
 authors = ["Michael Sitarzewski"]
 repository = "https://github.com/msitarzewski/phase"
 readme = "README.md"
+include = [
+    "src/**",
+    "tests/**",
+    "systemd/**",
+    "Cargo.toml",
+    "README.md",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -15,15 +22,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "lucidd"
 path = "src/main.rs"
-
-# Tiny stand-in for `llama-server` used by `worker_llama`'s integration
-# tests. Stays in the regular bin set (not `cfg(test)`) so `cargo test` can
-# locate it via the standard `CARGO_BIN_EXE_*` envvar pattern. It's not in
-# the published surface — keep it small and document loudly that it's a
-# test fixture.
-[[bin]]
-name = "fake-llama-server"
-path = "tests/fixtures/fake_llama_server.rs"
 
 [dependencies]
 phase-protocol = { path = "../phase-protocol" }
@@ -37,6 +35,9 @@ phase-receipt = { path = "../phase-receipt" }
 # already exposes (`publish_kad_record`) and what M5 will need to add
 # (a record-lookup primitive). Real wiring is M5's job.
 phase-net = { path = "../phase-net" }
+# Reuse Phase's existing content-addressed blob store and range-serving
+# primitives for verified model imports and `/api/pull`.
+phase-artifact-server = { path = "../phase-artifact-server" }
 ed25519-dalek = "2.1"
 # Wire format for signed DHT advertisements. Migrated off the unmaintained
 # `bincode 1.x` (RUSTSEC-2025-0141, SEC-12) to postcard — maintained, stable
@@ -58,7 +59,7 @@ thiserror = "2"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = "1"
 
 # Stream plumbing for the NDJSON response body.
@@ -121,10 +122,12 @@ toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
-# Stub binary tests need a temp dir and a way to wait for child output.
+# Subprocess integration tests need a temp dir and a way to wait for child
+# output. Their llama-server protocol fixture is compiled only into the
+# integration-test harness; it is not an installable Cargo binary target.
 tempfile = "3"
 tokio = { version = "1.40", features = ["full", "test-util"] }
-# The stub `llama-server` for tests is a tiny axum app — easier than mocking
-# the subprocess by hand. See `tests/fixtures/fake_llama_server.rs`.
+# The test-only llama-server protocol fixture is a tiny axum app. See
+# `tests/fixtures/fake_llama_server.rs`.
 axum = { version = "0.7", features = ["macros"] }
 hyper = { version = "1", features = ["server"] }
