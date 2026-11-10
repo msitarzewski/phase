@@ -1,12 +1,23 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-08-10
+**Last Updated**: 2026-11-07
 **Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint
 **Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Approved source `1356ef65…d847` is green on macOS ARM64 and native UMBP Ubuntu x86_64. Checkpoint commit/push was approved on 2026-08-10; no v0.2 tag or production deployment exists.
 
 ---
 
 ## Major Deliverables
+
+### Competitive and acceptance preparation refresh (2026-11-07)
+
+- Extended the existing research document with a primary-source competitive map, direct OpenHydra/KwaaiNet comparison, verification-method references, evidence limits and review triggers. Earlier June claims remain historical and explicitly unvalidated for current positioning.
+- Updated public/daemon READMEs and mission language to distinguish shipped software, the v0.2 checkpoint, transcript integrity, computation correctness and unqualified privacy goals. Corrected the stale claim that PeerId binding bypasses the submitter allowlist; current inbound code requires authorization and binding.
+- Extended the existing trust, whole-model-baseline and physical-test specifications with concrete experiments, method-selection gates, actor commands and cleanup/evidence requirements. No independent correctness validator, tensor scheduler or LUMEN implementation was added.
+- Rechecked current host prerequisites over SSH: beacon has no running Phase actor/4001 listener; historical pip is unreachable; pipx is Linux/NVIDIA and lacks Phase/backend tooling. These observations do not qualify the physical intended stream or Apple MLX.
+- Fresh Rust 1.99 compatibility fixes box internal HTTP error responses and scope generated-code lint annotations to the affected async_trait traits. The existing test port allocator now reserves disjoint whole ranges below standard ephemeral ports, and fixture stderr can be retained for diagnosis. No dependency, authorization or public API contract changed.
+- Full workspace follow-up: 460 tests passed / 2 ignored, formatting and strict Clippy passed (`target/phase-validation/20261107T184728Z-43089/`). The installed real llama-server/Gemma smoke passed separately. This is macOS/local evidence, not Linux, MLX or public-network qualification.
+- Repeated backend runs remain imperfect: a six-run diagnostic campaign passed five times and failed once with a fixture startup `Address already in use` error. That failure is retained and not waived. Further investigation/public-host setup awaits the AGENTS.md retry/time-budget extension requested from the owner. The initially observed failures remain at `target/phase-validation/20261107T182908Z-24926/`.
+- Release status is unchanged: 0 v0.2 milestones complete; physical intended stream and ShardWorker remain blocked; LUMEN remains planned.
 
 ### LUCID v0.2 implementation checkpoint APPROVED (2026-08-09; release incomplete)
 

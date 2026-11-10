@@ -2,6 +2,8 @@
 
 **Phase is the open verifiable compute protocol. LUCID is the first flagship built on it that the world urgently needs: open inference, on the public's hardware, that nobody can turn off.**
 
+**Positioning review — 2026-11-07:** this document states the intended end state. Current deployment and implementation guarantees live in the [LUCID v0.2 tracker](releases/lucid-v0.2/README.md#progress-tracker). Direct inference-network peers now exist; the [competitive reassessment](research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) supersedes the older uniqueness claims. Signed receipts establish provenance and transcript integrity; independent correctness validation, serving-operator prompt confidentiality and unrestricted public access are not shipped guarantees.
+
 ---
 
 ## For everyone
@@ -20,9 +22,9 @@ It works because thousands of regular people share a little of their computer's 
 
 ## Thesis
 
-In 2026, frontier-quality open-weights models (DeepSeek-V4, Qwen3-Next, Llama 4 series) are competitive with closed APIs at the median use case. Hundreds of millions of consumer GPUs sit idle most hours of the day. The hard parts of distributed inference — cross-vendor GPU support (llama.cpp's Metal/CUDA/ROCm/Vulkan backends), heterogeneous device sharding (exo's partitioning), open weight distribution (HuggingFace, IPFS) — are already solved upstream.
+Open-weight models and consumer inference runtimes make useful volunteered inference possible. Existing projects provide model execution, distribution and cluster partitioning; Phase should reuse those capabilities. Their existence does not establish reliable consumer-NAT operation, affordable verification or useful tensor sharding across untrusted internet peers.
 
-What is *not* solved is the substrate: a credibly-neutral, vendor-agnostic protocol for advertising, discovering, and verifying compute across machines that do not trust each other, without payments, without KYC, without lock-in.
+The contribution Phase aims to make is a credibly-neutral, workload-neutral protocol for advertising, discovering and checking compute evidence across independently operated machines, without protocol payments, KYC or vendor lock-in. This combination must be demonstrated; it is not a claim that decentralized inference, nonprofit compute or verification research lack prior art.
 
 That substrate is **Phase**. The flagship application built on it is **LUCID**.
 
@@ -32,7 +34,7 @@ That substrate is **Phase**. The flagship application built on it is **LUCID**.
 
 ### We are building
 
-- An **open compute protocol** — discovery, identity, signed manifests, signed receipts, verifiable execution. Workload-agnostic by design.
+- An **open compute protocol** — discovery, identity, signed manifests, signed receipts and explicitly scoped execution evidence. Workload-agnostic by design; current transcript integrity is separate from future computation-correctness validation.
 - A **family of reference node implementations** that speak the protocol:
   - **Plasm** — WASM workloads (existing work, repositioned)
   - **LUCID** — GPU inference (new flagship)
@@ -95,11 +97,11 @@ Phase and LUCID currently share one repository for development velocity. They wi
 
 ## Why now
 
-- **Open weights are competitive.** Mid-2026 frontier open models are at parity with closed APIs at the median use case — GLM-5.2 (744B MoE), MiniMax M3 (#1 open-weight SWE-Bench Pro, 59.0%), DeepSeek-V4-Flash, Qwen3.6-35B-A3B (73.4 SWE-bench Verified, and exactly the model class a contributor Mac would realistically serve). The "donate your GPU for a worse model" objection no longer applies.
-- **AI sovereignty stopped being theoretical.** On 2026-06-12 the US Commerce Department ordered Anthropic to block all foreign nationals from Claude Fable 5 / Mythos 5; unable to verify nationality in real time, Anthropic switched both models off *worldwide* overnight — the first government-forced takedown of a live, commercial frontier model. Days earlier it had announced mandatory biometric identity verification (Persona — government ID + live selfie) for consumer access. These are the same control architecture from two sides: **identity-gating is the enforcement layer that makes the off-switch possible.** LUCID's no-identity, no-KYC substrate is the structural refusal of both. (See [research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md](research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md).)
-- **Consumer GPUs are everywhere and mostly idle.** Aggregate consumer compute capacity is enormous; the missing piece has always been coordination, not silicon.
-- **Petals proved the protocol; the movement was missing.** Distributed inference works technically. What it has lacked is brand, packaging, and ideological energy.
-- **Phase already exists.** The libp2p + signed-receipts + DHT substrate is ~60-70% built. The work ahead is extraction, generalization, and a flagship — not greenfield.
+- **Existing execution projects are reusable.** [llama.cpp](https://github.com/ggml-org/llama.cpp), [exo](https://github.com/exo-explore/exo) and [Petals](https://github.com/bigscience-workshop/petals) supply relevant execution and distribution capabilities. Performance and model quality must be evaluated on the actual workload and hardware.
+- **Independent operation is a design requirement.** A provider-controlled account, gateway or payment layer is a control point. Phase's mission is to avoid making one mandatory. This rationale does not depend on a particular provider-policy or political anecdote; older June claims are retained as unvalidated historical notes in the research document.
+- **Volunteer compute has working precedent.** [AI Horde](https://github.com/Haidra-Org/AI-Horde) demonstrates donated inference with anonymous access. Phase must earn its distinction through peer operation and evidence guarantees rather than claiming the volunteer model is new.
+- **Direct peers sharpen the execution requirement.** [OpenHydra](https://github.com/samtroberts/openhydra) and [KwaaiNet](https://github.com/Kwaai-AI-Lab/KwaaiNet) overlap with LUCID technically and, in KwaaiNet's case, with nonprofit governance. Phase needs reproducible evidence of its particular guarantees.
+- **Phase already has a substrate and flagships.** Phase Core, Plasm and LUCID v0.1/v0.1.1 are shipped history. The v0.2 checkpoint implements content, streaming and reachability components; [physical-network and trust acceptance](releases/lucid-v0.2/README.md#progress-tracker) remain open.
 
 ---
 
@@ -107,11 +109,11 @@ Phase and LUCID currently share one repository for development velocity. They wi
 
 1. **Substrate first, then product.** Phase has to be credibly workload-neutral so anything — inference, render, science — can build on it. We resist the temptation to specialize the protocol around inference. The protocol does not know what a "model" is.
 
-2. **Compatibility as the wedge.** LUCID presents the Ollama API on `:11434`. Every existing AI tool (Open WebUI, Continue, Cursor, LangChain, opencode) just works without modification. No new client SDK adoption required for v0.1. Familiar interface, distributed substrate underneath.
+2. **Compatibility as the wedge.** LUCID presents an Ollama-compatible API on `:11434`. Clients using the supported endpoints can connect without a Phase SDK. Qualify actual clients and options; the compatibility promise is not a claim of complete upstream API parity. Familiar interfaces should make distributed compute easier to adopt.
 
-3. **Privacy is foundational, not roadmap.** Per-request prompt visibility is the brutal honest UX cost of distributed routing. UI must communicate this from day one. "Local-only" toggle ships in v0.1. Real cryptographic prompt privacy (onion-routing, split-prompt) lands in v0.3 — but it is *committed*, not aspirational.
+3. **Privacy claims must match the trust boundary.** Serving operators can see remote prompts today; clients must disclose that, and the local-only toggle keeps a request local. Stronger confidentiality remains a research goal. Transport encryption and onion routing alone do not hide input from the executing machine; any future construction needs its own threat model and measured acceptance.
 
-4. **Verification beats payments.** No tokens, no rate-limit-by-pay. Abuse is the real threat model, addressed by community moderation (Tor-shaped), redundant execution, and reputation. Not blockchain-shaped. Signed receipts carry a second payload — integrity: the closed labs just demonstrated covert, deniable capability-throttling (Anthropic shipped, then apologized for, invisibly downgrading frontier-AI-development responses in Fable 5). You cannot audit a black box you don't control; open weights plus verifiable execution is the answer.
+4. **Verification beats payments.** No tokens, no rate-limit-by-pay. Abuse controls, bounded redundant checks and local reputation must be established without a payment rail. Signed receipts bind a job, peer and delivered transcript; they do not prove the claimed model executed. Independent correctness evidence must identify its method, exact content/backend binding, validator, cost, confidence and exclusions. Default authorization remains deny-by-default until the approved correctness/load/abuse/public-network gate passes.
 
 5. **No vendor capture.** Apache-2.0 for the protocol so anyone — including governments hostile to other partners — can adopt without legal friction. AGPL-3.0 for LUCID so no one can fork-and-close the flagship. Take public dev resources from NVIDIA, AMD, Apple; never take their official blessing.
 
@@ -119,7 +121,9 @@ Phase and LUCID currently share one repository for development velocity. They wi
 
 ---
 
-## Current state (as of 2026-05-26)
+## Historical starting state (2026-05-26)
+
+Preserved for origin context only. Use the [current tracker](releases/lucid-v0.2/README.md#progress-tracker) for implementation, deployment and acceptance status.
 
 | Component | Status |
 |---|---|

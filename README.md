@@ -1,6 +1,6 @@
 # Phase
 
-Phase is the open verifiable compute protocol — a credibly-neutral, vendor-agnostic substrate for advertising, discovering, and verifying compute across machines that do not trust each other, without payments, without KYC, without lock-in. The protocol is workload-neutral: WASM today, GPU inference now (LUCID), anything that benefits from verifiable distributed compute after that. For everyone: smart computing, on the public's hardware, that nobody can turn off.
+Phase is the open verifiable compute protocol — a credibly-neutral, vendor-agnostic substrate for advertising and discovering compute, and checking signed execution evidence across independent machines, without payments, without KYC, without lock-in. The protocol is workload-neutral: WASM through Plasm, GPU inference through LUCID, and further workloads through the same substrate. The goal is public compute infrastructure that no single provider controls. Current receipts establish attributable output integrity; independent computation-correctness validation remains in development.
 
 See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale.
 
@@ -8,48 +8,59 @@ See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale
 
 ## Status
 
+**Reviewed: 2026-11-07.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
+
 - **Phase Core** — **complete** (Nov 2025 → May 2026). The libp2p + Ed25519 substrate, extracted from the legacy `daemon/` tree into six publishable Apache-2.0 library crates plus the repositioned Plasm reference node.
-- **LUCID v0.1** — **functional and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts. A 24/7 foundation relay runs on the public internet.
-- **Security hardening** — **shipped & live** (PR #9). Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate.
+- **LUCID v0.1 / v0.1.1** — **shipped and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts. A public foundation relay was deployed in May; current fleet availability requires fresh operational evidence.
+- **LUCID v0.2** — **implemented checkpoint, unreleased.** Verified content pull/alias/provider records, live peer streams, relay/AutoNAT/DCUtR machinery, local reputation and bounded redundancy, and an experimental MLX adapter are implemented. Physical cross-network/NAT acceptance, real large-artifact resume, real MLX acceptance, independent correctness validation, and the remaining qualification matrix are open. [Authoritative tracker](memory-bank/releases/lucid-v0.2/README.md).
+- **Security hardening** — **shipped in May 2026** (PR #9). Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate. Current dependency security requires a fresh audit.
 
 **Validated on real hardware:**
 - Two-node, DHT-routed inference demo — one machine loads a model, another `curl`s `localhost:11434/api/chat` and gets a signed result routed over libp2p.
 - Real embeddings on Apple Metal — `nomic-embed-text` via `/api/embed`, 768-dim vectors with correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
 - An authz-gate demo — default-deny rejects an unauthorized routed job; the operator escape hatch accepts it with `X-Lucid-Receipt-Verified: true`.
 
-**Workspace state:** 266 tests passing · `cargo build --workspace` clean · `clippy --workspace --all-targets -- -D warnings` clean · `cargo audit` 0 vulnerabilities · `cargo deny check` ok. ~20k lines of Rust across eight crates.
+**Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md), not a claim of fresh qualification or a released v0.2.
+
+**November follow-up:** a macOS Rust 1.99 workspace run passed 460 tests (2 ignored), formatting and strict Clippy after compatibility fixes; the existing real llama-server/Gemma smoke also passed separately. Repeated backend-suite runs still exposed an intermittent fixture startup bind failure. This is an open QA limitation, not a release waiver. See [current progress](memory-bank/progress.md#competitive-and-acceptance-preparation-refresh-2026-11-07).
 
 ---
 
 ## What works today (v0.1)
 
-- **Ollama-compatible API** on `:11434` — every existing AI tool (Open WebUI, Continue, Cursor, LangChain, `curl`) just works, no new SDK:
+- **Ollama-compatible API** on `:11434` — compatible clients can use the supported endpoints without a Phase SDK; qualify the actual client and options rather than assuming complete upstream API parity:
   `/api/chat`, `/api/generate` (NDJSON streaming) · `/api/embed`, `/api/embeddings` (vectors) · `/api/pull` (registers a local model) · `/api/tags`, `/api/show`, `/api/version`.
 - **Workers:** `llama.cpp` (real inference + embeddings via `llama-server`, any of its Metal/CUDA/ROCm/Vulkan backends) and an in-tree `echo` worker (no GPU, for dev/CI/demos).
 - **Local-or-DHT routing** — per-request: serve locally if the model is loaded, else discover a peer on the Kademlia DHT and relay the job, with **multi-peer failover**. Response headers report where it ran (`X-Lucid-Routed-Via`) and whether the peer's signed receipt verified (`X-Lucid-Receipt-Verified`).
-- **Verifiable execution** — every result carries a streaming SHA-256 commitment in an Ed25519 `SignedReceipt`; a peer-served receipt is verified and bound (signature → job-id → worker-pubkey→PeerId → commitment replay) before it is trusted.
+- **Attributable output integrity** — every result carries a streaming SHA-256 commitment in an Ed25519 `SignedReceipt`; verification binds signature, job, serving PeerId and delivered output. This does not prove correct model execution.
 - **Operator policy** — a hot-reloadable `policy.toml`: serve-model allowlist, auto-pause on battery / thermal / time-of-day / concurrency, a signer allowlist, and a `manual_pause`. Self-initiated requests bypass the donation-protection gates so the operator can always use their own GPU.
 - **WAN bootstrap** — stable libp2p ports, IPv6 listen, persistent identity, explicit `--bootstrap-peer`, and DNS TXT-record bootstrap (`--bootstrap-dns`, PeerID-pinned).
 - **Plasm** — the reference WASM node (`plasmd`): signed-manifest WASM execution in a sandboxed wasmtime runtime, content-addressed artifact serving, and the Phase Boot netboot/kexec pipeline.
 
 ---
 
-## Roadmap (aspirational — not yet built)
+## Current checkpoint and remaining roadmap
 
-These are committed directions, not shipped features. The protocol is deliberately workload-neutral so each lands without specializing the substrate.
+The protocol remains workload-neutral. Implementation does not imply release acceptance; the [v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md#progress-tracker) records each gate.
 
-**v0.2 — substrate & scale**
-- Real `/api/pull`: network model download with **content-hashed CIDs** (replacing the v0.1 deterministic name→CID placeholder) and a verified cross-peer `name → cid` index.
-- Token-by-token **streaming over the relay** (v0.1 peer-relay is batch-shaped).
-- libp2p **circuit-relay server + DCUtR hole-punching** + rendezvous, for the "coffee-shop" NAT-traversal scenario.
-- **Reputation** — harden peer-receipt verification from the v0.1 "friend's GPU" trust posture to redundant-execution + reputation spot-checking.
-- **ShardWorker** — sharded inference across heterogeneous devices (can proxy to exo-style clusters). Gated on the open problem of verifying sharded/partial computation.
+**v0.2 — implemented, awaiting acceptance**
+- Content-derived CIDs, signed alias/provider records, verified network pull and resumable transfer.
+- Live peer streaming with cancellation, backpressure, ordered frames and terminal receipt binding.
+- Circuit relay, AutoNAT and DCUtR machinery; public rendezvous serving stays disabled pending registration quotas.
+- Local evidence/reputation and bounded deterministic redundant checks. Agreement is empirical evidence, not proof of model execution.
+- Experimental pinned MLX subprocess adapter, pending real Apple Silicon acceptance.
+
+**Next evidence gates**
+- Demonstrate the [intended stream](memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md) across physical networks and consumer NAT using a real model, verified pull/resume, live remote output, cancellation and invalid-content/receipt rejection.
+- Evaluate independent correctness-validation methods against existing work such as TOPLOC and OpenHydra's challenge/replay mechanisms, with exact model/backend binding and explicit limitations.
+- Measure independent whole-model jobs across heterogeneous peers before proposing tensor sharding. **ShardWorker remains research-blocked**; no production worker exists.
+- Finish Linux ARM64, real MLX, rollback, clean-host and public-load qualification.
 
 **v0.3 — privacy**
-- Cryptographic prompt privacy: onion-routing / split-prompt so a serving peer never sees a plaintext prompt. (v0.1 is honest about per-request prompt visibility and ships a `local-only` toggle.)
+- Research prompt confidentiality from the serving operator. Encrypted transport and onion routing alone do not hide a prompt from the machine executing it; a stronger claim requires a separately evaluated construction. The current local-only toggle keeps requests on the operator's machine.
 
 **Backends (LUCID)**
-- **MLX worker** — Apple Silicon native inference (GPU/Metal via turnkey `mlx-lm`). Deferred LUCID M3; needs an Apple Silicon rig.
+- **MLX worker** — experimental implementation exists; real model, lifecycle, peer-routing and power/performance acceptance remain.
 - **CoreAIWorker** — Apple Neural Engine backend for our own converted open-weights models (the "donate your idle Mac overnight" efficiency profile). After MLX; gated on confirming the public Core AI API exposes KV-cache / stateful decode. (Apple **Foundation Models** is explicitly a non-goal — see [decisions.md](memory-bank/decisions.md).)
 
 **Second flagship & future workloads**
@@ -110,7 +121,7 @@ Build and test everything:
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 266 tests
+cargo test --workspace
 ```
 
 **Plasm** — run the reference WASM node and execute the hello.wasm sample (reverses `Hello, World` → `dlroW ,olleH`, emitting a signed receipt):
@@ -143,6 +154,8 @@ Any Ollama-compatible client works unchanged — point it at `http://localhost:1
 ## Documentation
 
 - [memory-bank/MISSION.md](memory-bank/MISSION.md) — what we are building and why
+- [Competitive ecosystem review](memory-bank/research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) — direct peers, evidence limits and Phase's remaining differentiation
+- [LUCID v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md) — authoritative implementation and release-acceptance status
 - [crates/lucidd/README.md](crates/lucidd/README.md) — the LUCID daemon (API, workers, CLI, security)
 - [crates/plasm/README.md](crates/plasm/README.md) — the Plasm WASM node
 - [memory-bank/releases/phase-core/](memory-bank/releases/phase-core/) — substrate extraction release plan

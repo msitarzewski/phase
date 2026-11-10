@@ -1,9 +1,64 @@
-# Research Report — AI sovereignty events & the local-inference ecosystem (June 2026): real-world validation of the LUCID thesis
+# Research — AI sovereignty and the distributed-compute ecosystem
 
-**Date:** 2026-06-21
+**Original investigation:** 2026-06-21
+**Last reviewed:** 2026-11-07
 **Author:** Michael S. + agent
-**Status:** Record of investigation from a working session. Conclusions *sharpen and corroborate* existing positioning — they do not change the plan. No code action. Three MISSION pillars just got dated, real-world evidence: "open inference… that nobody can turn off," "without KYC," and "open weights are competitive."
-**Method:** Web research + a hands-on local-tool shakedown on maxbeast. Credible outlets (The Hill, Fortune, CNBC, Euronews, Decrypt) weighted over SEO content farms; one viral claim explicitly debunked. Verified vs. unverified flagged throughout.
+**Status:** Current competitive reassessment followed by a preserved historical investigation. The November assessment supersedes the June positioning recommendations and any implication that signed receipts prove correct model execution.
+**Current method:** Primary project documentation, GitHub releases and selected source inspection. No competitor was installed, benchmarked or independently security-audited. Published functionality is distinguished from measured deployment evidence; project-reported network sizes are not treated as verified adoption.
+
+## Competitive reassessment — 2026-11-07
+
+### Finding
+
+Direct peers now exist. Phase's opportunity is the combination of a workload-neutral open protocol, volunteered compute without protocol payments or KYC, independent operation, content-bound execution and meaningful, explicitly scoped verification. Individual parts of this combination already exist elsewhere. Neither an API-compatible server nor a signed receipt establishes a unique or complete product.
+
+Phase itself is an implemented but incompletely qualified network: v0.1/v0.1.1 are shipped history; v0.2 is an approved implementation checkpoint, not a released public network. See [the authoritative tracker](../releases/lucid-v0.2/README.md#progress-tracker) and [the integrity/correctness decision](../decisions.md#2026-08-24-separate-transcript-integrity-from-computation-correctness-measure-whole-model-parallelism-before-tensor-sharding).
+
+### Competitive map
+
+| Project | Primary-source evidence | Relationship and limits |
+|---|---|---|
+| OpenHydra | [Repository](https://github.com/samtroberts/openhydra), [v0.3.24 release, 2026-10-22](https://github.com/samtroberts/openhydra/releases/tag/v0.3.24), [operator documentation](https://openhydra.co/docs) | Closest direct LUCID peer: Rust/libp2p, Kademlia/mDNS, NAT traversal, streamed inference, co-signed receipts and contribution-based access. Paid frontier tiers are explicitly on its roadmap. Release assets establish distribution, not independent proof of network scale or correctness. |
+| KwaaiNet | [Repository and current-status caveats](https://github.com/Kwaai-AI-Lab/KwaaiNet), [v0.7.3 release, 2026-11-05](https://github.com/Kwaai-AI-Lab/KwaaiNet/releases/tag/v0.7.3) | Nonprofit-backed Rust/libp2p infrastructure, whole-model Ollama serving, CPU/CUDA block sharding and local credential-based trust. Nodes are person/organization-anchored. Its README documents an Apple Metal sharding limitation and uses whole-model serving there. |
+| Petals | [Implementation and public-swarm instructions](https://github.com/bigscience-workshop/petals) | Established volunteer model-layer sharing and inference prior art. Public swarm processing is not prompt confidentiality; private swarms require chosen trusted participants. Availability of a specific model depends on the actual swarm. |
+| exo | [Implementation, topology and RDMA prerequisites](https://github.com/exo-explore/exo) | Automatic device discovery, MLX, tensor parallelism and topology-aware local clusters. Candidate execution backend beneath Phase rather than evidence that untrusted WAN verification is solved. RDMA/TB5 benchmarks cannot be transferred to internet peers. |
+| AI Horde | [Server architecture and anonymous access](https://github.com/Haidra-Org/AI-Horde), [public service](https://aihorde.net/) | Working nonprofit volunteer-compute model for images and text. A server queues requests, selects workers and manages kudos. This overlaps with LUCID/LUMEN's public benefit while retaining a central coordination service. |
+| Hyperspace | [Node documentation](https://github.com/hyperspaceai/hyperspace-node) | Documents libp2p/DHT inference and several additional capabilities, plus points, staking and USDC settlement. Broad architectural overlap; financial machinery differs from Phase's mission. Advertised agent/download totals were not independently verified. |
+| Cocoon | [Architecture and current control points](https://cocoon.org/architecture) | Confidential/attested inference using TEEs and TON payments. Documentation identifies currently team-operated proxies and registry control. Different hardware, payment and trust assumptions from ordinary volunteered consumer devices. |
+| Public AI Inference Utility | [Contribution architecture](https://publicai.co/contributing), [API access](https://platform.publicai.co/docs) | Public-interest model access using partner compute and a managed gateway/account layer. Relevant governance and contributor precedent; not the same permissionless peer protocol. |
+
+Mainstream remote access has improved too: [LM Link's February 2026 release](https://lmstudio.ai/changelog/lmstudio/lmstudio-v0.4.6) connects remote LM Studio instances through encrypted transport. Familiar APIs and remote access should be treated as compatibility requirements, not exclusive differentiators.
+
+### OpenHydra: specific overlap worth tracking
+
+- [Known issues](https://github.com/samtroberts/openhydra/blob/main/KNOWN_ISSUES.md) describe replay audits, serving-operator prompt visibility and payments not yet being live. Free operation today is different from a permanent no-payment protocol commitment.
+- [Co-signed receipt implementation](https://github.com/samtroberts/openhydra/blob/main/protocol/src/receipts.rs) binds identities and accounting fields. Co-signing alone does not prove the claimed model executed.
+- [Prompt-scoring implementation](https://github.com/samtroberts/openhydra/blob/main/agent/src/prompt_score.rs) contains networked, bounded model-distribution challenges.
+- [Log-probability verification policy](https://github.com/samtroberts/openhydra/blob/main/protocol/src/logprob.rs) explicitly limits a pass to challenged requests: a provider able to distinguish challenges can serve them honestly while substituting ordinary traffic. A capability test is not a per-request correctness guarantee.
+
+### Verification research and decision criteria
+
+[TOPLOC](https://arxiv.org/abs/2501.16007) uses activation fingerprints to assess claimed model configurations across the evaluated hardware. [INTELLECT-2](https://arxiv.org/abs/2505.07291) reports using TOPLOC to check untrusted inference workers, alongside other rollout checks. These are relevant existing methods, not a turnkey guarantee for Phase's mixed GGUF/MLX/precision environment.
+
+LUCID must compare methods against the same exact-CID jobs and independently selected validators, measuring honest cross-backend divergence, model/precision substitution, challenge distinguishability, collusion, validator cost and prompt exposure. Report empirical results and exclusions rather than inheriting an upstream paper's strongest headline. The experiment and go/no-go contract live in the existing [trust milestone](../releases/lucid-v0.2/reputation-and-redundant-verification.md#method-comparison--2026-11-07).
+
+### Recommendations adopted for repository planning
+
+1. Position Phase by its particular protocol and governance guarantees; stop implying the broader category is empty. Keep Plasm, LUCID and planned LUMEN distinct.
+2. Publish current checkpoint status and acceptance limits in both READMEs. Preserve the difference between signed transcript integrity, redundant agreement, model-identity challenges and independently validated execution.
+3. Execute the [physical intended stream](../releases/lucid-v0.2/intended-stream-vertical-slice.md#operator-runbook--2026-11-07) using exact-CID real content, native Phase transport, live output, cancellation and invalid-content/receipt rejection. Same-LAN, echo, Tailscale data paths and pre-copied artifacts cannot satisfy it.
+4. Benchmark independent whole-model jobs before tensor sharding. ShardWorker stays blocked until the existing control baseline and partial-compute ADR gates pass.
+5. Keep correctness validation a method-selection gate until an independently reproducible experiment establishes its bounds. Neither receipt code nor a comparison table completes that implementation.
+
+### Review triggers
+
+Recheck OpenHydra and KwaaiNet before a public Phase release or a trust/scale ADR. Record the inspected release/source revision and changes to validation guarantees, payment dependence, bootstrap/control points, public-network evidence and installation friction. Do not infer adoption from stars, download counts or self-reported node totals. Update this document in place and link substantive findings from the active tracker.
+
+## Historical June investigation — not current positioning evidence
+
+The original notes below are preserved as session history. Their model rankings, provider-policy and political-event claims have not been revalidated in this November review and must not be promoted to current mission/product claims without primary-source verification. In particular, the old recommendation to present signed receipts as an answer to covert model substitution is superseded: current receipts prove transcript integrity, not correct computation. The current competitive assessment above controls.
+
+**Original method:** Web research and a local-tool shakedown; the original author attributed claims to the links preserved below. Their inclusion here is not a fresh endorsement of those claims.
 
 ---
 

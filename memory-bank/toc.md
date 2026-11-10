@@ -1,6 +1,6 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-08-10
+**Last Updated**: 2026-11-07
 **Version**: 0.5
 
 ---
@@ -260,6 +260,13 @@ What was accomplished
 - [MLX Backend](./releases/lucid-v0.2/mlx-backend.md)
 - [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
 - [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
+
+### Competitive research and next experiments
+
+- [Competitive reassessment — 2026-11-07](./research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) — primary-source ecosystem map, OpenHydra/KwaaiNet overlap and limits on uniqueness claims; June notes retained as unvalidated history.
+- [Verification method comparison](./releases/lucid-v0.2/reputation-and-redundant-verification.md#method-comparison--2026-11-07) — TOPLOC, redundant replay, log-probability challenges, TEE assumptions and the method go/no-go experiment.
+- [Physical intended-stream runbook](./releases/lucid-v0.2/intended-stream-vertical-slice.md#operator-runbook--2026-11-07) — current host prerequisites, actor commands, acceptance evidence and cleanup.
+- [Whole-model control baseline](./releases/lucid-v0.2/shardworker.md#whole-model-independent-job-baseline) — required measurements before introducing tensor sharding.
 
 ### LUMEN milestone specifications
 
