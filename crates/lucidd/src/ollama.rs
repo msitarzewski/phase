@@ -348,19 +348,19 @@ fn refused_response(reason: &str) -> Response {
         .into_response()
 }
 
-async fn resolve_job_model_cid(state: &AppState, model: &str) -> Result<String, Response> {
+async fn resolve_job_model_cid(state: &AppState, model: &str) -> Result<String, Box<Response>> {
     match state.registry.resolve_model_cid(model).await {
         Ok(Some(cid)) => Ok(cid.to_hex()),
-        Ok(None) => Err(refused_response(&format!(
+        Ok(None) => Err(Box::new(refused_response(&format!(
             "model '{model}' has no verified local or signed network CID mapping"
-        ))),
+        )))),
         Err(error) => {
             tracing::warn!(
                 model = %sanitize_for_log(model),
                 error = %error,
                 "verified model CID resolution failed"
             );
-            Err(refused_response("model CID resolution failed"))
+            Err(Box::new(refused_response("model CID resolution failed")))
         }
     }
 }
@@ -949,7 +949,7 @@ async fn handle_generate(
     );
     let model_cid = match resolve_job_model_cid(&state, &routing_model).await {
         Ok(cid) => cid,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let (sampling, max_tokens) = match parse_ollama_options(req.options.as_ref()) {
         Ok(options) => options,
@@ -1182,7 +1182,7 @@ async fn handle_chat(
     );
     let model_cid = match resolve_job_model_cid(&state, &routing_model).await {
         Ok(cid) => cid,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let (sampling, max_tokens) = match parse_ollama_options(req.options.as_ref()) {
         Ok(options) => options,
@@ -1530,7 +1530,7 @@ async fn run_embedding(
     headers: &HeaderMap,
     model: &str,
     input: Vec<String>,
-) -> Result<EmbedOutcome, Response> {
+) -> Result<EmbedOutcome, Box<Response>> {
     let local_only = parse_local_only(headers);
 
     // Route decision. Refusals short-circuit to 503 before we build a
@@ -1540,7 +1540,7 @@ async fn run_embedding(
     if let RouteVia::Refused { reason } = &decision.via {
         // SEC-10: model is attacker-controlled (request body); sanitize.
         tracing::info!(model = %sanitize_for_log(model), reason = %reason, "router refused /api/embed");
-        return Err(refused_response(reason));
+        return Err(Box::new(refused_response(reason)));
     }
     let routed_via = decision.header_value();
     let route_explanation = public_route_explanation(&decision.explanation);
@@ -1558,25 +1558,31 @@ async fn run_embedding(
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "manifest signing failed (/api/embed)");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("manifest signing failed: {e}"),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("manifest signing failed: {e}"),
+                )
+                    .into_response(),
+            ));
         }
     };
 
     let (handle, mut job_stream, receipt_verification) =
         match state.router.execute(&decision, manifest).await {
             Ok(t) => t,
-            Err(RouterError::Refused { reason }) => return Err(refused_response(&reason)),
+            Err(RouterError::Refused { reason }) => {
+                return Err(Box::new(refused_response(&reason)))
+            }
             Err(e) => {
                 tracing::error!(error = %e, "router dispatch failed (/api/embed)");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("router dispatch failed: {e}"),
-                )
-                    .into_response());
+                return Err(Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("router dispatch failed: {e}"),
+                    )
+                        .into_response(),
+                ));
             }
         };
 
@@ -1607,12 +1613,12 @@ async fn run_embedding(
 
     let finished_receipt = finish_http_receipt(handle, receipt_verification).await;
     if let Some(reason) = execution_failure_reason(&terminal, finished_receipt.verification) {
-        return Err(execution_failure_response(
+        return Err(Box::new(execution_failure_response(
             reason,
             routed_via.as_deref(),
             finished_receipt.verification,
             Some(&route_explanation),
-        ));
+        )));
     }
     let receipt = finished_receipt
         .commitment
@@ -1679,7 +1685,7 @@ async fn handle_embed(
 
     let outcome = match run_embedding(&state, &headers, &model, input).await {
         Ok(o) => o,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let body = serde_json::json!({
@@ -1709,7 +1715,7 @@ async fn handle_embeddings(
 
     let outcome = match run_embedding(&state, &headers, &model, input).await {
         Ok(o) => o,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Legacy shape: a single `embedding` (the first vector, or `[]` if none).

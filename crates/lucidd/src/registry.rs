@@ -955,6 +955,10 @@ impl SignedModelAdvertisement {
 /// ownership and gives tests a deterministic in-memory transport. Production
 /// wiring is [`crate::PhaseNetDhtTransport`], which delegates publication and
 /// multi-record lookup to the active [`phase_net::Discovery`] swarm.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on methods returning an already-must-use boxed Future"
+)]
 #[async_trait]
 pub trait DhtTransport: Send + Sync {
     /// Publish (or refresh) a record under `key`. Idempotent — calling

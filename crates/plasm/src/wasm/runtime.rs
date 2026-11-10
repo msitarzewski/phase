@@ -41,6 +41,10 @@ pub struct ExecutionResult {
 }
 
 /// Trait for WASM runtime implementations
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on methods returning an already-must-use boxed Future"
+)]
 #[async_trait::async_trait]
 pub trait WasmRuntime {
     /// Execute a WASM module with arguments
