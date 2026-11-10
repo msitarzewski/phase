@@ -36,6 +36,16 @@ use phase_protocol::{
 #[path = "fixtures/fake_llama_server.rs"]
 mod fake_llama_server;
 
+/// On macOS, parallel fixture processes have inherited another test's
+/// temporary listening socket during startup. Isolate each probe/spawn/use
+/// scenario through worker teardown; disjoint port numbers alone cannot
+/// prevent an inherited descriptor from keeping a probe bound.
+#[cfg(target_os = "macos")]
+async fn fixture_process_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    GATE.lock().await
+}
+
 /// Keep fixture ranges disjoint across parallel tests and probe every slot.
 /// Use ports below the standard ephemeral ranges so outgoing health/request
 /// connections do not claim a fixture's not-yet-started adjacent server port.
@@ -238,6 +248,8 @@ fn multi_model_worker(
 
 #[tokio::test]
 async fn lru_eviction_at_cap_and_port_reused_on_reload() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // SEC-07: cap = 2, three distinct models, three ports available.
     // Loading the third evicts the LRU (the first). Reloading the evicted
     // model then succeeds — its port was freed and is reacquired cleanly.
@@ -260,6 +272,8 @@ async fn lru_eviction_at_cap_and_port_reused_on_reload() {
 
 #[tokio::test]
 async fn port_range_exhaustion_returns_capacity() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // SEC-07: a single-port range with a cap of 2 lets the first model
     // bind the only port; loading a SECOND distinct model (still resident,
     // not evicted because we're under the model cap) finds no free port and
@@ -280,6 +294,8 @@ async fn port_range_exhaustion_returns_capacity() {
 
 #[tokio::test]
 async fn happy_path_streams_tokens_and_signs_receipt() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("happy");
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
     let manifest = make_manifest(&setup.model_id, "Hello.");
@@ -317,6 +333,8 @@ async fn happy_path_streams_tokens_and_signs_receipt() {
 
 #[tokio::test]
 async fn cancellation_mid_stream_yields_cancelled_completion() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let mut setup = setup("cancel");
     // Slow tokens so we definitely cancel before the stream finishes.
     // Per-spawn env (not process env) keeps this test isolated when run
@@ -357,6 +375,8 @@ async fn cancellation_mid_stream_yields_cancelled_completion() {
 
 #[tokio::test]
 async fn hang_detection_aborts_request_and_marks_model_suspect() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("hang");
     // Tight idle window so the test runs fast.
     let mut cfg = setup.config;
@@ -393,6 +413,8 @@ async fn hang_detection_aborts_request_and_marks_model_suspect() {
 
 #[tokio::test]
 async fn crash_during_load_surfaces_as_dispatch_error() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("crash-at-load");
     // Crash before /health ever returns 200.
     let mut cfg = setup.config;
@@ -414,6 +436,8 @@ async fn crash_during_load_surfaces_as_dispatch_error() {
 
 #[tokio::test]
 async fn missing_model_file_returns_artifact_unavailable() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let setup = setup("present"); // Real file on disk.
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
 
@@ -432,6 +456,8 @@ async fn missing_model_file_returns_artifact_unavailable() {
 
 #[tokio::test]
 async fn embedding_streams_vectors_and_signs_receipt() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     // Drive the embedding path against the fake server's canned `/embedding`
     // handler. Two inputs → two "embedding"-kind chunks, one per input,
     // ordered by `seq`, each decoding to the canned Vec<f32>. The terminal
@@ -491,6 +517,8 @@ async fn embedding_streams_vectors_and_signs_receipt() {
 #[tokio::test]
 #[ignore]
 async fn real_llama_server_smoke_test_requires_explicit_hardware_env() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
     let bin = std::env::var("LLAMA_SERVER_PATH").expect(
         "real llama hardware gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_MODEL_PATH",
     );
