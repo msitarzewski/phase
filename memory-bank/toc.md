@@ -1,6 +1,6 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-11-07
+**Last Updated**: 2026-11-09
 **Version**: 0.5
 
 ---
@@ -22,8 +22,8 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 | [projectbrief.md](./projectbrief.md) | Vision, goals, MVP scope | Rarely (major pivots) | 2025-11-08 |
 | [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2026-08-09 |
 | [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-08-10 |
-| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-08-10 |
-| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-08-10 |
+| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-09 |
+| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-09 |
 | [projectRules.md](./projectRules.md) | Coding standards | New patterns | 2025-11-08 |
 | [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2026-08-10 |
 | [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2025-11-08 |
@@ -263,6 +263,7 @@ What was accomplished
 
 ### Competitive research and next experiments
 
+- [CI security and test reliability refresh — 2026-11-09](./progress.md#ci-security-and-test-reliability-refresh-2026-11-09) — dependency security baseline, CI reporting permissions, relay timeout and macOS fixture fixes, and local qualification evidence.
 - [Competitive reassessment — 2026-11-07](./research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) — primary-source ecosystem map, OpenHydra/KwaaiNet overlap and limits on uniqueness claims; June notes retained as unvalidated history.
 - [Verification method comparison](./releases/lucid-v0.2/reputation-and-redundant-verification.md#method-comparison--2026-11-07) — TOPLOC, redundant replay, log-probability challenges, TEE assumptions and the method go/no-go experiment.
 - [Physical intended-stream runbook](./releases/lucid-v0.2/intended-stream-vertical-slice.md#operator-runbook--2026-11-07) — current host prerequisites, actor commands, acceptance evidence and cleanup.
@@ -342,7 +343,7 @@ What was accomplished
 ## Memory Bank Statistics
 
 **Total Files**: Living Memory Bank; use this TOC and `rg --files memory-bank` rather than a stale manual count
-**Last Updated**: 2026-08-10
+**Last Updated**: 2026-11-09
 **Coverage**:
 - ✅ Project vision and goals (projectbrief.md)
 - ✅ Architecture patterns (systemPatterns.md) - updated with Phase Boot patterns

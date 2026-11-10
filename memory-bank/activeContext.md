@@ -1,6 +1,6 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2026-11-07
+**Last Updated**: 2026-11-09
 **Sprint**: Refresh competitive positioning, revalidate current hosts/QA, and complete the LUCID v0.2 public-network and trust gates
 **Status**: Phase Core, LUCID v0.1, and v0.1.1 remain shipped. The LUCID v0.2 checkpoint contains approved implementations for verified content pull/alias/provider records, live relay v2, circuit relay/AutoNAT/DCUtR plus fail-closed rendezvous surfaces, reputation and bounded redundant verification, and the experimental MLX adapter. Source `1356ef65…d847` passed macOS ARM64 workspace QA and native UMBP Ubuntu x86_64 release/tests/Clippy plus isolated live HTTP smoke. Checkpoint publication was approved on 2026-08-10. The 2026-08-24 architecture update distinguishes transcript integrity from computation correctness and requires a whole-model independent-job baseline before tensor sharding. This is not a v0.2 release or production deployment: the physical two-network/NAT intended stream, real multi-GB pull/resume, real Apple Silicon MLX, Linux ARM64, public rendezvous quotas, correctness-evidence validator, whole-model baseline, ShardWorker research/ADR, rollback, and clean-host operations remain open.
 
@@ -9,6 +9,10 @@
 ## Current Focus
 
 The immediate focus is converting the approved component implementation into release acceptance evidence without weakening the tracker. Seven v0.2 milestones are in progress, the physical intended-stream slice and ShardWorker are blocked on named gates, and Core AI remains not started/non-blocking. The authoritative state and evidence links are in `releases/lucid-v0.2/README.md`; LUMEN remains a separate planned node under `releases/lumen/`.
+
+### CI security and test reliability refresh (2026-11-09)
+
+The owner approved updating dependencies and repairing CI after the new branch runs failed. The repair at `313565e` updates compatible dependency families, scopes audit check-write permission to the advisory job, fixes the relay timeout test's valid peer-failure outcome, and isolates macOS fixture processes after captured socket-inheritance failures. Final local qualification passes 460 tests / 2 ignored, formatting, strict Clippy, actionlint, dependency audit and cargo-deny; there are zero reported vulnerabilities or yanked packages under the existing policy, with four transitive unmaintained warnings retained. The relay test passed 40 repeats and the backend suite passed 16 repeats. See [the dated qualification record](progress.md#ci-security-and-test-reliability-refresh-2026-11-09) for source/evidence details. This supersedes the November 7 local test-investigation blocker; public-network and release-acceptance gates remain open.
 
 ### Competitive and operational reassessment — 2026-11-07
 

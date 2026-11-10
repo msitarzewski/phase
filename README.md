@@ -22,7 +22,7 @@ See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale
 
 **Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md), not a claim of fresh qualification or a released v0.2.
 
-**November follow-up:** a macOS Rust 1.99 workspace run passed 460 tests (2 ignored), formatting and strict Clippy after compatibility fixes; the existing real llama-server/Gemma smoke also passed separately. Repeated backend-suite runs still exposed an intermittent fixture startup bind failure. This is an open QA limitation, not a release waiver. See [current progress](memory-bank/progress.md#competitive-and-acceptance-preparation-refresh-2026-11-07).
+**November follow-up:** the November 7 macOS run and separate real llama-server/Gemma smoke passed, while repeated backend suites exposed an intermittent fixture startup failure. The November 9 CI repair updates the affected dependencies, isolates macOS fixture subprocesses and corrects the relay idle-timeout assertion. The macOS workspace passes 460 tests (2 ignored), formatting and strict Clippy; the dependency audit reports zero vulnerabilities and zero yanked packages under the existing policy. Four transitive unmaintained warnings remain visible. See [current qualification evidence](memory-bank/progress.md#ci-security-and-test-reliability-refresh-2026-11-09); physical-network and release acceptance gates remain open.
 
 ---
 
