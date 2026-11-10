@@ -21,6 +21,7 @@
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -35,14 +36,39 @@ use phase_protocol::{
 #[path = "fixtures/fake_llama_server.rs"]
 mod fake_llama_server;
 
-/// Pick a port that's free *right now*. The fixture process will re-bind it
-/// almost immediately; on the tiny window between drop and re-bind we
-/// accept the rare flake.
+/// Keep fixture ranges disjoint across parallel tests and probe every slot.
+/// Use ports below the standard ephemeral ranges so outgoing health/request
+/// connections do not claim a fixture's not-yet-started adjacent server port.
+/// The external close-to-child-bind race remains because llama-server cannot
+/// inherit listeners, but another test cannot allocate an adjacent range here.
+fn free_port_range(span: u16) -> std::ops::Range<u16> {
+    static RESERVED: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    assert!(span > 0);
+    let mut reserved = RESERVED.get_or_init(Mutex::default).lock().unwrap();
+    for _ in 0..128 {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let start = 20_000 + first.local_addr().unwrap().port() % 10_000;
+        let Some(end) = start.checked_add(span) else {
+            continue;
+        };
+        let range = start..end;
+        if range.clone().any(|port| reserved.contains(&port)) {
+            continue;
+        }
+        let remaining = range
+            .clone()
+            .map(|port| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)))
+            .collect::<std::io::Result<Vec<_>>>();
+        if let Ok(_listeners) = remaining {
+            reserved.extend(range.clone());
+            return range;
+        }
+    }
+    panic!("could not allocate a disjoint fixture port range");
+}
+
 fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+    free_port_range(1).start
 }
 
 /// Quote arbitrary UTF-8 text for a POSIX shell single-quoted word.
@@ -60,6 +86,12 @@ fn fixture_launcher(dir: &Path) -> PathBuf {
         .to_str()
         .expect("llama_worker test executable path must be UTF-8");
     let launcher = dir.join("llama-server-test-fixture");
+    // Opt-in persistent diagnostics survive TempDir cleanup on a failed test.
+    let diagnostics_dir = std::env::var_os("PHASE_TEST_DIAGNOSTICS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.to_path_buf());
+    std::fs::create_dir_all(&diagnostics_dir).expect("create fixture diagnostics directory");
+    let diagnostics_prefix = diagnostics_dir.join("fixture");
     let script = format!(
         r#"#!/bin/sh
 port=""
@@ -85,9 +117,10 @@ done
 export PHASE_FAKE_LLAMA_SERVER_PROCESS=1
 export PHASE_FAKE_LLAMA_PORT="$port"
 export PHASE_FAKE_LLAMA_HOST="$host"
-exec {} --exact fixture_server_process_entrypoint --ignored --nocapture
+exec {} --exact fixture_server_process_entrypoint --ignored --nocapture 2>> {}."$port".log
 "#,
-        shell_quote(test_exe)
+        shell_quote(test_exe),
+        shell_quote(diagnostics_prefix.to_str().expect("UTF-8 fixture path"))
     );
     std::fs::write(&launcher, script).expect("write fixture subprocess launcher");
     #[cfg(unix)]
@@ -184,13 +217,13 @@ fn multi_model_worker(
     for id in model_ids {
         std::fs::write(dir.path().join(format!("{id}.gguf")), b"fake").expect("touch model");
     }
-    let base = free_port();
+    let port_range = free_port_range(port_range_span);
     let config = LlamaCppConfig {
         server_binary_path: fixture_launcher(dir.path()),
         model_dir: dir.path().to_path_buf(),
         default_n_gpu_layers: 0,
         default_context_size: 2048,
-        server_port_range: base..(base + port_range_span),
+        server_port_range: port_range,
         max_loaded_models,
         model_load_timeout: Duration::from_secs(10),
         per_request_idle_timeout: Duration::from_secs(5),
