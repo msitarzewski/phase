@@ -10,7 +10,7 @@
 
 The project demonstrates the complete LUCID experience on real machines and real networks, with evidence at each trust and transport boundary. This is not a synthetic unit-test milestone and not a “components exist” milestone.
 
-The accepted end state from the original mission was two machines on different networks where one serves a model and the other uses the Ollama API through Phase (`memory-bank/MISSION.md:131-135`). v0.2 strengthens that scenario with verified content distribution, genuine relay streaming, NAT reachability, and receipt binding.
+The accepted end state from the [mission](../../MISSION.md#historical-starting-state-2026-05-26) was two machines on different networks where one serves a model and the other uses the Ollama API through Phase. v0.2 strengthens that scenario with verified content distribution, genuine relay streaming, NAT reachability, and receipt binding.
 
 ## Canonical demonstration
 
@@ -152,3 +152,95 @@ The milestone remains incomplete if any of these occur:
 - **Transition dependency**: UMBP is being snapshotted before Ubuntu 26.04 LTS upgrade and requires a post-upgrade service/network audit.
 
 The actor roles and network boundary are no longer ambiguous, but the milestone remains blocked until the cloud node is provisioned and the canonical happy/failure flows are recorded. Public rendezvous is excluded from the first run because `lucidd` intentionally disables rendezvous serving pending hard registration quotas; configured relay/bootstrap plus DHT supply the initial test path.
+
+## Operator runbook — 2026-11-07
+
+**State:** executable preparation, not passing acceptance. Reuse `scripts/phase-validate.sh` for source/toolchain/QA evidence and the existing daemon CLI for network actors. The validation script is local-only; it does not provision hosts or manufacture a physical-network pass.
+
+### Observed prerequisites
+
+Read-only SSH preflight on 2026-11-07 found:
+
+- `beacon`: public DigitalOcean Linux x86_64 host, reachable by the existing SSH alias; no running `lucidd`, no Phase checkout/toolchain, and no listener on TCP 4001. Its active firewall permits SSH and web ports but has no Phase-port rule. Caddy is running and must remain untouched.
+- `pip`: the historical SSH alias timed out; do not assume the former M1 contributor is available.
+- `pipx`: reachable Linux x86_64 host with an NVIDIA RTX 5060 Ti (16 GB), about 30 GiB system RAM and existing real model directories. No `lucidd`, `llama-server`, Ollama service or Rust toolchain was found. This is a candidate contributor, not verified Apple MLX hardware and not proof of the NAT topology.
+- Development Mac: installed llama-server and real local GGUF weights are available. Local execution can qualify that backend separately; it cannot satisfy the two-network milestone alone.
+
+No Phase service, public firewall, DNS, Caddy or existing inference service was changed during this preflight. Addresses, keys and model payloads stay out of committed operational evidence. Before choosing the actors, confirm their actual physical networks and consumer-NAT boundary; SSH/Tailscale reachability is administration evidence only.
+
+### Prepare exact binaries and isolated state
+
+1. Run `scripts/phase-validate.sh workspace` on the requester and the existing `linux` profile on each Linux architecture being qualified. Retain failed attempts as well as successful retries. A package reused from August must match that checkpoint's source/binary evidence; a matching version string alone is insufficient.
+2. Build the native bundle with `scripts/phase-validate.sh release`. Record the archive/binary SHA-256, source fingerprint, Cargo.lock hash, toolchain and OS for each actor. Use a fingerprinted staging directory, private per-actor identity/policy/catalog paths and unused loopback HTTP ports. Do not replace a standing service for this experiment.
+3. Stage the native binary and a version-pinned real llama-server on the selected contributor. Verify the upstream binary digest and model licensing/provenance; use actual GGUF bytes, not an echo worker or a fixture. Choose a model that fits measured available GPU/RAM with a bounded context.
+4. On the infrastructure host, verify the dedicated Phase TCP port is free and arrange its scoped ingress rule and rollback before starting the relay. Preserve SSH, Caddy and all web routing. Keep every Ollama HTTP API loopback-only.
+
+### Start the actors
+
+The variables below must contain measured/operator-selected values. `PHASE_RUN_DIR` is a private staging directory on each host; `PHASE_RELAY_MULTIADDR` ends in the actual relay PeerId. Keys are generated on their owning actor and are never copied between roles.
+
+Infrastructure host:
+
+```bash
+LUCIDD_PORT=11435 "$PHASE_LUCIDD" --mode infrastructure \
+  --no-default-bootstrap --libp2p-port 4001 \
+  --external-address "$PHASE_RELAY_PUBLIC_ADDRESS" \
+  --identity-path "$PHASE_RUN_DIR/relay.key" \
+  --policy-config "$PHASE_RUN_DIR/relay-policy.toml"
+```
+
+Read the actual relay PeerId from its startup evidence, then construct its peer-pinned public multiaddr. Public rendezvous serving remains disabled; do not enable it to bypass the quota gate.
+
+Consumer (no local worker and an initially empty artifact store):
+
+```bash
+LUCIDD_PORT=11435 "$PHASE_LUCIDD" --mode consume-only \
+  --no-default-bootstrap --bootstrap-peer "$PHASE_RELAY_MULTIADDR" \
+  --relay-peer "$PHASE_RELAY_MULTIADDR" \
+  --identity-path "$PHASE_RUN_DIR/consumer.key" \
+  --policy-config "$PHASE_RUN_DIR/consumer-policy.toml" \
+  --artifact-dir "$PHASE_RUN_DIR/consumer-artifacts"
+```
+
+Contributor:
+
+```bash
+LUCIDD_PORT=11435 "$PHASE_LUCIDD" --worker llama-cpp \
+  --no-default-bootstrap --bootstrap-peer "$PHASE_RELAY_MULTIADDR" \
+  --relay-peer "$PHASE_RELAY_MULTIADDR" \
+  --identity-path "$PHASE_RUN_DIR/contributor.key" \
+  --policy-config "$PHASE_RUN_DIR/contributor-policy.toml" \
+  --model-dir "$PHASE_SOURCE_MODEL_DIR" \
+  --artifact-dir "$PHASE_RUN_DIR/contributor-artifacts" \
+  --llama-server-binary "$PHASE_LLAMA_SERVER" \
+  --llama-ctx-size 2048 --serve-model-content
+```
+
+Configure the contributor's existing `authorized_submitters` with the consumer's actual public signing key, `allow_unauthenticated_jobs = false`, `max_concurrent_remote_jobs = 1` and a bounded `max_tokens_ceiling`. Both authorization and signer-to-transport identity binding must hold (`crates/lucidd/src/router.rs:1903-1930`). Do not use the insecure development escape hatch as acceptance policy. Record any battery/thermal serving pause rather than suppressing it silently.
+
+### Pull, stream, cancel and fail
+
+On the consumer, use the advertised normalized alias and retain its signed publisher/CID resolution:
+
+```bash
+curl --fail-with-body --no-buffer http://127.0.0.1:11435/api/pull \
+  -H 'Content-Type: application/json' \
+  --data "{\"model\":\"$PHASE_MODEL_ALIAS\",\"stream\":true}"
+
+curl --fail-with-body --no-buffer --dump-header "$PHASE_RUN_DIR/generate.headers" \
+  http://127.0.0.1:11435/api/generate \
+  -H 'Content-Type: application/json' \
+  --data "{\"model\":\"$PHASE_MODEL_ALIAS\",\"prompt\":\"Describe a tree in three sentences.\",\"stream\":true,\"options\":{\"num_predict\":64}}"
+```
+
+These commands are a starting point, not an evidence parser or a whole-milestone pass. Validate the alias before shell interpolation, use a non-sensitive operator-selected prompt, and timestamp receipt of each NDJSON frame with a monotonic clock. The stream's final `x_lucid_receipt_verified` must be `true`, contain a commitment, and have no error. The initial live response header is `pending`; neither HTTP 200 nor `X-Lucid-Routed-Via: peer:...` establishes successful receipt verification. Pair client timing with the contributor's terminal timestamp so buffered output cannot pass as live generation.
+
+Interrupt a multi-GB pull, record the partial-byte offset, then retry the same exact CID/publisher selection (`/api/pull` accepts `cid` and `publisher`). Verify resumed offset and final recomputed CID. Repeat with a second independent provider holding the same bytes. Pulling to a consume-only node must not make inference local; verify the serving identity and transport path.
+
+For cancellation, close the client stream before the requested token budget completes and confirm contributor capacity/process cleanup. For forced relay-only acceptance, restrict direct paths in the isolated test topology and prove a `/p2p-circuit` path from transport evidence; relay configuration alone is not proof. Record DCUtR upgrades separately. Execute the existing failure checklist against isolated actors, including wrong/missing receipts and tampered blobs; existing fixture tests alone do not satisfy physical failure injection.
+
+### Close and report
+
+Stop only the experiment-owned PIDs/units, remove its temporary ingress rule, verify its ports and worker processes are gone, and confirm Caddy/SSH/standing services remain healthy. Retain private raw logs under ignored `target/phase-validation/`; publish only sanitized timings, hashes, public identities, topology and explicit pass/fail/skipped outcomes. Do not commit prompts, generated content, private keys, addresses used only for administration or raw model bytes.
+
+Until every canonical run and failure gate has attributable evidence, keep this milestone blocked. A local real-model smoke, a staged binary or a prepared runbook is useful progress but does not change that state.

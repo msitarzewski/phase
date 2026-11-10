@@ -1,9 +1,9 @@
 # LUCID v0.2 — Substrate, Reach, Trust, and Scale
 
-**Status:** IMPLEMENTATION ACTIVE — 2026-08-09 checkpoint approved; 2026-08-10 external test topology approved; release acceptance incomplete
+**Status:** IMPLEMENTATION ACTIVE — 2026-08-09 checkpoint approved; 2026-08-10 external test topology approved; 2026-08-24 trust/scale sequencing approved; release acceptance incomplete
 **Release:** LUCID v0.2
 **Tracker role:** This README is the authoritative progress tracker for the build.
-**Last tracker update:** 2026-08-10
+**Last tracker update:** 2026-11-07
 
 LUCID v0.2 turns the v0.1 demonstration into a real public-network path: a fresh node can discover the network, resolve a human model name to verified content, pull that content, reach a serving peer through hostile NAT, receive tokens while they are generated, and verify the signed result. Trust, sharding, and Apple-native backends build on that vertical slice without obscuring it.
 
@@ -33,17 +33,34 @@ The release extends the workload-neutral Phase substrate. It must not move model
 | 3 | [Reachability Plane](./reachability-plane.md) | Intended stream | 🟦 In progress | Existing bootstrap and `phase-net` swarm | Circuit relay server/client, AutoNAT, rendezvous client/optional-server surfaces, DCUtR integration, path observation, limits, and exact relay-loopback coverage implemented. Public rendezvous stays fail-closed pending hard registration quotas; real consumer-NAT/DCUtR matrix remains. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
 | 4 | [Network Operations](./network-operations.md) | Intended stream | 🟦 In progress | Reachability design | Bounded infrastructure roles, service/config surface, validation automation, protected UMBP qualification, and the first independent DigitalOcean deployment topology are approved; provisioning, geographic fleet, clean-host operator drill, monitoring, and failure drills remain. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
 | 5 | [Intended-Stream Vertical Slice](./intended-stream-vertical-slice.md) | Integration gate | 🟨 Blocked | Content, live relay, reachability, operations | Component and loopback flows pass, but the required physical two-network/NAT run, real model pull/resume, and relay-only remote inference recording have not run. |
-| 6 | [Reputation and Redundant Verification](./reputation-and-redundant-verification.md) | Trust | 🟦 In progress | Verified receipts and stable peer identity | Private append-only evidence, validation/compaction, cold-start/decay, operator precedence, truthful taxonomy, bounded deterministic redundancy, and adversarial unit tests implemented; multi-peer load and failure-injection acceptance remains. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
-| 7 | [ShardWorker](./shardworker.md) | Scale / research-gated | 🟨 Blocked | Reputation plus partial-compute verification decision | No production worker exists. The approved partial-tensor verification ADR and reproducible research gate remain unresolved; no sharding claim is made. |
+| 6 | [Reputation and Redundant Verification](./reputation-and-redundant-verification.md) | Trust | 🟦 In progress | Verified receipts and stable peer identity | Private append-only evidence, validation/compaction, cold-start/decay, operator precedence, truthful taxonomy, bounded deterministic redundancy, and adversarial unit tests implemented. The workload-specific correctness-evidence/independent-validator seam, multi-peer load, and failure-injection acceptance remain. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
+| 7 | [ShardWorker](./shardworker.md) | Scale / research-gated | 🟨 Blocked | Reputation, whole-model independent-job baseline, and partial-compute verification decision | No production worker exists. The whole-model control baseline, approved partial-tensor verification ADR, and reproducible research gate remain unresolved; no sharding claim is made. |
 | 8 | [MLX Backend](./mlx-backend.md) | Backend / parallel | 🟦 In progress | Content-plane format metadata; Apple Silicon rig | Pinned-bundle subprocess worker, streaming parser, cancellation/invalidation, receipt integration, resource bounds, mutation checks, and non-Apple fail-closed behavior implemented; real Apple Silicon model acceptance remains. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
 | 9 | [Core AI Feasibility Gate](./core-ai-feasibility-gate.md) | Backend research / non-blocking | ⬜ Not started | MLX findings; public KV-cache evidence | — |
 | 10 | [Release Qualification](./release-qualification.md) | Release gate | 🟦 In progress | All required milestones | macOS ARM64 workspace QA and release bundle pass; native Ubuntu x86_64 release/tests/Clippy and isolated HTTP smoke pass for source `1356ef65…d847`. Linux ARM64, full interoperability/NAT, real MLX, rollback, and clean-host matrices remain. See [checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md). |
 
 **Overall:** 0 of 10 milestones complete; 7 in progress; 2 blocked; 1 not started.
 **Intended-stream gate:** 0 of 5 complete; four component milestones are in progress and the physical vertical slice is blocked on real-network execution.
-**Trust-and-scale gate:** Reputation is in progress; ShardWorker is blocked at its verification research/ADR gate.
+**Trust-and-scale gate:** Reputation is in progress with a correctness-evidence seam still open; ShardWorker is blocked on the whole-model baseline and its verification research/ADR gate.
 **Backend gate:** MLX implementation is in progress pending real Apple Silicon acceptance; Core AI remains a non-blocking, not-started research gate.
 **Release qualification:** In progress; macOS ARM64 and Linux x86_64 evidence exist, but the complete release matrix is not satisfied.
+
+### Trust and scale sequencing — 2026-08-24
+
+- Signed receipts and replayed commitments establish peer-attributed transcript integrity; they do not by themselves prove correct model execution.
+- The next trust upgrade is a versioned, bounded LUCID evidence envelope generated by the serving backend and assessed by an independently selected validator. The evidence binds exact job, model CID, backend/precision, output, software, method, and peer identities; unsupported or probabilistic methods receive explicit trust labels.
+- Before cross-peer tensor sharding, LUCID will benchmark multiple heterogeneous peers executing complete exact-CID jobs independently. This reuses the current router, worker, capability, receipt, and content paths while avoiding an unverified intermediate-tensor boundary.
+- ShardWorker remains research-blocked unless that control baseline leaves a concrete workload requirement unmet and the partial-compute gate is approved. Open authorization is governed by correctness evidence plus load, amplification, Sybil, abuse, and public-network qualification—not by sharding availability.
+
+### Competitive and acceptance reassessment — 2026-11-07
+
+- The [primary-source ecosystem review](../../research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) identifies direct inference-network peers, particularly OpenHydra and KwaaiNet. Phase's intended combination remains a delivery/qualification obligation, not evidence that the category is empty.
+- The [trust method comparison](./reputation-and-redundant-verification.md#method-comparison--2026-11-07) defines how to compare TOPLOC, replay audits, log-probability challenges and TEE assumptions. It does not select or implement an independent validator.
+- The [physical operator runbook](./intended-stream-vertical-slice.md#operator-runbook--2026-11-07) records fresh beacon/pip/pipx preflight, exact actor commands, authorization, pull/stream/cancel checks, topology evidence and cleanup. The former M1 contributor assignment is not assumed available.
+- The [whole-model control experiment](./shardworker.md#whole-model-independent-job-baseline) requires observed work distribution, equal-load comparison, latency/throughput/fairness and failure-isolation measurements before tensor work.
+- Fresh Rust 1.99 QA exposed test port-allocation and HTTP-error/macro lint compatibility issues. Internal error boxing, generated-code lint annotations and disjoint whole-range test allocation produced a full 460-pass/2-ignore workspace run with formatting/strict Clippy clean (`target/phase-validation/20261107T184728Z-43089/`). A local real llama-server/Gemma smoke passed separately.
+- Repeated backend runs still intermittently fail during fixture startup with `Address already in use`: five of six diagnostic repeats passed, one failed. Persistent fixture diagnostics and failed attempts remain in ignored evidence; the retry/time-budget extension is required before continuing investigation or public-host setup. No failure is waived. Neither local smoke nor a single green workspace run satisfies the physical-network, independent-validator or release gates.
+- No milestone is promoted: **0 complete, 7 in progress, 2 blocked, 1 not started**. Public authorization, public rendezvous, ShardWorker and LUMEN scope are unchanged.
 
 ### Approved implementation checkpoint — 2026-08-09
 
@@ -81,7 +98,7 @@ Pip M1/16-GB Apple Silicon contributor behind consumer NAT
 - Network Operations starts once relay policy and advertised-address behavior are stable enough to deploy safely.
 - MLX may proceed in parallel, but it must consume the Content Plane’s chosen model-format metadata instead of inventing a second registry.
 - Reputation begins with evidence collection and storage design, but enforcement waits for stable live-relay receipt outcomes.
-- ShardWorker cannot cross its design gate until partial-compute verification has an approved ADR.
+- Whole-model independent-job scheduling and correctness-evidence validation may be researched through existing LUCID extension points; ShardWorker cannot cross its design gate until that control baseline is measured and partial-compute verification has an approved ADR.
 - Core AI is research-only until its feasibility gate is passed; it cannot delay the intended stream.
 
 ---
@@ -158,6 +175,8 @@ This path is the release’s center of gravity. A collection of individually com
 | Pull API | `crates/lucidd/src/ollama.rs:1081-1160` | Refactor the stub handler into the real pull coordinator; preserve Ollama-compatible progress behavior |
 | Worker stream | `crates/phase-protocol/src/worker.rs:315-378` | Carry existing `JobEvent` frames over the network; do not invent a token-only substrate protocol |
 | Stream commitment | `crates/phase-protocol/src/commitment.rs:29-86` | Replay exactly the output chunks delivered to the client |
+| Correctness evidence | `crates/phase-protocol/src/worker.rs:315-378`, `crates/lucidd/src/router.rs:1550-1678` | Transport only bounded opaque evidence in Phase; generate, validate, and label inference-specific evidence in LUCID with an independent validator |
+| Whole-model scheduling | `crates/lucidd/src/router.rs:160-665`, `crates/lucidd/src/registry.rs:685-711` | Schedule independent complete jobs through existing eligibility/capability paths before introducing cross-peer tensor plans |
 | Current batch relay | `crates/phase-net/src/protocol.rs:16-67`, `crates/phase-net/src/discovery.rs:281-306` | Introduce a versioned streaming path; retain an explicit compatibility policy for v0.1 peers |
 | NAT and discovery | `crates/phase-net/src/discovery.rs:88-99`, `crates/phase-net/src/discovery.rs:210-351` | Extend `CombinedBehaviour` and the existing driver command/event loop |
 | Policy | `crates/lucidd/src/policy.rs:69-164`, `crates/lucidd/src/policy.rs:262-383`, and `crates/lucidd/src/router.rs:590-825` | Attribute remote work, cap resources, and remain default-deny until the recorded trigger is satisfied |
@@ -177,6 +196,8 @@ The following decisions must be written to `memory-bank/decisions.md` and approv
 - Streaming relay protocol identifier, framing, terminal receipt delivery, cancellation, and v0.1 compatibility.
 - Foundation relay service policy: resource caps, reservation policy, abuse response, retention, and operator disclosure.
 - Reputation evidence model, storage scope, decay, Sybil assumptions, and routing influence.
+- Correctness-evidence envelope, method negotiation, exact bindings, independent-validator selection, compute/privacy limits, verdict taxonomy, and client-visible trust labels.
+- Whole-model independent-job control baseline and the exact unmet workload requirement required to justify tensor sharding.
 - Partial-compute verification strategy and tolerance model before untrusted sharding.
 - MLX process boundary and supported deployment contract.
 - Core AI go/no-go evidence on public stateful decode/KV-cache support.
@@ -194,6 +215,8 @@ The release is complete only when all of the following are true:
 - Tampered chunks, wrong manifests, alias substitution, replayed/expired advertisements, out-of-order stream frames, missing receipts, and wrong-peer receipts are rejected.
 - Cancellation, slow-client backpressure, serving-peer loss, relay loss, and local capacity exhaustion have deterministic outcomes and no leaked worker process or reservation.
 - Reputation affects routing only through the approved policy, and its raw evidence remains inspectable.
+- Receipt integrity and computation-correctness evidence are separately labeled; any correctness claim is bound, independently validated, bounded, and no stronger than its approved method.
+- The whole-model independent-job baseline is reproducible before any ShardWorker go decision.
 - ShardWorker makes no claim stronger than the accepted partial-verification design permits.
 - MLX passes real Apple Silicon inference and the same commitment/receipt checks as llama.cpp.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, format checks, dependency audit, and release builds pass.

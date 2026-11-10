@@ -1080,7 +1080,7 @@ Live relay v2 uses bounded opaque frames over a negotiated libp2p substream. Neg
 
 **Where**: `crates/lucidd/src/reputation.rs`, `crates/lucidd/src/router.rs`
 
-Reputation records local, privacy-minimal observations and decays their influence over time. It informs routing but does not become a global truth oracle. Redundant execution raises confidence only when independent results literally agree under the configured comparison rule.
+Reputation records local, privacy-minimal observations and decays their influence over time. It informs routing but does not become a global truth oracle. Redundant execution raises confidence only when independent results literally agree under the configured comparison rule. A verified signed receipt proves that the named peer signed the exact job-bound transcript received; it does not prove that the backend executed the claimed model correctly.
 
 **Key principles**:
 
@@ -1088,6 +1088,8 @@ Reputation records local, privacy-minimal observations and decays their influenc
 - Decay stale observations and cap their routing effect.
 - Treat disagreement as disagreement; never manufacture consensus.
 - Keep redundancy bounded so verification cannot become uncontrolled duplicate work.
+- Label transcript integrity separately from computation-correctness evidence in APIs, logs, and operator reports.
+- Keep future inference correctness methods inside LUCID: the Phase worker stream may transport and commit a versioned, bounded opaque envelope, while an independently selected LUCID validator owns method interpretation, exact model/backend binding, verdict taxonomy, and empirical/probabilistic trust labels.
 
 ### Pinned Subprocess Backend Pattern
 

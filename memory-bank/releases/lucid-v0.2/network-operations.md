@@ -130,6 +130,12 @@ Targets must be measured and approved before release rather than guessed here. A
 
 ## Completion evidence required in the tracker
 
+### Current host preflight — 2026-11-07
+
+The existing SSH aliases were checked read-only. `beacon` is reachable and runs Caddy, but has no Phase checkout/toolchain, running `lucidd`, TCP 4001 listener or Phase ingress rule. The historical `pip` alias timed out; `pipx` is reachable Linux x86_64 with a 16-GB NVIDIA GPU and real model directories, but lacks Phase/llama-server/Ollama tooling. Do not substitute these observations for a verified physical/NAT topology or Apple Silicon acceptance. No standing service, DNS, Caddy or firewall configuration was changed during the preflight.
+
+Use the existing [intended-stream runbook](./intended-stream-vertical-slice.md#operator-runbook--2026-11-07) for isolated binary/state staging, exact source evidence, scoped ingress/rollback, operator authorization and cleanup. Install and qualify the selected backend before enabling a public contributor. The August topology below remains historical planning until the current actors and paths are qualified.
+
 - Approved bootstrap and operator-policy decisions.
 - Public relay inventory with PeerIds, regions, roles, and software versions.
 - Clean-host operator run result.

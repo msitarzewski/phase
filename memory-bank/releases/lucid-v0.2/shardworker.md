@@ -3,7 +3,7 @@
 **Status:** 🟨 Blocked — partial-compute verification research/ADR unresolved; no production worker exists
 **Track:** Trust and scale — research-gated
 **Blocking:** Yes, but its honest v0.2 outcome may be an approved deferral
-**Depends on:** Reputation and Redundant Verification
+**Depends on:** Reputation and Redundant Verification; whole-model independent-job baseline
 **Tracker:** [README.md](./README.md)
 
 ## Outcome
@@ -14,6 +14,14 @@ Resolve the partial-compute verification decision, then implement only the Shard
 2. An approved, evidence-backed deferral that preserves a tested trusted-cluster prototype/research artifact without claiming untrusted sharding is verified.
 
 The open problem is documented at `memory-bank/decisions.md:890-914`: a peer computing intermediate tensors cannot be cheaply verified by replaying public output chunks. The `ShardWorker` name and nominative relationship to exo-style clusters are established at `memory-bank/decisions.md:918-934`.
+
+## Sequencing decision — 2026-08-24
+
+Before LUCID splits one execution across peers, it must characterize the simpler scale path: many peers independently execute complete jobs for the same exact model revision. This reuses the current router, `Worker` lifecycle, signed receipts, coarse `ModelCapabilities`, and verified content plane. Peers may complete work at different rates and expose different bounded concurrency; no intermediate tensor crosses a trust boundary.
+
+The baseline must exercise useful concurrent or queued inference demand across at least two independently identified peers, with exact model-CID assignment, content fan-out, per-peer capacity limits, failure isolation, and separately attributable receipt/correctness evidence. It must measure aggregate throughput, per-job latency, model-distribution cost, validator overhead, scheduling fairness, and recovery from a slow, stale, or unavailable peer.
+
+ShardWorker proceeds only if the baseline demonstrates a concrete unmet need—such as a required model fitting no eligible peer or a required single-request latency target remaining unattainable—and the partial-compute verification gate below justifies the added trust, bandwidth, coupling, and recovery cost. Independent whole-model parallelism does not solve those cases, but it is the required control experiment.
 
 ## Hard stop
 
@@ -42,6 +50,22 @@ If these cannot be answered honestly, the milestone stops at research/prototype 
 | Backend | `crates/lucidd/src/worker_llama.rs:464-472` | Mirror worker lifecycle, cancellation, capacity, and signed receipt conventions |
 
 ## Research gate
+
+### Whole-model independent-job baseline
+
+**Experiment order (2026-11-07):** characterize one serving peer first, then the same bounded demand over two independently operated peers, keeping exact model CID and input/seed policy fixed. Reuse the current API/router/worker path. Record the actual serving PeerId for every result; extra HTTP clients alone do not prove work was distributed. Do not build a new scheduling protocol to make the benchmark pass.
+
+The report must include completed jobs/second, p50/p95 job and first-token latency, refusal/retry counts, distribution of completed jobs by peer, maximum observed concurrency, content fan-out/resume cost, validator/duplicate compute multiplier and recovery after one slow or lost peer. Compare equal offered load and resource budgets. If current routing cannot use the second peer efficiently, report that limitation and propose an incremental router change rather than claiming linear scaling.
+
+Use the physical test's source fingerprints, identities, content and privacy/evidence rules. Keep integrity-only jobs explicitly labeled until the independent-validator method qualifies. The baseline can establish throughput and failure isolation without claiming correctness validation is complete.
+
+- [ ] Dispatch a bounded queue of complete exact-CID inference jobs across at least two independent peers without cross-peer tensors.
+- [ ] Reuse signed model advertisements, verified CID pull, existing router eligibility, worker lifecycle, output commitments, and receipts; do not create a parallel scheduler protocol or artifact channel for the experiment.
+- [ ] Respect each peer’s advertised backend, quantization/precision, context, and concurrency limits; record only coarse scheduling data required for the decision.
+- [ ] Demonstrate heterogeneous completion rates, bounded backpressure, cancellation, peer loss, stale model revision rejection, and reassignment without corrupting another job.
+- [ ] Attach separately attributable integrity and approved correctness evidence to sampled jobs without making every serving peer its own validator.
+- [ ] Measure aggregate throughput, per-job latency distribution, content fan-out time, duplicate/validator compute multiplier, fairness, and recovery cost against a single-peer baseline.
+- [ ] State the exact workload requirement that remains unmet before proposing cross-peer tensor work.
 
 ### Baseline characterization
 
@@ -127,6 +151,7 @@ These packages activate only if the research gate permits them.
 
 ### Research gate — always required
 
+- [ ] Whole-model independent-job baseline is reproducible and identifies the exact unmet workload requirement, if any, that motivates sharding.
 - [ ] Determinism and adversarial-injection report is reproducible.
 - [ ] Verification ADR states guarantees, probabilities, costs, exclusions, and client-visible trust labels.
 - [ ] Upstream license and trademark language are verified.
@@ -151,6 +176,7 @@ These packages activate only if the research gate permits them.
 ## Explicit non-goals
 
 - Claiming cryptographic verification from hashes of unverified intermediate tensors.
+- Introducing cross-peer tensor execution before the whole-model independent-job baseline demonstrates a concrete unmet requirement.
 - Hiding hardware nondeterminism with an arbitrary tolerance.
 - Forking or rebranding an upstream cluster project as Phase-owned technology.
 - Flipping open authorization merely because a trusted-cluster demo works.
@@ -168,6 +194,7 @@ These packages activate only if the research gate permits them.
 
 - No `ShardWorker`, tensor transport, partition scheduler, or production sharding claim was added.
 - The new content, receipt, evidence, reputation, and bounded redundant-execution primitives are prerequisites for the research harness, not proof that partial tensor computation is correct.
+- The next scale experiment is whole-model independent-job parallelism with exact model binding and independently attributable validation. It is a prerequisite/control baseline, not a ShardWorker implementation.
 - The existing open-problem record at `memory-bank/decisions.md#2026-05-29-verifying-sharded--partial-computation-is-an-unsolved-open-problem-recorded-risk` remains controlling.
 - Unblock only after the determinism/adversarial-injection study and verification ADR specify measurable guarantees, costs, exclusions, and client-visible trust labels. Until then authorization remains default-deny and the public release must not imply sharding shipped.
 - Related implementation checkpoint: [2026-08-09 task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).

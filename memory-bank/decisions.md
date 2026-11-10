@@ -799,7 +799,7 @@ The 2026-05-28 audit's keystone finding (C1): `SignedManifest::verify()` checks 
 - Negative: contributors must be allowlisted (or rely on PeerID-bind semantics) — friction matching the intended soft launch.
 - The decision was delegated to the agent during the "get'r done" hardening run; recommended option taken and flagged for Michael's review. Reversible via config.
 
-**Revisit trigger** (Michael, 2026-05-29): default-deny is right *for now*. Flip the default toward open once (a) the network serves sliced/distributed models (v0.2 `ShardWorker` / multi-node sharding) AND (b) the inference infra can handle open load — gated by the rate-limit + reputation end-state above. Capability-gated, not date-gated; treat the flip as an in-scope deliverable of the v0.2 sharding milestone. Until then, use `allow_unauthenticated_jobs=true` for local dev rather than flipping the production default early.
+**Revisit trigger** (revised 2026-08-24): default-deny is right *for now*. Flip the default toward open only after (a) LUCID has an approved workload-specific correctness-evidence and independent-validation path with explicit trust labels, (b) the inference infrastructure passes public-load, rate-limit, amplification, Sybil, and abuse controls, and (c) public-network qualification passes. Sharding is neither a prerequisite nor sufficient evidence for this flip. The trigger remains capability-gated, not date-gated; until it passes, use `allow_unauthenticated_jobs=true` for local development rather than weakening the production default.
 
 **References**: `crates/lucidd/src/policy.rs`, `crates/lucidd/src/router.rs` (`make_inbound_relay_handler`), `crates/plasm/src/worker.rs`, SEC-01 task file.
 
@@ -1154,6 +1154,41 @@ UMBP’s Sonic public IPv4 is DHCP-assigned and the existing public host also se
 - Negative: the proxied web origins still depend on UMBP and the home connection; one cloud site is not geographic fleet resilience; public rendezvous and the physical intended-stream evidence remain incomplete.
 
 **References**: `crates/lucidd/src/main.rs:756-803`, `crates/lucidd/systemd/lucidd-relay.service:17-40`, `releases/lucid-v0.2/reachability-plane.md`, `releases/lucid-v0.2/network-operations.md`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+
+---
+
+### 2026-08-24: Separate transcript integrity from computation correctness; measure whole-model parallelism before tensor sharding
+
+**Status**: Accepted as LUCID architecture and research sequencing; implementation and public-network validation remain open.
+
+**Context**:
+LUCID already verifies that a persistent peer identity signed a receipt bound to the dispatched job and to the exact output chunks received by the requester. `crates/lucidd/src/router.rs:1596-1612` documents the signature, job, PeerId, and commitment-replay checks. Those checks establish attributable transcript integrity: they detect tampering, truncation, substitution, and wrong-peer receipts. They do not establish that the serving backend loaded the claimed model, used the claimed precision/software, or performed the claimed computation correctly.
+
+Bounded redundant execution is intentionally narrower. It samples exact-CID seeded inference on two backend-equivalent peers and compares terminal commitments (`crates/lucidd/src/router.rs:1164-1247`, `crates/lucidd/src/router.rs:1305-1330`). Agreement is useful empirical evidence, but it is not cryptographic proof and cannot identify the dishonest peer when results disagree without a trusted reference.
+
+The current architecture can also distribute useful work without splitting one model execution across untrusted peers. Each eligible peer can execute a complete job independently, at its own bounded concurrency and pace, using the existing router, worker, receipt, model-capability, and content-plane machinery. That path should be measured before LUCID accepts the verification, coupling, and failure-recovery costs of intermediate-tensor transport.
+
+**Decision**:
+
+1. Treat signed receipts and replayed output commitments as proof of provenance and transcript integrity only. Product language and API trust labels must not call them proof of correct model execution.
+2. Add any future model-execution correctness signal through a versioned, bounded, workload-specific evidence seam. LUCID owns the evidence meaning and validator policy; the workload-neutral Phase substrate may transport and commit opaque evidence but must not interpret inference activations, traces, tokens, model formats, or backend semantics.
+3. Bind correctness evidence to the exact job/manifest hash, model CID, backend and precision class, output commitment, software/protocol version, evidence method/version, and serving peer. An independent validator records its own identity, method/version, verdict, and confidence or trust label. Evidence generation and validation must not collapse into the same trust boundary.
+4. Describe validator output honestly as empirical or probabilistic evidence unless a separately approved construction supplies a stronger guarantee. Unsupported, incomparable, expired, malformed, budget-exhausted, and disagreement outcomes remain distinct from pass/fail.
+5. Prioritize and benchmark independent whole-model job parallelism before cross-peer tensor sharding. Peers may differ in backend, throughput, concurrency budget, and availability; scheduling uses coarse signed capabilities such as `ModelCapabilities` (`crates/lucidd/src/registry.rs:685-711`) and does not require fine-grained private hardware telemetry.
+6. Reuse the existing signed alias/provider and verified CID pull paths to distribute exact model revisions. Do not create a second model/version broadcast or artifact transport for validators or parallel workers.
+7. Keep `ShardWorker` blocked until both the whole-model baseline is characterized and its existing partial-compute verification gate passes. Proceed only if a demonstrated workload cannot fit or meet its required latency through whole-model scheduling and the added sharding trust/cost trade-off is explicitly accepted.
+8. Decouple the open-authorization trigger from sharding. Correctness-evidence validation, load/amplification limits, Sybil/abuse controls, and public-network qualification govern that decision.
+9. Do not add training or optimization-loop semantics to LUCID v0.2 or to `phase-*`. Any later long-running independent workload must be introduced as a separately approved job kind/application layer that reuses the substrate boundary.
+
+**Consequences**:
+- Positive: makes the existing receipt guarantee precise; prevents integrity evidence from being overstated as correctness proof.
+- Positive: creates a narrow upgrade seam for backend-specific validation without contaminating generic Phase APIs.
+- Positive: extracts network value from heterogeneous peers using current complete-job semantics before paying the complexity cost of cross-peer tensor execution.
+- Positive: keeps model distribution content-addressed and version-bound through one existing content plane.
+- Negative: independent validation consumes bounded extra compute and still may not prove correctness; trust labels and validator policy become product-visible complexity.
+- Negative: whole-model parallelism cannot serve a model that fits no eligible peer and may not satisfy a single request's latency goal; those measured limits become evidence for or against ShardWorker.
+
+**References**: `releases/lucid-v0.2/reputation-and-redundant-verification.md`, `releases/lucid-v0.2/shardworker.md`, `crates/phase-protocol/src/job_spec.rs:35-81`, `crates/phase-protocol/src/worker.rs:315-378`, `crates/phase-protocol/src/commitment.rs:29-86`, `crates/lucidd/src/router.rs:1164-1398`, `crates/lucidd/src/router.rs:1550-1678`, `crates/lucidd/src/registry.rs:685-711`.
 
 ---
 
