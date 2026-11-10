@@ -4467,7 +4467,23 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), silent_after_acceptance.next_frame())
                 .await
                 .expect("silence after Accepted must terminate deterministically");
-        assert!(matches!(liveness_failure, Some(Err(_)) | None));
+        // Either endpoint may reach its idle deadline first. The requester
+        // reports a transport error, while the serving peer sends a validated
+        // Failed frame. Both paths must terminate without successful output.
+        if let Some(Ok(frame)) = liveness_failure {
+            assert!(matches!(
+                frame.kind,
+                JobRelayStreamFrameKind::Failed { ref reason }
+                    if reason == "live relay idle timeout reached"
+            ));
+            assert!(tokio::time::timeout(
+                Duration::from_secs(2),
+                silent_after_acceptance.next_frame(),
+            )
+            .await
+            .expect("failed peer stream must close")
+            .is_none());
+        }
         tokio::time::timeout(Duration::from_secs(2), cancel_seen_rx)
             .await
             .expect("server handler receives cancellation and releases resources")

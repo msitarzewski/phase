@@ -1,12 +1,21 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-11-07
+**Last Updated**: 2026-11-09
 **Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint
 **Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Approved source `1356ef65…d847` is green on macOS ARM64 and native UMBP Ubuntu x86_64. Checkpoint commit/push was approved on 2026-08-10; no v0.2 tag or production deployment exists.
 
 ---
 
 ## Major Deliverables
+
+### CI security and test reliability refresh (2026-11-09)
+
+- Updated the affected networking, TLS, Tokio, compression and Wasmtime dependency families within their existing compatible constraints. Plasm now requires Wasmtime/WASI 36.0.20; the lockfile also replaces the yanked chacha20 and spin versions. Fresh `cargo audit` reports zero vulnerabilities and zero yanked packages under the existing policy, with four existing transitive unmaintained warnings. `cargo deny` passes advisories, bans, licenses and sources; no advisory exception was added.
+- The existing CI advisory job now has job-scoped `checks: write` so it can publish its result. The independent cargo-deny step runs even when audit fails, unless the workflow was cancelled (`.github/workflows/security.yml:34`). `actionlint` passes.
+- Corrected the live-relay loopback test to accept the serving peer's validated idle-timeout `Failed` frame as well as requester-side transport termination. Both outcomes still require bounded termination and server-side cancellation cleanup (`crates/phase-net/src/discovery.rs:4470`).
+- Retained diagnostics identified the macOS fixture failure: concurrent subprocesses inherited another test's temporary listening socket. A shared async guard now isolates each macOS fixture scenario through worker teardown (`crates/lucidd/tests/llama_worker.rs:39`). Temporary process-owner diagnostics were removed from the fixture source; raw diagnostic logs remain outside Git.
+- Final macOS ARM64 qualification: 460 tests passed / 2 ignored, formatting and strict all-target Clippy passed. Evidence: `target/phase-validation/20261110T014852Z-65053/`; source fingerprint `b10dec2c7273012bb8aca5d354cd779003750c44f1e184573fe6001ecdc86388`. The relay test additionally passed 40 consecutive runs and the backend suite passed 16 consecutive runs with parallel harness scheduling.
+- Code checkpoint: `313565e` on `fix/ci-security-and-test-reliability`. These are CI/local qualification updates; physical intended-stream, independent-validator, real MLX, Linux ARM64 and the remaining release gates retain their tracker status.
 
 ### Competitive and acceptance preparation refresh (2026-11-07)
 
