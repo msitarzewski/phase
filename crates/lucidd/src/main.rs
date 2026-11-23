@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use lucidd::content::{ContentPlane, ContentPlaneConfig, LocalGgufActivation};
 use lucidd::echo::EchoWorker;
 use lucidd::ollama::{router as ollama_router, AppState};
@@ -57,8 +57,11 @@ enum WorkerChoice {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum NodeMode {
-    /// Run a local worker. Default. Same node can also serve peers via the
-    /// inbound job-relay handler if --no-local-worker is not set.
+    /// Auto-select from `~/.config/lucidd/node.toml`: consume-only until the
+    /// user explicitly approves providing models and a pinned runtime.
+    Auto,
+    /// Run a local worker. Same node can also serve peers via the inbound
+    /// job-relay handler if --no-local-worker is not set.
     Worker,
     /// Consume-only peer: no local worker is loaded; requests route to a
     /// serving peer or are refused. `relay` remains a CLI compatibility alias.
@@ -70,15 +73,57 @@ enum NodeMode {
     Infrastructure,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Inspect this machine's hardware, existing inference tools (Ollama / LM
+    /// Studio), and local GGUF models strictly read-only without changing state.
+    Probe,
+    /// List models available on your network and on this machine from the
+    /// running local LUCID daemon.
+    Models {
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+    },
+    /// List live connected peers from the running local LUCID daemon.
+    Peers {
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+    },
+    /// Mint a one-time `lucid://join/...` invitation link from the running
+    /// local LUCID daemon.
+    Invite {
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+        /// Invitation lifetime in seconds (1..=3600).
+        #[arg(long, default_value_t = 1800)]
+        ttl_seconds: u64,
+    },
+    /// Join a private LUCID network using an operator-issued `lucid://join/...`
+    /// invitation link.
+    Join {
+        /// Invitation string (`lucid://join/...`).
+        invitation: String,
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "lucidd",
     about = "LUCID inference daemon — verified local/peer inference behind an Ollama-compatible API."
 )]
 struct Cli {
-    /// Run as a worker (default) or as a consume-only relay node.
-    /// `--mode relay` is equivalent to `--no-local-worker`.
-    #[arg(long, value_enum, default_value_t = NodeMode::Worker)]
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run mode (`auto` default reads node.toml safely; explicit `worker`,
+    /// `consume-only`/`relay`, or `infrastructure` overrides it).
+    #[arg(long, value_enum, default_value_t = NodeMode::Auto)]
     mode: NodeMode,
 
     /// Which `Worker` impl to expose on :11434. Required for worker mode;
@@ -152,6 +197,10 @@ struct Cli {
     /// resolution). `lucidd` seeds a fully-commented default if absent.
     #[arg(long)]
     policy_config: Option<PathBuf>,
+
+    /// Override the persistent node preferences path (`node.toml`).
+    #[arg(long)]
+    node_config: Option<PathBuf>,
 
     /// Private file containing the local native-control API bearer token.
     #[arg(long)]
@@ -659,6 +708,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    if let Some(subcommand) = cli.command {
+        return run_cli_subcommand(
+            subcommand,
+            cli.identity_path,
+            cli.control_token_file,
+            cli.node_config,
+        )
+        .await;
+    }
+
+    let node_config_store =
+        lucidd::node_config::NodeConfigStore::load_or_default(cli.node_config.clone())?;
+    let node_cfg = node_config_store.snapshot();
+
     if cli.redundant_verification_permille > 1_000 {
         return Err("--redundant-verification-permille must be in 0..=1000".into());
     }
@@ -690,19 +753,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     validate_http_bind_addr(addr)?;
 
-    let no_local_worker = cli.no_local_worker || cli.mode != NodeMode::Worker;
-    if cli.mode == NodeMode::Infrastructure && cli.external_addresses.is_empty() {
+    // Resolve Auto mode safely: explicit flags always win; zero-flag startup
+    // stays consume-only until the user has explicitly granted permission to
+    // provide models and pinned a verified llama-server runtime.
+    let effective_mode = match cli.mode {
+        NodeMode::Auto => {
+            if cli.no_local_worker {
+                NodeMode::ConsumeOnly
+            } else if cli.worker.is_some()
+                || (node_cfg.providing_enabled
+                    && node_cfg.llama_server_binary.is_some()
+                    && !node_cfg.model_dirs.is_empty())
+            {
+                NodeMode::Worker
+            } else {
+                NodeMode::ConsumeOnly
+            }
+        }
+        other => other,
+    };
+
+    let no_local_worker = cli.no_local_worker || effective_mode != NodeMode::Worker;
+    if effective_mode == NodeMode::Infrastructure && cli.external_addresses.is_empty() {
         return Err(
             "--mode infrastructure requires at least one operator-confirmed --external-address"
                 .into(),
         );
     }
-    if cli.mode != NodeMode::Infrastructure && (cli.no_relay_server || cli.no_autonat_server) {
+    if effective_mode != NodeMode::Infrastructure && (cli.no_relay_server || cli.no_autonat_server)
+    {
         return Err(
             "--no-relay-server and --no-autonat-server require --mode infrastructure".into(),
         );
     }
-    if cli.outbound_only && cli.mode == NodeMode::Infrastructure {
+    if cli.outbound_only && effective_mode == NodeMode::Infrastructure {
         return Err("--outbound-only cannot be combined with --mode infrastructure".into());
     }
     if cli.listen_addresses.len() > 4 {
@@ -713,10 +797,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let worker_choice = if no_local_worker {
         None
+    } else if let Some(explicit) = cli.worker {
+        Some(explicit)
+    } else if cli.mode == NodeMode::Auto
+        && node_cfg.providing_enabled
+        && node_cfg.llama_server_binary.is_some()
+    {
+        Some(WorkerChoice::LlamaCpp)
     } else {
-        Some(cli.worker.ok_or(
-            "--worker is required in worker mode; use --worker llama-cpp or --worker mlx for real inference, or --worker echo only for development/testing",
-        )?)
+        return Err(
+            "--worker is required in worker mode; use --worker llama-cpp or --worker mlx for real inference, or --worker echo only for development/testing"
+                .into(),
+        );
     };
     let prepared_mlx_startup = if worker_choice == Some(WorkerChoice::Mlx) {
         Some(prepare_mlx_startup(
@@ -776,7 +868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap_peers,
         ..DiscoveryConfig::default()
     };
-    let reachability = if cli.mode == NodeMode::Infrastructure {
+    let reachability = if effective_mode == NodeMode::Infrastructure {
         ReachabilityConfig {
             role: ReachabilityRole::Infrastructure,
             outbound_only: false,
@@ -821,7 +913,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if cli.mode == NodeMode::Infrastructure && !direct_listening {
+    if effective_mode == NodeMode::Infrastructure && !direct_listening {
         return Err("infrastructure mode could not establish any libp2p listener".into());
     }
     for address in &cli.external_addresses {
@@ -838,7 +930,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // public peers as rendezvous servers. Relay client support is independent
     // of the infrastructure/server role: operators can disable server duties
     // without losing their own NAT traversal path.
-    let _reachability_maintenance = if cli.mode != NodeMode::Infrastructure {
+    let _reachability_maintenance = if effective_mode != NodeMode::Infrastructure {
         if cli.relay_peers.len() > MAX_RELAY_CLIENT_CANDIDATES {
             return Err(format!(
                 "at most {MAX_RELAY_CLIENT_CANDIDATES} explicit --relay-peer values are allowed"
@@ -931,14 +1023,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(
             cli.model_dir
                 .clone()
+                .or_else(|| node_cfg.model_dirs.first().cloned())
                 .ok_or("--model-dir is required with --worker llama-cpp")?,
         )
     } else {
         None
     };
     let needs_content_store = source_model_dir.is_some()
-        || cli.mode == NodeMode::ConsumeOnly
+        || effective_mode == NodeMode::ConsumeOnly
         || cli.serve_model_content
+        || node_cfg.serve_model_content
         || cli.artifact_dir.is_some();
     let content_storage = if needs_content_store {
         let artifact_dir = cli
@@ -962,7 +1056,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional local worker.
     let local_worker: Option<Arc<dyn DynWorker>> = if no_local_worker {
         tracing::info!(
-            mode = ?cli.mode,
+            mode = ?effective_mode,
             "consume-only / relay node (no local worker loaded)"
         );
         None
@@ -1023,9 +1117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // inherited `$PATH` — a binary-hijack vector. Canonicalize
                 // it (which also fails fast if it's missing) and require the
                 // result to be absolute so the spawn never PATH-resolves.
-                let configured_server_binary = cli.llama_server_binary.as_ref().ok_or(
-                    "--llama-server-binary is required with --worker llama-cpp and must be an absolute trusted path",
-                )?;
+                let configured_server_binary = cli
+                    .llama_server_binary
+                    .as_ref()
+                    .or(node_cfg.llama_server_binary.as_ref())
+                    .ok_or(
+                        "--llama-server-binary is required with --worker llama-cpp and must be an absolute trusted path",
+                    )?;
                 if !configured_server_binary.is_absolute() {
                     return Err("--llama-server-binary must be an absolute trusted path".into());
                 }
@@ -1035,6 +1133,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         configured_server_binary
                     )
                 })?;
+                if cli.llama_server_binary.is_none() {
+                    if let Some(expected_sha) = &node_cfg.llama_server_sha256 {
+                        let actual_sha =
+                            lucidd::runtime_manager::sha256_file_hex(&server_binary_path)?;
+                        if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+                            return Err(format!(
+                                "pinned llama-server SHA-256 mismatch for {} (expected {}, got {})",
+                                server_binary_path.display(),
+                                expected_sha,
+                                actual_sha
+                            )
+                            .into());
+                        }
+                    }
+                }
                 if !server_binary_path.is_absolute() {
                     return Err(format!(
                         "--llama-server-binary resolved to a non-absolute path: {}",
@@ -1330,6 +1443,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("verified model-content serving enabled");
     }
 
+    let cached_probe = Arc::new(tokio::sync::RwLock::new(None));
+    {
+        let probe_cache = cached_probe.clone();
+        let probe_store = node_config_store.clone();
+        tokio::spawn(async move {
+            let cfg = probe_store.snapshot();
+            let result = lucidd::runtime_manager::probe_system(&cfg).await;
+            *probe_cache.write().await = Some(result);
+        });
+    }
+
     let (verified_model_dir, artifact_store) = match content_storage {
         Some((verified, store)) => (Some(verified), Some(store)),
         None => (None, None),
@@ -1344,6 +1468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         content_plane,
         consumer,
         discovery,
+        policy: policy.clone(),
+        node_config: node_config_store,
+        cached_probe,
+        runtime_lock: Arc::new(tokio::sync::Mutex::new(())),
         started_at: tokio::time::Instant::now(),
     };
     let app = ollama_router(state);
@@ -1352,6 +1480,231 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_cli_subcommand(
+    command: Command,
+    identity_path: Option<PathBuf>,
+    control_token_file: Option<PathBuf>,
+    node_config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Probe => {
+            let store = lucidd::node_config::NodeConfigStore::load_or_default(node_config_path)?;
+            let probe = lucidd::runtime_manager::probe_system(&store.snapshot()).await;
+            println!("Hardware: {}", probe.hardware.summary);
+            println!(
+                "Existing Ollama: {}",
+                if let Some(ver) = &probe.existing_inference.ollama_version {
+                    format!("running (v{ver})")
+                } else if probe.existing_inference.ollama_store_found {
+                    "installed (local models found)".to_string()
+                } else {
+                    "not detected".to_string()
+                }
+            );
+            println!(
+                "Inference Runtime: {} ({})",
+                probe.runtime.status,
+                probe
+                    .runtime
+                    .pinned_path
+                    .as_deref()
+                    .or(probe.runtime.detected_path.as_deref())
+                    .unwrap_or("none pinned yet")
+            );
+            if probe.discovered_models.is_empty() {
+                println!("Discovered local GGUF models: none");
+            } else {
+                println!("Discovered local GGUF models (read-only, permission required to share):");
+                for m in &probe.discovered_models {
+                    let gb = (m.size_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+                    println!(
+                        "  - {} ({:.2} GB, source={}, fits={})",
+                        m.name, gb, m.source, m.fits_hardware
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Models { api } => {
+            let token = load_local_control_token(identity_path, control_token_file)?;
+            let body: serde_json::Value =
+                local_control_get(&api, "/api/lucid/models", &token).await?;
+            let models = body
+                .get("models")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if models.is_empty() {
+                println!("No models available yet. Add a model folder or join a network.");
+                return Ok(());
+            }
+            println!(
+                "{:<32} {:<10} {:<8} {:<10}",
+                "MODEL", "SOURCE", "PEERS", "PROVIDING"
+            );
+            for m in models {
+                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("-");
+                let source = m.get("source").and_then(|v| v.as_str()).unwrap_or("-");
+                let peers = m.get("peer_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let providing = m
+                    .get("providing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                println!(
+                    "{:<32} {:<10} {:<8} {:<10}",
+                    name,
+                    source,
+                    peers,
+                    if providing { "yes" } else { "no" }
+                );
+            }
+            Ok(())
+        }
+        Command::Peers { api } => {
+            let token = load_local_control_token(identity_path, control_token_file)?;
+            let body: serde_json::Value =
+                local_control_get(&api, "/api/lucid/peers", &token).await?;
+            let peers = body
+                .get("peers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let path = body
+                .get("active_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            println!("Connected peers: {} (path: {})", peers.len(), path);
+            for p in peers {
+                println!(
+                    "  - {} ({})",
+                    p.get("peer_id").and_then(|v| v.as_str()).unwrap_or("-"),
+                    p.get("path").and_then(|v| v.as_str()).unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        Command::Invite { api, ttl_seconds } => {
+            let token = load_local_control_token(identity_path, control_token_file)?;
+            let body: serde_json::Value = local_control_post(
+                &api,
+                "/api/lucid/invitations",
+                &token,
+                serde_json::json!({ "ttl_seconds": ttl_seconds }),
+            )
+            .await?;
+            if let Some(invite) = body.get("invitation").and_then(|v| v.as_str()) {
+                println!("{invite}");
+                Ok(())
+            } else {
+                Err(format!("unexpected response: {body}").into())
+            }
+        }
+        Command::Join { invitation, api } => {
+            let token = load_local_control_token(identity_path, control_token_file)?;
+            let body: serde_json::Value = local_control_post(
+                &api,
+                "/api/lucid/enroll",
+                &token,
+                serde_json::json!({ "invitation": invitation }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+    }
+}
+
+fn validate_loopback_api_base(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(trimmed)?;
+    if parsed.scheme() != "http" {
+        return Err("local control API must use http:// on loopback".into());
+    }
+    match parsed.host_str() {
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]") => Ok(trimmed.to_string()),
+        _ => Err("refusing to send control token to non-loopback host".into()),
+    }
+}
+
+fn load_local_control_token(
+    identity_path: Option<PathBuf>,
+    control_token_file: Option<PathBuf>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let token_path = match control_token_file {
+        Some(p) => p,
+        None => {
+            let id = match identity_path {
+                Some(p) => p,
+                None => default_identity_path()?,
+            };
+            identity_sidecar_path(&id, ".control-token")
+        }
+    };
+    let token = std::fs::read_to_string(&token_path)
+        .map_err(|e| {
+            format!(
+                "could not read local control token {}: {e}",
+                token_path.display()
+            )
+        })?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err("local control token file is empty".into());
+    }
+    Ok(token)
+}
+
+async fn local_control_get(
+    api_base: &str,
+    path: &str,
+    token: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let base = validate_loopback_api_base(api_base)?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(format!("{base}{path}"))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
+}
+
+async fn local_control_post(
+    api_base: &str,
+    path: &str,
+    token: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let base = validate_loopback_api_base(api_base)?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
 }
 
 fn validate_http_bind_addr(addr: SocketAddr) -> Result<(), String> {
@@ -1495,5 +1848,34 @@ mod tests {
             std::path::Path::new("/tmp/node-a.key.alias-replay-state-v1.json")
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cli_subcommands_parse_and_loopback_guard_enforces_localhost() {
+        let probe = Cli::try_parse_from(["lucidd", "probe"]).unwrap();
+        assert!(matches!(probe.command, Some(Command::Probe)));
+
+        let models = Cli::try_parse_from(["lucidd", "models"]).unwrap();
+        assert!(matches!(models.command, Some(Command::Models { .. })));
+
+        let peers = Cli::try_parse_from(["lucidd", "peers"]).unwrap();
+        assert!(matches!(peers.command, Some(Command::Peers { .. })));
+
+        let invite = Cli::try_parse_from(["lucidd", "invite", "--ttl-seconds", "600"]).unwrap();
+        assert!(matches!(
+            invite.command,
+            Some(Command::Invite {
+                ttl_seconds: 600,
+                ..
+            })
+        ));
+
+        let join = Cli::try_parse_from(["lucidd", "join", "lucid://join/abc"]).unwrap();
+        assert!(matches!(join.command, Some(Command::Join { .. })));
+
+        assert!(validate_loopback_api_base("http://127.0.0.1:11435").is_ok());
+        assert!(validate_loopback_api_base("http://localhost:11435/").is_ok());
+        assert!(validate_loopback_api_base("http://example.com:11435").is_err());
+        assert!(validate_loopback_api_base("https://127.0.0.1:11435").is_err());
     }
 }

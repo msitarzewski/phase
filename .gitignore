@@ -54,3 +54,10 @@ control-*.token
 # Private local fleet topology / SSH / relay configuration (never commit hostnames or IPs).
 .phase-fleet.local.env
 *.local.env
+
+# Tauri v2 desktop app build artifacts & staged sidecar binaries
+apps/lucid-desktop/node_modules/
+apps/lucid-desktop/dist/
+apps/lucid-desktop/src-tauri/target/
+apps/lucid-desktop/src-tauri/gen/
+apps/lucid-desktop/src-tauri/binaries/lucidd*

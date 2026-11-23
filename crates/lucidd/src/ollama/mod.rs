@@ -269,6 +269,10 @@ pub struct AppState {
     /// Private native-app control; never shared with chat clients.
     pub consumer: Arc<crate::consumer::ConsumerControl>,
     pub discovery: Arc<phase_net::Discovery>,
+    pub policy: Arc<crate::policy::PolicyEngine>,
+    pub node_config: Arc<crate::node_config::NodeConfigStore>,
+    pub cached_probe: Arc<tokio::sync::RwLock<Option<crate::runtime_manager::SystemProbe>>>,
+    pub runtime_lock: Arc<tokio::sync::Mutex<()>>,
     pub started_at: tokio::time::Instant,
 }
 
@@ -386,6 +390,30 @@ pub fn router(state: AppState) -> Router {
         .route("/api/embeddings", post(handle_embeddings))
         .route("/api/pull", post(handle_pull))
         .route("/api/lucid/status", get(handle_consumer_status))
+        .route("/api/lucid/peers", get(handle_control_peers))
+        .route("/api/lucid/probe", get(handle_control_probe))
+        .route(
+            "/api/lucid/probe/refresh",
+            post(handle_control_probe_refresh).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/api/lucid/models", get(handle_control_models))
+        .route(
+            "/api/lucid/provide",
+            post(handle_control_provide).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/lucid/folders",
+            post(handle_control_folders).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/lucid/settings",
+            post(handle_control_settings).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route("/api/lucid/runtime", get(handle_control_runtime))
+        .route(
+            "/api/lucid/runtime/setup",
+            post(handle_control_runtime_setup).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route(
             "/api/lucid/enroll",
             post(handle_consumer_enroll).layer(DefaultBodyLimit::max(16 * 1024)),
@@ -547,15 +575,19 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
     if let Some(response) = authorize_control(&state, &headers) {
         return response;
     }
-    let connected = matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            state.discovery.reachability_snapshot(),
-        )
-        .await,
-        Ok(Ok(snapshot)) if !snapshot.connections.is_empty()
-    );
-    let connection = if connected {
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.discovery.reachability_snapshot(),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok());
+    let peer_count = snapshot.as_ref().map(|s| s.connections.len()).unwrap_or(0);
+    let active_path = snapshot
+        .as_ref()
+        .map(|s| format!("{:?}", s.active_path).to_ascii_lowercase())
+        .unwrap_or_else(|| "none".to_string());
+    let connection = if peer_count > 0 {
         "connected"
     } else if state.started_at.elapsed() < std::time::Duration::from_secs(15) {
         "connecting"
@@ -572,12 +604,611 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
     for model in state.registry.cached_network_models().await {
         cids.insert(model.caps.model_cid);
     }
+    let node_cfg = state.node_config.snapshot();
+    let policy_cfg = state.policy.config();
+    let policy_state = state.policy.state();
+    let paused_reason = if policy_cfg.manual_pause {
+        Some("manual_pause")
+    } else if policy_cfg.auto_pause_on_battery && policy_state.on_battery == Some(true) {
+        Some("battery")
+    } else if let (Some(limit), Some(temp)) = (
+        policy_cfg.auto_pause_on_thermal_threshold_c,
+        policy_state.temperature_c,
+    ) {
+        (temp >= limit).then_some("thermal")
+    } else {
+        None
+    };
+
     control_response(
         StatusCode::OK,
         serde_json::json!({
             "state": connection,
+            "peer_count": peer_count,
+            "active_path": active_path,
             "model_count": cids.len(),
             "enrollment": state.consumer.enrollment_status(),
+            "onboarding_completed": node_cfg.onboarding_completed,
+            "providing_enabled": node_cfg.providing_enabled,
+            "providing_models": node_cfg.approved_provide_models,
+            "paused_reason": paused_reason,
+            "policy": {
+                "manual_pause": policy_cfg.manual_pause,
+                "auto_pause_on_battery": policy_cfg.auto_pause_on_battery,
+                "thermal_limit_c": policy_cfg.auto_pause_on_thermal_threshold_c,
+                "max_concurrent_remote_jobs": policy_cfg.max_concurrent_remote_jobs,
+            }
+        }),
+    )
+}
+
+async fn handle_control_peers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.discovery.reachability_snapshot(),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok());
+
+    let (active_path, nat, peers) = match snapshot {
+        Some(snap) => {
+            let list: Vec<serde_json::Value> = snap
+                .connections
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "peer_id": c.peer_id.to_string(),
+                        "path": format!("{:?}", c.path).to_ascii_lowercase(),
+                    })
+                })
+                .collect();
+            (
+                format!("{:?}", snap.active_path).to_ascii_lowercase(),
+                format!("{:?}", snap.nat).to_ascii_lowercase(),
+                list,
+            )
+        }
+        None => ("none".to_string(), "unknown".to_string(), Vec::new()),
+    };
+
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "peer_count": peers.len(),
+            "active_path": active_path,
+            "nat": nat,
+            "peers": peers,
+        }),
+    )
+}
+
+async fn current_or_fresh_probe(state: &AppState) -> crate::runtime_manager::SystemProbe {
+    if let Some(existing) = state.cached_probe.read().await.clone() {
+        let cfg = state.node_config.snapshot();
+        let mut copy = existing;
+        copy.onboarding_completed = cfg.onboarding_completed;
+        copy.providing_enabled = cfg.providing_enabled;
+        return copy;
+    }
+    let cfg = state.node_config.snapshot();
+    let probe = crate::runtime_manager::probe_system(&cfg).await;
+    *state.cached_probe.write().await = Some(probe.clone());
+    probe
+}
+
+async fn handle_control_probe(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let probe = current_or_fresh_probe(&state).await;
+    control_response(StatusCode::OK, serde_json::json!(probe))
+}
+
+async fn handle_control_probe_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let cfg = state.node_config.snapshot();
+    let probe = crate::runtime_manager::probe_system(&cfg).await;
+    *state.cached_probe.write().await = Some(probe.clone());
+    control_response(StatusCode::OK, serde_json::json!(probe))
+}
+
+async fn handle_control_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let node_cfg = state.node_config.snapshot();
+    let probe = current_or_fresh_probe(&state).await;
+    let installed = state.registry.local_installed_async().await;
+    let loaded = state.registry.local_models_async().await;
+    let remote = state
+        .registry
+        .discover_network_models()
+        .await
+        .unwrap_or_default();
+    let authorized_issuers: std::collections::HashSet<_> = state
+        .consumer
+        .authorized_issuers()
+        .iter()
+        .filter_map(|key| crate::registry::peer_id_from_ed25519_pubkey(key).ok())
+        .collect();
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    for m in &installed {
+        let cid_hex = m.model_cid.to_hex();
+        let providing = node_cfg.providing_enabled
+            && (node_cfg
+                .approved_provide_models
+                .iter()
+                .any(|a| a == &m.model_id || a == &cid_hex));
+        let peer_count = remote
+            .iter()
+            .find(|r| r.caps.model_cid == m.model_cid)
+            .map(|r| r.providers.len())
+            .unwrap_or(0);
+        seen_names.insert(m.model_id.to_ascii_lowercase());
+        entries.push(serde_json::json!({
+            "id": m.model_id,
+            "name": m.model_id,
+            "cid": cid_hex,
+            "source": "local",
+            "size_bytes": m.size_bytes,
+            "quantization": serde_json::Value::Null,
+            "peer_count": peer_count,
+            "on_device": true,
+            "available_locally": true,
+            "providing": providing,
+            "can_request": true,
+            "fits_hardware": probe.hardware.recommended_max_model_bytes == 0 || m.size_bytes <= probe.hardware.recommended_max_model_bytes,
+            "local_path": serde_json::Value::Null,
+        }));
+    }
+
+    for caps in &loaded {
+        if seen_names.contains(&caps.model_id.to_ascii_lowercase()) {
+            continue;
+        }
+        let cid_hex = caps.model_cid.to_hex();
+        let providing = node_cfg.providing_enabled
+            && node_cfg
+                .approved_provide_models
+                .iter()
+                .any(|a| a == &caps.model_id || a == &cid_hex);
+        seen_names.insert(caps.model_id.to_ascii_lowercase());
+        entries.push(serde_json::json!({
+            "id": caps.model_id,
+            "name": caps.model_id,
+            "cid": cid_hex,
+            "source": "local",
+            "size_bytes": 0,
+            "quantization": caps.quantization,
+            "peer_count": 0,
+            "on_device": true,
+            "available_locally": true,
+            "providing": providing,
+            "can_request": true,
+            "fits_hardware": true,
+            "local_path": serde_json::Value::Null,
+        }));
+    }
+
+    for disc in &probe.discovered_models {
+        if !seen_names.insert(disc.name.to_ascii_lowercase()) {
+            continue;
+        }
+        let providing = node_cfg.providing_enabled
+            && node_cfg
+                .approved_provide_models
+                .iter()
+                .any(|a| a == &disc.name);
+        let available_locally = node_cfg
+            .approved_local_models
+            .iter()
+            .any(|a| a == &disc.name)
+            || providing;
+        entries.push(serde_json::json!({
+            "id": disc.name,
+            "name": disc.name,
+            "cid": serde_json::Value::Null,
+            "source": disc.source,
+            "size_bytes": disc.size_bytes,
+            "quantization": disc.quantization,
+            "peer_count": 0,
+            "on_device": true,
+            "available_locally": available_locally,
+            "providing": providing,
+            "can_request": false,
+            "fits_hardware": disc.fits_hardware,
+            "local_path": disc.path,
+        }));
+    }
+
+    for net in &remote {
+        let name = net.caps.model_id.clone();
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let can_request = net.providers.iter().any(|p| authorized_issuers.contains(p));
+        entries.push(serde_json::json!({
+            "id": name,
+            "name": net.caps.model_id,
+            "cid": net.caps.model_cid.to_hex(),
+            "source": "network",
+            "size_bytes": 0,
+            "quantization": net.caps.quantization,
+            "peer_count": net.providers.len(),
+            "on_device": false,
+            "available_locally": can_request,
+            "providing": false,
+            "can_request": can_request,
+            "fits_hardware": true,
+            "local_path": serde_json::Value::Null,
+        }));
+    }
+
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "models": entries,
+            "model_dirs": node_cfg.model_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "providing_enabled": node_cfg.providing_enabled,
+            "onboarding_completed": node_cfg.onboarding_completed,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvideToggleRequest {
+    model_name: String,
+    enable: bool,
+    #[serde(default)]
+    confirm_permission: bool,
+    #[serde(default)]
+    make_available_locally: Option<bool>,
+}
+
+async fn handle_control_provide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ProvideToggleRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let model_name = req.model_name.trim().to_string();
+    if model_name.is_empty() || model_name.len() > 256 {
+        return control_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "Invalid model name."}),
+        );
+    }
+    if req.enable && !req.confirm_permission {
+        return control_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            serde_json::json!({"error": "Explicit user permission (confirm_permission: true) is required before providing a model."}),
+        );
+    }
+
+    let updated = match state.node_config.update(|cfg| {
+        cfg.onboarding_completed = true;
+        if req.enable {
+            cfg.providing_enabled = true;
+            if !cfg.approved_provide_models.iter().any(|m| m == &model_name) {
+                cfg.approved_provide_models.push(model_name.clone());
+            }
+            if !cfg.approved_local_models.iter().any(|m| m == &model_name) {
+                cfg.approved_local_models.push(model_name.clone());
+            }
+        } else {
+            cfg.approved_provide_models.retain(|m| m != &model_name);
+            if cfg.approved_provide_models.is_empty() {
+                cfg.providing_enabled = false;
+            }
+        }
+        if let Some(local) = req.make_available_locally {
+            if local {
+                if !cfg.approved_local_models.iter().any(|m| m == &model_name) {
+                    cfg.approved_local_models.push(model_name.clone());
+                }
+            } else {
+                cfg.approved_local_models.retain(|m| m != &model_name);
+            }
+        }
+        Ok(())
+    }) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to persist provide permission");
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "Could not save model permission."}),
+            );
+        }
+    };
+
+    // Sync PolicyEngine allowlist immediately so remote authorization matches
+    // user-approved models with zero restart lag.
+    let serve_list = updated.approved_provide_models.clone();
+    let pause_remote = !updated.providing_enabled;
+    if let Err(err) = state.policy.update_config(|pol| {
+        pol.serve_models = serve_list;
+        pol.manual_pause = pause_remote;
+    }) {
+        tracing::warn!(error = %err, "failed to sync policy after provide toggle");
+    }
+
+    let probe = current_or_fresh_probe(&state).await;
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "providing_enabled": updated.providing_enabled,
+            "approved_provide_models": updated.approved_provide_models,
+            "runtime_ready": probe.runtime.status == "ready",
+            "restart_required": req.enable && state.model_dir.is_none() && probe.runtime.status == "ready",
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderActionRequest {
+    action: String,
+    path: String,
+}
+
+async fn handle_control_folders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<FolderActionRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let path = std::path::PathBuf::from(req.path.trim());
+    let updated = match req.action.as_str() {
+        "add" => {
+            let valid = match crate::node_config::validate_model_dir(&path) {
+                Ok(p) => p,
+                Err(err) => {
+                    return control_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"error": err.to_string()}),
+                    );
+                }
+            };
+            state.node_config.update(|cfg| {
+                if !cfg.model_dirs.contains(&valid) {
+                    cfg.model_dirs.push(valid);
+                }
+                Ok(())
+            })
+        }
+        "remove" => state.node_config.update(|cfg| {
+            cfg.model_dirs.retain(|p| p != &path);
+            Ok(())
+        }),
+        _ => {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "action must be 'add' or 'remove'"}),
+            );
+        }
+    };
+
+    let cfg = match updated {
+        Ok(c) => c,
+        Err(err) => {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+
+    let probe = crate::runtime_manager::probe_system(&cfg).await;
+    *state.cached_probe.write().await = Some(probe.clone());
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "model_dirs": cfg.model_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "probe": probe,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsUpdateRequest {
+    #[serde(default)]
+    onboarding_completed: Option<bool>,
+    #[serde(default)]
+    manual_pause: Option<bool>,
+    #[serde(default)]
+    auto_pause_on_battery: Option<bool>,
+    #[serde(default)]
+    thermal_limit_c: Option<Option<f32>>,
+    #[serde(default)]
+    serve_model_content: Option<bool>,
+}
+
+async fn handle_control_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SettingsUpdateRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    if let Some(Some(t)) = req.thermal_limit_c {
+        if !(40.0..=105.0).contains(&t) {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "Thermal limit must be between 40°C and 105°C."}),
+            );
+        }
+    }
+
+    let node_cfg = match state.node_config.update(|cfg| {
+        if let Some(done) = req.onboarding_completed {
+            cfg.onboarding_completed = done;
+        }
+        if let Some(serve_content) = req.serve_model_content {
+            cfg.serve_model_content = serve_content;
+        }
+        Ok(())
+    }) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+
+    let pol_cfg = match state.policy.update_config(|pol| {
+        if let Some(pause) = req.manual_pause {
+            pol.manual_pause = pause;
+        }
+        if let Some(bat) = req.auto_pause_on_battery {
+            pol.auto_pause_on_battery = bat;
+        }
+        if let Some(thermal) = req.thermal_limit_c {
+            pol.auto_pause_on_thermal_threshold_c = thermal;
+        }
+    }) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return control_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "onboarding_completed": node_cfg.onboarding_completed,
+            "serve_model_content": node_cfg.serve_model_content,
+            "policy": {
+                "manual_pause": pol_cfg.manual_pause,
+                "auto_pause_on_battery": pol_cfg.auto_pause_on_battery,
+                "thermal_limit_c": pol_cfg.auto_pause_on_thermal_threshold_c,
+            }
+        }),
+    )
+}
+
+async fn handle_control_runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let probe = current_or_fresh_probe(&state).await;
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "hardware": probe.hardware,
+            "runtime": probe.runtime,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSetupRequest {
+    /// `"pin_detected"` or `"download_pinned"`
+    action: String,
+    #[serde(default)]
+    confirm_permission: bool,
+}
+
+async fn handle_control_runtime_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RuntimeSetupRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    if !req.confirm_permission {
+        return control_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            serde_json::json!({"error": "Explicit user permission (confirm_permission: true) is required before installing or pinning an inference runtime."}),
+        );
+    }
+
+    let _guard = state.runtime_lock.lock().await;
+    let probe = current_or_fresh_probe(&state).await;
+
+    let result = match req.action.as_str() {
+        "pin_detected" => {
+            let Some(detected) = probe.runtime.detected_path.as_deref() else {
+                return control_response(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"error": "No existing llama-server binary was detected on this machine."}),
+                );
+            };
+            crate::runtime_manager::pin_existing_runtime(std::path::Path::new(detected))
+                .await
+                .map(|(path, sha)| (path, sha, "pinned".to_string()))
+        }
+        "download_pinned" => {
+            crate::runtime_manager::download_and_install_pinned_runtime(&probe.hardware, None)
+                .await
+                .map(|(path, sha, asset)| (path, sha, format!("downloaded {}", asset.tag)))
+        }
+        _ => {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "action must be 'pin_detected' or 'download_pinned'"}),
+            );
+        }
+    };
+
+    let (binary_path, sha256, detail) = match result {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::warn!(error = %err, "runtime setup failed");
+            return control_response(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+
+    let updated = match state.node_config.update(|cfg| {
+        cfg.llama_server_binary = Some(binary_path.clone());
+        cfg.llama_server_sha256 = Some(sha256.clone());
+        Ok(())
+    }) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return control_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+
+    let refreshed = crate::runtime_manager::probe_system(&updated).await;
+    *state.cached_probe.write().await = Some(refreshed.clone());
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "detail": detail,
+            "runtime": refreshed.runtime,
         }),
     )
 }

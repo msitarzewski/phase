@@ -431,14 +431,51 @@ impl PolicyEngine {
     }
 
     /// Flip the operator-controlled manual pause. The change is durable for
-    /// the lifetime of the process; persisting to disk is a separate
-    /// concern (M7 future work — the operator can also just edit the
-    /// config file).
+    /// the lifetime of the process; persisting to disk is handled by
+    /// [`PolicyEngine::update_config`].
     pub async fn set_manual_pause(&self, paused: bool) {
         let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
         let mut updated = guard.config.clone();
         updated.manual_pause = paused;
         *guard = Arc::new(CompiledPolicy::new(updated));
+    }
+
+    /// Atomically update `PolicyConfig` in memory and persist it privately
+    /// (`0600`) to `policy.toml` when backed by a config file.
+    pub fn update_config<F>(&self, mutate: F) -> Result<PolicyConfig>
+    where
+        F: FnOnce(&mut PolicyConfig),
+    {
+        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        let mut updated = guard.config.clone();
+        mutate(&mut updated);
+        if let Some(path) = &self.config_path {
+            if let Some(parent) = path.parent() {
+                crate::node_config::ensure_private_dir(parent)?;
+            }
+            let serialized = toml::to_string_pretty(&updated)
+                .context("failed to serialize updated policy.toml")?;
+            let tmp_path =
+                path.with_file_name(format!(".policy-{}.tmp", uuid::Uuid::new_v4().simple()));
+            {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut file = opts.open(&tmp_path).with_context(|| {
+                    format!("failed to create temp policy file {}", tmp_path.display())
+                })?;
+                std::io::Write::write_all(&mut file, serialized.as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, path)
+                .with_context(|| format!("failed to persist {}", path.display()))?;
+        }
+        *guard = Arc::new(CompiledPolicy::new(updated.clone()));
+        Ok(updated)
     }
 
     /// Force a re-read of the config file. Used by the SIGHUP handler and

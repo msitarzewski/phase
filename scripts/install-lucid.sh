@@ -14,6 +14,7 @@ PREFIX="${HOME}/.local"
 FROM_DIR=""
 INSTALL_APP=0
 INSTALL_SYSTEMD=0
+SETUP_RELAY_IP=""
 
 usage() {
     cat <<'EOF'
@@ -24,11 +25,12 @@ Usage:
 
 Options:
   --repo OWNER/REPO     GitHub repository (default: msitarzewski/phase)
-  --tag TAG             Release tag (e.g. v0.2.0-rc1) or 'latest' (default: latest)
+  --tag TAG             Release tag (e.g. v0.2.0-rc2) or 'latest' (default: latest)
   --from-dir PATH       Install from a local directory containing the archive + SHA256SUMS.txt
   --prefix DIR          Install prefix for `bin/lucidd` (default: ~/.local)
   --app                 macOS Apple Silicon only: install LUCID.app to ~/Applications/LUCID.app
   --install-systemd     Linux only: install user systemd service + example env (never overwrites existing env)
+  --setup-relay IP      Linux only: install systemd unit, write infrastructure.env with IP, and print next steps
   -h, --help            Show this help
 EOF
 }
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --prefix) PREFIX="$2"; shift 2 ;;
         --app) INSTALL_APP=1; shift ;;
         --install-systemd) INSTALL_SYSTEMD=1; shift ;;
+        --setup-relay) SETUP_RELAY_IP="$2"; INSTALL_SYSTEMD=1; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -170,12 +173,22 @@ if [[ "$INSTALL_SYSTEMD" -eq 1 ]]; then
     UNIT_SRC="$(find "$UNPACK" -type f -path '*/systemd/lucidd-relay.service' -print -quit)"
     ENV_SRC="$(find "$UNPACK" -type f -path '*/config/infrastructure.env.example' -print -quit)"
     mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/lucidd"
+    chmod 700 "$HOME/.config/lucidd"
     if [[ -n "$UNIT_SRC" ]]; then
-        install -m 0644 "$UNIT_SRC" "$HOME/.config/systemd/user/lucidd-relay.service"
-        echo "Installed unit: $HOME/.config/systemd/user/lucidd-relay.service"
+        UNIT_DST="$HOME/.config/systemd/user/lucidd-relay.service"
+        sed "s|ExecStart=%h/bin/lucidd|ExecStart=${PREFIX}/bin/lucidd|" "$UNIT_SRC" > "$UNIT_DST"
+        chmod 0644 "$UNIT_DST"
+        echo "Installed unit: $UNIT_DST (ExecStart=${PREFIX}/bin/lucidd)"
     fi
-    if [[ -n "$ENV_SRC" && ! -f "$HOME/.config/lucidd/infrastructure.env" ]]; then
-        install -m 0600 "$ENV_SRC" "$HOME/.config/lucidd/infrastructure.env"
-        echo "Seeded template: $HOME/.config/lucidd/infrastructure.env (edit before enabling service)"
+    ENV_DST="$HOME/.config/lucidd/infrastructure.env"
+    if [[ -n "$SETUP_RELAY_IP" ]]; then
+        printf '# Configured by install-lucid.sh --setup-relay\nLUCIDD_EXTERNAL_ADDRESS=/ip4/%s/tcp/4001\nLUCIDD_LIBP2P_PORT=4001\n' "$SETUP_RELAY_IP" > "$ENV_DST"
+        chmod 0600 "$ENV_DST"
+        echo "Wrote relay config: $ENV_DST"
+        echo "Next: open TCP 4001, then run:"
+        echo "  systemctl --user daemon-reload && systemctl --user enable --now lucidd-relay.service"
+    elif [[ -n "$ENV_SRC" && ! -f "$ENV_DST" ]]; then
+        install -m 0600 "$ENV_SRC" "$ENV_DST"
+        echo "Seeded template: $ENV_DST (edit before enabling service)"
     fi
 fi

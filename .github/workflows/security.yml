@@ -195,3 +195,49 @@ jobs:
           print(json.dumps({'app_bundle': 'verified', 'architecture': build['architecture'],
                             'daemon_sha256': digest, 'source_commit': build['source_commit']}))
           PY
+
+  # --- Cross-platform Tauri v2 desktop app -------------------------------
+  desktop-tauri:
+    name: desktop app (Tauri v2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Linux WebKit/GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/lucid-desktop/src-tauri -> apps/lucid-desktop/src-tauri/target
+
+      - name: Frontend type-check and production build
+        working-directory: apps/lucid-desktop
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: Build lucidd sidecar and verify Tauri Rust tests & clippy
+        run: |
+          cargo build -p lucidd --locked
+          bash apps/lucid-desktop/stage-sidecar.sh target/debug/lucidd
+          cargo test --manifest-path apps/lucid-desktop/src-tauri/Cargo.toml
+          cargo clippy --manifest-path apps/lucid-desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
