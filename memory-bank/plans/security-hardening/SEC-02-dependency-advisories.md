@@ -20,20 +20,20 @@ wasmtime sandbox escape + SEC-01's anonymous-WASM-execution = anonymous remote h
 2. wasmtime: try the minimal bump that clears the advisories first (`cargo update -p wasmtime --precise <ver>`); if that pulls a semver-incompatible line, update Cargo.toml and migrate the runtime API. **Verify hello.wasm still produces byte-identical `dlroW ,olleH`** (the existing M7 acceptance test) and module hash unchanged after the bump.
 3. hickory: `cargo update -p hickory-resolver`; confirm `--bootstrap-dns bootstrap.phasebased.net` still resolves + dials (the live test from this session).
 4. nix: bump the dependent; rebuild.
-5. Rebuild all three dist targets (aarch64-darwin, aarch64-linux, x86_64-linux), refresh `dist/`, redeploy umbp's relay binary.
+5. Rebuild all three dist targets (aarch64-darwin, aarch64-linux, x86_64-linux), refresh `dist/`, redeploy Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)'s relay binary.
 6. `cargo audit` → confirm the vuln count drops to 0 (unmaintained warnings remain → SEC-12).
 
 ## Acceptance criteria
 - `cargo audit` reports **0 vulnerabilities** (4 unmaintained warnings acceptable, tracked in SEC-12).
 - hello.wasm round-trip byte-identical post-wasmtime-bump.
 - `--bootstrap-dns` still works against the live TXT record.
-- All three dist binaries rebuilt; umbp relay restarted on the new binary.
+- All three dist binaries rebuilt; Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) relay restarted on the new binary.
 - 210 tests pass.
 
 ## Test plan
 - `cargo audit` before/after.
 - plasm hello.wasm round-trip (`crates/plasm/examples/peer_id_check.rs` + the WASM test).
-- lucidd DNS bootstrap live test (Mac → umbp via `--bootstrap-dns`).
+- lucidd DNS bootstrap live test (Mac → Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) via `--bootstrap-dns`).
 
 ## Dependencies
 None. Run parallel to SEC-01/SEC-03. **But SEC-00's CI gate should turn green only after this lands.**

@@ -29,7 +29,7 @@ Note this compounds with SEC-02's hickory-proto CVEs (a malicious resolver can a
 - Unit test: a synthetic TXT set of 1000 records → only N kept.
 - Unit test: a record without `/p2p/` → rejected.
 - Unit test: a well-formed record with `/p2p/<id>` → accepted.
-- Live regression: Mac `--bootstrap-dns bootstrap.phasebased.net` still dials umbp.
+- Live regression: Mac `--bootstrap-dns bootstrap.phasebased.net` still dials Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM).
 
 ## Dependencies
 None for the caps/validation. The hickory-proto CVE fix is SEC-02 (do that too — they're the same attack surface from different angles).

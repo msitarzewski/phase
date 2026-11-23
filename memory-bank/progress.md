@@ -1,12 +1,20 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-11-09
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint
-**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Approved source `1356ef65…d847` is green on macOS ARM64 and native UMBP Ubuntu x86_64. Checkpoint commit/push was approved on 2026-08-10; no v0.2 tag or production deployment exists.
+**Last Updated**: 2026-11-22
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint + consumer macOS app & efficiency pass
+**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Local macOS ARM64 QA passes 492 Rust tests (2 ignored) and 11 Swift tests on `feat/lucid-consumer-experience`; soup-to-nuts physical qualification (Cloud Relay sole static-IP relay + behind-NAT Ubuntu Desktop, Ubuntu Laptop, Mac M1 Max + cellular Mac M5 Max consumer) is planned with installable release bundles and ready to run.
 
 ---
 
 ## Major Deliverables
+
+### Workspace/runtime efficiency & physical qualification plan (2026-11-22)
+
+- Completed the workspace, build/CI, runtime hot-path, and structural efficiency pass on `feat/lucid-consumer-experience`: reclaimed ~140 GB net of stale build/cross-target/boot/validation blob bloat, removed committed v0.1.0 binaries under `dist/`, unified `[workspace.dependencies]` (eliminating `tower 0.4`, `tower-http 0.5`, and `native-tls` from `Cargo.lock` and dropping unused `phase-net`/`phase-manifest` deps from `phase-artifact-server`), batched `scripts/phase-validate.sh` fingerprinting and removed duplicate `qualification` test re-runs, and split `rustfmt` into a fast CI job.
+- Fixed concrete hot paths: lock-free `DashMap` fast path in `LlamaCppWorker::ensure_loaded`, shared `wasmtime::Engine`/`Linker` + 64-module SHA-256 cache + `StoreLimits` in `plasm`, zero-clone `CompiledPolicy` + reusable `sysinfo::Components` in `PolicyEngine`, shared zero-extra-allocation `crates/lucidd/src/backend_io.rs` for `worker_llama` and `worker_mlx`, `O(n)` `sanitize_for_log` + async `tokio::fs::metadata` in `ollama`, `hex::encode` in `ModelCid::to_hex`, zero-clone `canonical.rs` sorting, concurrent `async let` + event-driven shutdown + background polling backoff in `apps/lucid-macos`, and split 7 oversized Rust modules into `<mod>/mod.rs` + `<mod>/tests.rs`.
+- Added installable release automation (`.github/workflows/release.yml`, `scripts/install-lucid.sh`, `scripts/fleet-install.sh`, `.phase-fleet.env.example` + gitignored `.phase-fleet.local.env`) and scrubbed private hostnames, SSH aliases, usernames, and real IPs from repository documentation.
+- Verification on Mac M5 Max (128GB RAM, macOS 27.3 b2, Rust 1.100, Swift 6.4.2): **492 Rust tests passed / 0 failed / 2 ignored**, **11 Swift tests passed / 0 failed (`-warnings-as-errors`)**, `cargo fmt`, strict `cargo clippy --workspace --all-targets -- -D warnings`, `cargo audit` (0 vulnerabilities, 4 allowed transitive unmaintained warnings), and `cargo deny` (`advisories/bans/licenses/sources ok`).
+- Documented the complete physical fleet soup-to-nuts test plan (Cloud Relay sole static public IPv4 relay + behind-NAT Ubuntu Desktop (5060ti 16GB, 32GB RAM), Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM), Mac M1 Max (32GB RAM) + cellular Mac M5 Max (128GB RAM) consumer) in [intended-stream-vertical-slice.md](releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22) and recorded the task in [261122_workspace-and-runtime-efficiency.md](tasks/2026-11/261122_workspace-and-runtime-efficiency.md). No v0.2 release gate is promoted until physical multi-network, MLX, and Linux runs produce attributable evidence.
 
 ### CI security and test reliability refresh (2026-11-09)
 
@@ -22,7 +30,7 @@
 - Extended the existing research document with a primary-source competitive map, direct OpenHydra/KwaaiNet comparison, verification-method references, evidence limits and review triggers. Earlier June claims remain historical and explicitly unvalidated for current positioning.
 - Updated public/daemon READMEs and mission language to distinguish shipped software, the v0.2 checkpoint, transcript integrity, computation correctness and unqualified privacy goals. Corrected the stale claim that PeerId binding bypasses the submitter allowlist; current inbound code requires authorization and binding.
 - Extended the existing trust, whole-model-baseline and physical-test specifications with concrete experiments, method-selection gates, actor commands and cleanup/evidence requirements. No independent correctness validator, tensor scheduler or LUMEN implementation was added.
-- Rechecked current host prerequisites over SSH: beacon has no running Phase actor/4001 listener; historical pip is unreachable; pipx is Linux/NVIDIA and lacks Phase/backend tooling. These observations do not qualify the physical intended stream or Apple MLX.
+- Rechecked current host prerequisites over SSH: Cloud Relay has no running Phase actor/4001 listener; historical Apple Silicon host is unreachable; Ubuntu Desktop (5060ti 16GB, 32GB RAM) is Linux/NVIDIA and lacks Phase/backend tooling. These observations do not qualify the physical intended stream or Apple MLX.
 - Fresh Rust 1.99 compatibility fixes box internal HTTP error responses and scope generated-code lint annotations to the affected async_trait traits. The existing test port allocator now reserves disjoint whole ranges below standard ephemeral ports, and fixture stderr can be retained for diagnosis. No dependency, authorization or public API contract changed.
 - Full workspace follow-up: 460 tests passed / 2 ignored, formatting and strict Clippy passed (`target/phase-validation/20261107T184728Z-43089/`). The installed real llama-server/Gemma smoke passed separately. This is macOS/local evidence, not Linux, MLX or public-network qualification.
 - Repeated backend runs remain imperfect: a six-run diagnostic campaign passed five times and failed once with a fixture startup `Address already in use` error. That failure is retained and not waived. Further investigation/public-host setup awaits the AGENTS.md retry/time-budget extension requested from the owner. The initially observed failures remain at `target/phase-validation/20261107T182908Z-24926/`.
@@ -35,21 +43,21 @@
 | Content | Content-derived CIDs, signed alias/provider records, rollback protection, bounded resumable blob transfer, verified atomic catalog/install, real pull coordinator | Physical multi-GB pull/resume/provider failover and cold third-node resolution |
 | Live relay | v2 ordered substream, immediate event delivery, cancellation, backpressure, shared v1/v2 limits/replay cache, exact receipt binding | Physical two-peer first-token/cancellation and 100+ stream resource evidence |
 | Reachability | Circuit relay server/client, AutoNAT, rendezvous client/optional-server surfaces, DCUtR, explicit infrastructure roles, path observation and bounded loopback QA | Public rendezvous admission quotas, real consumer NAT, DCUtR upgrade/failure, hostile/VPN network matrix |
-| Operations | Hardened user service/config, reusable evidence runner, resource-bounded UMBP native qualification, approved independent DigitalOcean foundation topology | Provision/deploy the public node, geographic fleet, DNS/default bootstrap, monitoring and independent clean-host/failure drills |
+| Operations | Hardened user service/config, reusable evidence runner, resource-bounded Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) native qualification, approved independent DigitalOcean foundation topology | Provision/deploy the public node, geographic fleet, DNS/default bootstrap, monitoring and independent clean-host/failure drills |
 | Reputation | Private attributable evidence, corruption/retention/compaction, decay/confidence/cold start, operator precedence, bounded deterministic redundancy | Multi-peer divergence/Sybil/load/network-partition acceptance and threat-model approval |
 | ShardWorker | Prerequisite evidence/redundancy primitives only | Blocked: partial-tensor determinism/verification study and approved ADR; no worker exists |
 | MLX | Pinned runtime/bundle subprocess worker, strict mutation/SSE/cancellation/resource checks, shared receipt/API path | Real Apple Silicon model, peer routing, lifecycle, performance/power acceptance |
-| Qualification | macOS ARM64 460 passed/2 ignored; UMBP Linux x86_64 release + 450 passed/2 ignored + strict Clippy; isolated HTTP smoke; zero vulnerabilities | Linux ARM64, full physical interoperability/NAT, MLX, rollback, clean-host and claims audit |
+| Qualification | macOS ARM64 460 passed/2 ignored; Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) Linux x86_64 release + 450 passed/2 ignored + strict Clippy; isolated HTTP smoke; zero vulnerabilities | Linux ARM64, full physical interoperability/NAT, MLX, rollback, clean-host and claims audit |
 
-The UMBP production relay was not upgraded or restarted during qualification. It remained active on PID `106521` with zero restarts; the temporary loopback smoke service was removed and port `11435` closed. Evidence and exact commands are recorded in `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md` and the authoritative tracker at `releases/lucid-v0.2/README.md`.
+The Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) production relay was not upgraded or restarted during qualification. It remained active on PID `106521` with zero restarts; the temporary loopback smoke service was removed and port `11435` closed. Evidence and exact commands are recorded in `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md` and the authoritative tracker at `releases/lucid-v0.2/README.md`.
 
 ### External intended-stream staging APPROVED (2026-08-10; deployment pending)
 
 - Use a DigitalOcean Ubuntu x86_64 host with Reserved IPv4 as the independent public foundation actor. Run the bounded `lucidd --mode infrastructure` service locally on public TCP `4001`; do not redirect Phase traffic to the Sonic DHCP address.
-- Terminate TCP `80/443` in Caddy on the public host and proxy only the existing web origins to UMBP through Tailscale. Keep LUCID HTTP loopback-only and Ollama private.
+- Terminate TCP `80/443` in Caddy on the public host and proxy only the existing web origins to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) through Tailscale. Keep LUCID HTTP loopback-only and Ollama private.
 - Start at 1 vCPU, 2 GB RAM, and 50 GB disk; build artifacts elsewhere. Resize temporarily for saturation evidence if measurement requires it.
-- Use Pip (M1 iMac, 16 GB) as the Apple Silicon contributor/MLX candidate and an external-network Apple Silicon development machine as requester. Tailscale is an administrative path, not the acceptance data path.
-- UMBP is being snapshotted before its Ubuntu 26.04 LTS upgrade. Post-upgrade qualification must verify SSH/Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, and TCP `4001` before it is considered healthy.
+- Use Mac M1 Max (32GB RAM) (M1 iMac, 16 GB) as the Apple Silicon contributor/MLX candidate and an external-network Apple Silicon development machine as requester. Tailscale is an administrative path, not the acceptance data path.
+- Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) is being snapshotted before its Ubuntu 26.04 LTS upgrade. Post-upgrade qualification must verify SSH/Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, and TCP `4001` before it is considered healthy.
 - The public daemon currently enables bounded relay and AutoNAT roles but intentionally leaves rendezvous serving off because upstream TTL bounds do not supply required global/per-peer/per-namespace admission quotas (`crates/lucidd/src/main.rs:756-765`). This remains an explicit reachability gate, not a hidden deployment assumption.
 
 ---
@@ -129,7 +137,7 @@ The inference flagship was built in a continuation of the same sprint. Eight of 
 - [x] **M5** — Local-or-DHT Router. `RouteVia::{Local, Peer, Refused}`. `X-Lucid-Local-Only` request header parsed; `X-Lucid-Routed-Via` response header set; 503 + reason on Refused. Peer relay via libp2p `request_response::cbor::Behaviour` on `/phase/job-relay/1.0.0` (5min timeout). **Peer-relay is batch (full Vec<JobEvent> ships in one CBOR response) in v0.1; token streaming across the relay is a v0.2 polish target.**
 - [x] **M6** — Model Registry on DHT. `SignedModelAdvertisement` (bincode + Ed25519). Key layout: `b"phase/model/" || model_cid` (44 bytes). 5-min TTL refresh task per loaded model; withdraw aborts refresh; Drop cancels all. Persistent identity from phase-identity ensures advertisements survive daemon restart with the same peer_id. `DhtTransport` trait as the seam, with `PhaseNetDhtTransport` wrapping `Arc<Discovery>`.
 - [x] **M7** — Policy + auto-pause. Declarative `lucid-policy.toml` (default at `~/.config/lucidd/policy.toml`). Decision order: Manual → OnBattery → ThermalLimit → OutsideTimeWindow → ConcurrencyLimit → ModelNotInAllowlist → Allow. Battery state via the `battery` crate; thermals via `sysinfo`. Config reload via `notify` filesystem watch + SIGHUP. Windows stubs return None (no battery/thermal pauses fire). 24 unit tests cover every decision branch.
-- [x] **M8** — **Live two-node end-to-end demo DONE 2026-05-28.** Mac M5 Max (128GB) hosting Qwen3-Next 35B-A3B on Metal; Ubuntu ARM64 in Parallels at 10.211.55.5 running `lucidd --no-local-worker`. `curl localhost:11434/api/chat` from inside the VM routed via Phase DHT to Mac, streamed back NDJSON with `x-lucid-routed-via: peer:ctCUGwkd`. Asciinema recording at `dist/demos/lucid-2node-demo.cast`. Three v0.1 bugs landed during the demo session — see `activeContext.md#three-bugs-the-demo-found`.
+- [x] **M8** — **Live two-node end-to-end demo DONE 2026-05-28.** Mac M5 Max (128GB) hosting Qwen3-Next 35B-A3B on Metal; Ubuntu ARM64 in Parallels at <vm-local-ip> running `lucidd --no-local-worker`. `curl localhost:11434/api/chat` from inside the VM routed via Phase DHT to Mac, streamed back NDJSON with `x-lucid-routed-via: peer:ctCUGwkd`. Asciinema recording at `dist/demos/lucid-2node-demo.cast`. Three v0.1 bugs landed during the demo session — see `activeContext.md#three-bugs-the-demo-found`.
 
 ### v0.2 substrate prep — first foundation relay (2026-05-28 late evening)
 
@@ -146,7 +154,7 @@ After the LAN demo proved the protocol works, the same session brought the subst
 | New x86_64-linux dist target + README | `dist/lucidd-0.1.0-x86_64-unknown-linux-gnu/` |
 | User-level systemd unit for relay mode | `crates/lucidd/systemd/lucidd-relay.service` |
 
-First foundation relay: peer_id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB`, public mAddr `/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`, running under `systemctl --user lucidd-relay.service` with `Linger=yes`. Connection from a fresh Mac lucidd via `--bootstrap-peer` confirmed in tens of ms.
+First foundation relay: peer_id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB`, public mAddr `/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`, running under `systemctl --user lucidd-relay.service` with `Linger=yes`. Connection from a fresh Mac lucidd via `--bootstrap-peer` confirmed in tens of ms.
 
 The full coffee-shop / NAT-traversal story (`libp2p::relay::server::Behaviour` + DCUtR + rendezvous) is the real v0.2 substantive engineering. This session built the prerequisite: a node that other peers can find by name and dial without prior introduction.
 
@@ -171,7 +179,7 @@ See [memory-bank/releases/lucid/](releases/lucid/) for the full release plan.
 
 ### Security Hardening SHIPPED (2026-05-28 → 31; PR #9 merged to `main` `73fa907`, deployed live)
 
-A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of file carries the per-finding remediation table) found sound crypto primitives but an **unenforced trust model**, **20 dependency advisories** (incl. wasmtime sandbox escapes), and a **PHP SDK verification bypass**. The 14-task plan (`memory-bank/plans/security-hardening/`) was executed by an agent team in 5 integration-verified waves, **merged to `main` (PR #9), and deployed to the live umbp foundation relay** (hardened binary, peer id preserved, DNS intact). Validated green on three independent environments (Mac native, Docker cross, vanilla Ubuntu 26.04 ARM64 `scratch` box). New standing infra: `scratch` clean-room build/test VM (see `activeContext.md`).
+A 5-agent adversarial security audit (`SECURITY-AUDIT-2026-05-28.md`, top of file carries the per-finding remediation table) found sound crypto primitives but an **unenforced trust model**, **20 dependency advisories** (incl. wasmtime sandbox escapes), and a **PHP SDK verification bypass**. The 14-task plan (`memory-bank/plans/security-hardening/`) was executed by an agent team in 5 integration-verified waves, **merged to `main` (PR #9), and deployed to the live Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) foundation relay** (hardened binary, peer id preserved, DNS intact). Validated green on three independent environments (Mac native, Docker cross, vanilla Ubuntu 26.04 ARM64 Ubuntu ARM64 VM box). New standing infra: Ubuntu ARM64 VM clean-room build/test VM (see `activeContext.md`).
 
 | Task | Finding | Fix |
 |---|---|---|
@@ -198,7 +206,7 @@ See [memory-bank/plans/security-hardening/](plans/security-hardening/) for the f
 
 ---
 
-### LUCID v0.1.1 SHIPPED (2026-06-09; PRs #10–#13 merged to `main` `0aefbb2`, umbp redeployed)
+### LUCID v0.1.1 SHIPPED (2026-06-09; PRs #10–#13 merged to `main` `0aefbb2`, Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) redeployed)
 
 The post-security gap-closure sprint. Closed the v0.1.1 feature gaps, then validated on real hardware — which surfaced and fixed three latent bugs the unit tests couldn't see.
 
@@ -210,10 +218,10 @@ The post-security gap-closure sprint. Closed the v0.1.1 feature gaps, then valid
 | **#13** | llama nested `/embedding` parse | The native `llama-server` `/embedding` wraps the pooled vector as `[[...]]`; the parser expected a flat array and returned **zero** vectors. Found via real-GPU validation. |
 
 **Validated on real hardware (2026-06-09):**
-- `scratch` (ARM64): build + tests + live `/api/embed`·`/api/embeddings`·`/api/pull` against the echo worker.
+- Ubuntu ARM64 VM (ARM64): build + tests + live `/api/embed`·`/api/embeddings`·`/api/pull` against the echo worker.
 - M5 Max (Apple Metal): real embeddings via `llama-server --embeddings` + `nomic-embed-text-v1.5` — `/api/embed` → 768-dim vectors, correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
-- Two-node authz demo (`scratch`): default-deny **rejects** an unauthorized routed job; escape hatch **accepts** + routes (`X-Lucid-Routed-Via: peer:…`) + `X-Lucid-Receipt-Verified: true`.
-- **umbp relay redeployed** to `0aefbb2` (x86_64 cross-build, peer id `12D3KooWJ6vTjo6yFgEc…` preserved, old binary backed up).
+- Two-node authz demo (Ubuntu ARM64 VM): default-deny **rejects** an unauthorized routed job; escape hatch **accepts** + routes (`X-Lucid-Routed-Via: peer:…`) + `X-Lucid-Receipt-Verified: true`.
+- **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) relay redeployed** to `0aefbb2` (x86_64 cross-build, peer id `12D3KooWJ6vTjo6yFgEc…` preserved, old binary backed up).
 
 **Final gate:** 266 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulnerabilities, `cargo deny check` ok.
 
@@ -590,42 +598,6 @@ Boot from DHT → Run plasmd serve → Advertise to DHT → Serve others
 
 ---
 
-## Active Work
-
-### Current Sprint (Nov 2025)
-**Status**: ✅ **MVP COMPLETE + Phase Boot Implemented**
-
-**Completed in November 2025**:
-- ✅ Milestone 1: Local WASM Execution (5/5 tasks)
-- ✅ Milestone 2: Peer Discovery (6/6 tasks)
-- ✅ Milestone 3: Remote Execution (6/6 tasks)
-- ✅ Milestone 4: Packaging & Demo (6/6 tasks)
-- ✅ Library + Binary Pattern Refactor (architectural improvement)
-- ✅ **Phase Boot M1-M7**: Full boot system implementation (54 files, 14,395 lines)
-
-**Project Status**:
-- Phase Open MVP: Production-ready for Debian/Ubuntu deployments
-- Phase Boot: Ready for hardware testing (USB, VM)
-
----
-
-## Blockers & Issues
-
-### Current Blockers
-- **libp2p 0.53 API**: `SwarmBuilder::with_tokio()` doesn't exist - needs updated docs reference
-
-### Known Issues
-- Remote transport not implemented (local execution only) - network transport in M4
-- Signing keys ephemeral (generated per session) - persistence in M4
-- WASM stdout inherited, not captured in-memory (works but not ideal)
-
-### Risks Being Monitored
-- wasm3 maintenance status (mitigation: plan wasmtime migration)
-- Cross-platform testing complexity (mitigation: GitHub Actions CI)
-- NAT traversal reliability (mitigation: relay nodes in Milestone 2)
-
----
-
 ## Key Metrics
 
 ### Code Quality (Target)
@@ -684,11 +656,11 @@ Nov 2025: ██████████ Milestone 4 (Packaging & Demo) ✅
 
 ## Next Review Date
 
-**Date**: After the DigitalOcean deployment and UMBP post-upgrade audit
+**Date**: After the DigitalOcean deployment and Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) post-upgrade audit
 **Agenda**:
 - Record the public foundation PeerId/address, service version, firewall, and health evidence.
-- Record UMBP upgrade/recovery evidence without overwriting its identity.
-- Run or schedule the external requester → public relay → Pip contributor acceptance matrix.
+- Record Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) upgrade/recovery evidence without overwriting its identity.
+- Run or schedule the external requester → public relay → Mac M1 Max (32GB RAM) contributor acceptance matrix.
 - Update milestone counts only when the tracker acceptance criteria and human approval gates pass.
 
 ---

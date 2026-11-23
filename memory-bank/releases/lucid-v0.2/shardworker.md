@@ -197,4 +197,4 @@ These packages activate only if the research gate permits them.
 - The next scale experiment is whole-model independent-job parallelism with exact model binding and independently attributable validation. It is a prerequisite/control baseline, not a ShardWorker implementation.
 - The existing open-problem record at `memory-bank/decisions.md#2026-05-29-verifying-sharded--partial-computation-is-an-unsolved-open-problem-recorded-risk` remains controlling.
 - Unblock only after the determinism/adversarial-injection study and verification ADR specify measurable guarantees, costs, exclusions, and client-visible trust labels. Until then authorization remains default-deny and the public release must not imply sharding shipped.
-- Related implementation checkpoint: [2026-08-09 task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Related implementation checkpoint: [2026-08-09 task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).

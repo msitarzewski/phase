@@ -17,6 +17,7 @@ composer.lock
 
 # Binaries
 *.wasm
+dist/lucidd-*/lucidd
 
 # IDE
 .vscode/
@@ -44,3 +45,12 @@ identity.key
 **/identity.key
 *.key
 !keys/*.pub.placeholder
+
+# Local daemon control credentials and one-use enrollment invitations.
+*.control-token
+control-*.token
+*.lucidinvite
+
+# Private local fleet topology / SSH / relay configuration (never commit hostnames or IPs).
+.phase-fleet.local.env
+*.local.env

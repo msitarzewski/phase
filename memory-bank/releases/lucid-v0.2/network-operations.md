@@ -132,7 +132,7 @@ Targets must be measured and approved before release rather than guessed here. A
 
 ### Current host preflight — 2026-11-07
 
-The existing SSH aliases were checked read-only. `beacon` is reachable and runs Caddy, but has no Phase checkout/toolchain, running `lucidd`, TCP 4001 listener or Phase ingress rule. The historical `pip` alias timed out; `pipx` is reachable Linux x86_64 with a 16-GB NVIDIA GPU and real model directories, but lacks Phase/llama-server/Ollama tooling. Do not substitute these observations for a verified physical/NAT topology or Apple Silicon acceptance. No standing service, DNS, Caddy or firewall configuration was changed during the preflight.
+The existing SSH aliases were checked read-only. Cloud Relay is reachable and runs Caddy, but has no Phase checkout/toolchain, running `lucidd`, TCP 4001 listener or Phase ingress rule. The historical historical Apple Silicon host alias timed out; Ubuntu Desktop (5060ti 16GB, 32GB RAM) is reachable Linux x86_64 with a 16-GB NVIDIA GPU and real model directories, but lacks Phase/llama-server/Ollama tooling. Do not substitute these observations for a verified physical/NAT topology or Apple Silicon acceptance. No standing service, DNS, Caddy or firewall configuration was changed during the preflight.
 
 Use the existing [intended-stream runbook](./intended-stream-vertical-slice.md#operator-runbook--2026-11-07) for isolated binary/state staging, exact source evidence, scoped ingress/rollback, operator authorization and cleanup. Install and qualify the selected backend before enabling a public contributor. The August topology below remains historical planning until the current actors and paths are qualified.
 
@@ -147,13 +147,13 @@ Use the existing [intended-stream runbook](./intended-stream-vertical-slice.md#o
 - Hardened the existing user-systemd infrastructure service with loopback-only HTTP, operator-owned external address configuration, restart limits, filesystem/device/kernel restrictions, and bounded CPU/memory/task resources at `crates/lucidd/systemd/lucidd-relay.service:1-66`.
 - Added a documented non-secret infrastructure environment template at `crates/lucidd/systemd/infrastructure.env.example` and bounded infrastructure-role CLI validation in `crates/lucidd/src/main.rs`.
 - Formalized reusable Phase validation profiles and fingerprinted evidence capture in `scripts/phase-validate.sh`; the Linux profile runs offline locked release build, tests, and strict Clippy at `scripts/phase-validate.sh:410-420`.
-- Ran the exact source natively on UMBP under a transient resource-bounded user unit. The standing production relay remained active on PID `106521` with zero restarts; the isolated smoke service used loopback port `11435` and was removed after verification.
+- Ran the exact source natively on Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) under a transient resource-bounded user unit. The standing production relay remained active on PID `106521` with zero restarts; the isolated smoke service used loopback port `11435` and was removed after verification.
 - Remaining before completion: geographic relay inventory, DNS/default-bootstrap rollout, monitoring/status surface, clean-host independent operator drill, saturation/site-loss/identity-rotation drills, and traceable deployment of a release artifact. Caddy was not changed by this checkpoint.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).
 
 ## 2026-08-10 approved first external deployment
 
-The first independent foundation site will be a small DigitalOcean Ubuntu x86_64 host with a Reserved IPv4. It runs Phase infrastructure directly rather than forwarding Phase traffic to UMBP’s DHCP-assigned Sonic address.
+The first independent foundation site will be a small DigitalOcean Ubuntu x86_64 host with a Reserved IPv4. It runs Phase infrastructure directly rather than forwarding Phase traffic to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)’s DHCP-assigned Sonic address.
 
 ### Initial resource envelope
 
@@ -165,18 +165,29 @@ The first independent foundation site will be a small DigitalOcean Ubuntu x86_64
 ### Port and trust boundaries
 
 - Public TCP `4001` terminates at the local `lucidd --mode infrastructure`; it is the current stable Phase TCP listener (`crates/lucidd/src/main.rs:772-803`).
-- Public TCP `80` redirects to HTTPS at local Caddy. Public TCP `443` terminates TLS at local Caddy and may reverse-proxy existing web services to UMBP over Tailscale.
-- The Caddy upstream is UMBP’s tailnet identity/address, not the mutable Sonic public address. This stabilizes web ingress but does not make the web origin independent of UMBP.
+- Public TCP `80` redirects to HTTPS at local Caddy. Public TCP `443` terminates TLS at local Caddy and may reverse-proxy existing web services to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) over Tailscale.
+- The Caddy upstream is Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)’s tailnet identity/address, not the mutable Sonic public address. This stabilizes web ingress but does not make the web origin independent of Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM).
 - The LUCID HTTP API remains bound to `127.0.0.1`; Ollama TCP `11434` is never public (`crates/lucidd/systemd/lucidd-relay.service:28-33`).
 - SSH administration uses Tailscale or a tightly restricted source rule. Tailscale is an administration/recovery plane, not Phase acceptance evidence.
 - The host receives a unique persistent Phase identity. Reserved-IP reassignment must not clone one live identity onto multiple sites.
 
 ### Rollout sequence and current state
 
-1. Complete UMBP’s backup snapshot and Ubuntu 26.04 LTS upgrade.
-2. Re-qualify UMBP SSH/Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, identity, and TCP `4001` before treating it as healthy.
+1. Complete Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)’s backup snapshot and Ubuntu 26.04 LTS upgrade.
+2. Re-qualify Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) SSH/Tailscale, Caddy, Docker/Ollama, `lucidd`, firewall, identity, and TCP `4001` before treating it as healthy.
 3. Provision the external host, apply firewall/time-sync/resource/log controls, install the exact qualified release artifact, and record its PeerId and external multiaddr.
-4. Point public web DNS at the Reserved IP only after Caddy-to-UMBP tailnet proxying is verified. Publish Phase bootstrap/relay coordinates separately.
-5. Run the external requester → DigitalOcean relay → Pip contributor matrix and retain attributable evidence.
+4. Point public web DNS at the Reserved IP only after Caddy-to-Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) tailnet proxying is verified. Publish Phase bootstrap/relay coordinates separately.
+5. Run the external requester → DigitalOcean relay → Mac M1 Max (32GB RAM) contributor matrix and retain attributable evidence.
 
 Provisioning and testing are pending. Public rendezvous serving is also pending: the daemon intentionally disables it because the upstream store lacks the required hard registration quotas (`crates/lucidd/src/main.rs:756-765`). The first site can still provide bootstrap, DHT, bounded circuit relay, and AutoNAT service.
+
+## 2026-11-22 active test fleet assignment
+
+Current physical machines available for end-to-end operational testing (private SSH aliases and real IPs stay in gitignored `.phase-fleet.local.env`; see [physical fleet test plan](./intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22)):
+
+- **Cloud Relay** (DigitalOcean Ubuntu x86_64) — **sole host directly connected to the internet with a static external IPv4**. Primary public infrastructure relay/bootstrap (`--mode infrastructure`, TCP `4001`). Existing web traffic flows `Internet (80/443) → Cloud Relay (Caddy) → Tailscale → Ubuntu Desktop (Caddy)` and must remain completely untouched; Phase TCP `4001` terminates directly at `lucidd` on Cloud Relay (never via Caddy or Tailscale). Installs verified release bundles via `scripts/install-lucid.sh --install-systemd` (no Rust toolchain needed on the host).
+- **Ubuntu Desktop (5060ti 16GB, 32GB RAM)** — Ubuntu 26.04 LTS x86_64, behind home NAT; also hosts Caddy behind Cloud Relay's Tailscale web proxy. Primary CUDA contributor and Content Provider #1 (`--worker llama-cpp --serve-model-content`); keep `lucidd` HTTP strictly on `127.0.0.1` and never expose it through Caddy.
+- **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** — Ubuntu 26.04 LTS x86_64, behind home NAT. Primary Linux x86_64 qualification host (`scripts/phase-validate.sh linux`) and behind-NAT Content Provider #2 (`--serve-model-content`).
+- **Mac M1 Max (32GB RAM)** — macOS 27.x, Apple Silicon, behind home NAT. Apple Silicon Contributor #2 (`llama-cpp` Metal + real `--worker mlx`).
+- **Mac M5 Max (128GB RAM)** — macOS 27.3 b2, Apple Silicon, on a cellular hotspot (daily driver). Clean consumer running the installed `LUCID.app` (`--mode consume-only --outbound-only`) and CLI pull/DCUtR tests, plus macOS QA lead and Ubuntu ARM64 VM host for Linux ARM64 qualification.
+- *Multi-site gap:* A second independent static-IP cloud relay site is still required later for multi-site loss, geographic bootstrap, and DNS-rotation drills.

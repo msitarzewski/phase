@@ -34,6 +34,6 @@ asciinema play lucid-2node-demo.cast
 
 ## Notes
 
-- The Linux VM was on Parallels' Shared Network at `10.211.55.5`. The Mac was at `10.211.55.2`. Both addresses are auto-assigned by Parallels and meaningless outside the host.
+- The Linux VM was on Parallels' Shared Network at `<vm-local-ip>`. The Mac was at `<vm-local-ip>`. Both addresses are auto-assigned by Parallels and meaningless outside the host.
 - The demo uses the v0.1 *batch* peer-relay protocol — the serving peer drains the full inference stream into a `Vec<JobEvent>` and ships the whole vector as one CBOR response. Token streaming across the libp2p substream is a v0.2 polish target.
 - `x_phase_commitment` is computed via the SHA-256 chain in `phase-protocol`'s `CommitmentAccumulator`. A verifier can replay the streamed tokens and confirm the hash matches.

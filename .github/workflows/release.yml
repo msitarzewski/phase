@@ -1,0 +1,154 @@
+# Build and publish installable LUCID release bundles (Linux x86_64, Linux ARM64,
+# macOS Apple Silicon CLI + native LUCID.app) with SHA-256 checksums.
+#
+# Triggered automatically on `v*` tags or manually via `workflow_dispatch` (e.g.
+# prerelease test candidates so every test machine installs via
+# `scripts/install-lucid.sh` with zero manual file copying).
+
+name: Release Bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update (e.g. v0.2.0-rc1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as a prerelease"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and verify release bundle
+        run: |
+          cargo fetch --locked
+          scripts/phase-validate.sh --evidence-dir "$RUNNER_TEMP/release-out" release
+          mkdir -p dist-upload
+          cp "$RUNNER_TEMP"/release-out/*/lucidd-*-${{ matrix.target }}.tar.gz dist-upload/
+
+      - name: Upload Linux bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: dist-upload/*.tar.gz
+
+  build-macos:
+    name: Build macOS Apple Silicon (CLI + LUCID.app)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI bundle and native LUCID.app
+        run: |
+          cargo fetch --locked
+          scripts/phase-validate.sh --evidence-dir "$RUNNER_TEMP/release-out" release
+          VERSION="$(awk -F '"' '/^version = / { print $2; exit }' crates/lucidd/Cargo.toml)"
+          mkdir -p dist-upload
+          cp "$RUNNER_TEMP"/release-out/*/lucidd-*-aarch64-apple-darwin.tar.gz dist-upload/
+          bash apps/lucid-macos/build-app.sh \
+            --daemon "$GITHUB_WORKSPACE/target/release/lucidd" \
+            --output "$RUNNER_TEMP/lucid-app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/lucid-app/LUCID.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/lucid-app/LUCID.app" \
+            "dist-upload/LUCID-${VERSION}-aarch64-apple-darwin.zip"
+
+      - name: Upload macOS bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-aarch64-apple-darwin
+          path: |
+            dist-upload/*.tar.gz
+            dist-upload/*.zip
+
+  publish:
+    name: Checksum & Publish GitHub Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-artifacts
+        run: |
+          LC_ALL=C sha256sum -- *.tar.gz *.zip | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "prerelease=$INPUT_PRERELEASE" >> "$GITHUB_OUTPUT"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            case "$TAG" in
+              *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+              *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          FLAGS=(--verify-tag=false --target "$GITHUB_SHA" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            FLAGS+=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-artifacts/* --clobber
+          else
+            gh release create "$TAG" release-artifacts/* "${FLAGS[@]}"
+          fi

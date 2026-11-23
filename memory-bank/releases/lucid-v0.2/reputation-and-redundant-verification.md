@@ -215,4 +215,4 @@ Do not collapse all failures into “bad peer.” Network loss, requester cancel
 - Redundant verification is disabled by default, deterministically sampled and concurrency-bounded when enabled, restricted to exact-CID seeded jobs, and refuses to treat embedding/nondeterministic comparisons as proof at `crates/lucidd/src/router.rs:118-1398`.
 - No backend-derived correctness-evidence envelope or independent validator is implemented at this checkpoint. That seam is an approved upgrade target, not a shipped trust claim.
 - Remaining before completion: physical multi-peer divergence demo, load/amplification measurement, network-partition behavior, larger Sybil/collusion campaign, version recovery, and an approved reputation/redundancy ADR and threat model.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).

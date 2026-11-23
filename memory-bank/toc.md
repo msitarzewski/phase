@@ -1,7 +1,7 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-11-09
-**Version**: 0.5
+**Last Updated**: 2026-11-22
+**Version**: 0.6
 
 ---
 
@@ -11,7 +11,7 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 
 **Navigation**: This TOC is your starting point. Jump to specific files based on what you need.
 
-**Most current shipped and active state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, `tasks/2026-06/`, and `tasks/2026-08/`. Historical release plans are in `releases/phase-core/` and `releases/lucid/`; the active LUCID v0.2 tracker is [`releases/lucid-v0.2/`](./releases/lucid-v0.2/), and the planned independent LUMEN tracker is [`releases/lumen/`](./releases/lumen/). Tracker status is authoritative; implementation existence does not mean a release shipped.
+**Most current shipped and active state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, `tasks/2026-06/`, `tasks/2026-08/`, and `tasks/2026-11/`. Historical release plans are in `releases/phase-core/` and `releases/lucid/`; the active LUCID v0.2 tracker is [`releases/lucid-v0.2/`](./releases/lucid-v0.2/), and the planned independent LUMEN tracker is [`releases/lumen/`](./releases/lumen/). Tracker status is authoritative; implementation existence does not mean a release shipped.
 
 ---
 
@@ -21,12 +21,12 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 |------|---------|------------------|--------------|
 | [projectbrief.md](./projectbrief.md) | Vision, goals, MVP scope | Rarely (major pivots) | 2025-11-08 |
 | [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2026-08-09 |
-| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-08-10 |
-| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-09 |
-| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-09 |
+| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-11-22 |
+| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-22 |
+| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-22 |
 | [projectRules.md](./projectRules.md) | Coding standards | New patterns | 2025-11-08 |
 | [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2026-08-10 |
-| [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2025-11-08 |
+| [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2026-11-22 |
 
 ---
 
@@ -227,13 +227,25 @@ What was accomplished
 
 ---
 
+## Current Task Documentation (2026-11)
+
+**Status**: Workspace, build/CI, and runtime efficiency pass completed on `feat/lucid-consumer-experience`
+
+| Task | Status | File |
+|---|---|---|
+| Workspace, build/CI, and runtime efficiency | ✅ Verified | [261122_workspace-and-runtime-efficiency.md](./tasks/2026-11/261122_workspace-and-runtime-efficiency.md) |
+
+**Monthly Summary**: [tasks/2026-11/README.md](./tasks/2026-11/README.md)
+
+---
+
 ## Current Task Documentation (2026-08)
 
 **Status**: LUCID v0.2 implementation checkpoint approved; release acceptance incomplete
 
 | Task | Status | File |
 |---|---|---|
-| LUCID v0.2 implementation + UMBP qualification | ✅ Checkpoint approved | [260809_lucid-v0.2-implementation-umbp-qualification.md](./tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md) |
+| LUCID v0.2 implementation + Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) qualification | ✅ Checkpoint approved | [260809_lucid-v0.2-implementation-linux-qualification.md](./tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md) |
 
 **Monthly Summary**: [tasks/2026-08/README.md](./tasks/2026-08/README.md)
 
@@ -343,18 +355,18 @@ What was accomplished
 ## Memory Bank Statistics
 
 **Total Files**: Living Memory Bank; use this TOC and `rg --files memory-bank` rather than a stale manual count
-**Last Updated**: 2026-11-09
+**Last Updated**: 2026-11-22
 **Coverage**:
 - ✅ Project vision and goals (projectbrief.md)
 - ✅ Architecture patterns (systemPatterns.md) - updated with Phase Boot patterns
 - ✅ Tech stack documentation (techContext.md) - LUCID v0.2 checkpoint and experimental MLX adapter reflected
-- ✅ Current focus (activeContext.md) - external foundation/Pip/UMBP acceptance staging
+- ✅ Current focus (activeContext.md) - external foundation/Mac M1 Max (32GB RAM)/Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) acceptance staging
 - ✅ Progress tracking (progress.md) - shipped releases plus unreleased LUCID v0.2 checkpoint
 - ✅ Coding standards (projectRules.md)
 - ✅ Architectural decisions (decisions.md)
 - ✅ Quick reference (quick-start.md)
 - ✅ Navigation (toc.md - this file)
-- ✅ Monthly summaries (2025-11, 2026-05, 2026-06, and 2026-08)
+- ✅ Monthly summaries (2025-11, 2026-05, 2026-06, 2026-08, and 2026-11)
 - ✅ Phase Boot documentation (releases/boot/)
 - ✅ LUCID v0.2 detailed release tracker (releases/lucid-v0.2/)
 - ✅ Independent LUMEN detailed release tracker (releases/lumen/)

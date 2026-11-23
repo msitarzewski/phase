@@ -2,7 +2,7 @@
 
 The **LUCID inference daemon** — the open GPU-inference flagship built on the Phase substrate. `lucidd` presents the Ollama API on `:11434`, runs inference and embeddings through pluggable workers, routes each request locally or across the Phase DHT, and returns cryptographically verifiable signed receipts.
 
-**Current checkout: LUCID v0.2 implementation checkpoint, unreleased (reviewed 2026-11-07).** Phase Core and LUCID v0.1/v0.1.1 are shipped history. Features below describe this checkout; real cross-network/NAT, large pull/resume, MLX and the remaining release matrix still require acceptance. See the [authoritative tracker](../../memory-bank/releases/lucid-v0.2/README.md#progress-tracker).
+**Current checkout: LUCID v0.2 implementation checkpoint, unreleased (reviewed 2026-11-22).** Phase Core and LUCID v0.1/v0.1.1 are shipped history. Features below describe this checkout; real cross-network/NAT, large pull/resume, MLX and the remaining release matrix still require acceptance. See the [authoritative tracker](../../memory-bank/releases/lucid-v0.2/README.md#progress-tracker) and [physical test runbook](../../memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22).
 
 License: **AGPL-3.0-or-later** (the flagship is copyleft so no one can fork it closed). Depends on `phase-net`, `phase-identity`, `phase-manifest`, `phase-receipt`, and `phase-protocol`.
 
@@ -19,9 +19,13 @@ Point an Ollama-compatible client at `http://localhost:11434`. The supported end
 | `POST /api/embed` | JSON | Embedding vectors; `input` is a string or array → `embeddings` |
 | `POST /api/embeddings` | JSON | Legacy singular-`prompt` embedding → `embedding` |
 | `POST /api/pull` | JSON / NDJSON | Resolve a signed alias and download/resume verified model content; content-plane configuration is required |
-| `GET /api/tags` | JSON | List local models |
-| `POST /api/show` | JSON | Verified installed/loaded model metadata; unknown models fail explicitly |
+| `GET /api/tags` | JSON | List local and cached/discovered remote models |
+| `POST /api/show` | JSON | Verified installed/loaded/remote model metadata; unknown models fail explicitly |
+| `GET /api/ps` | JSON | Honest empty list until runtime residency telemetry is wired |
 | `GET /api/version` | JSON | Capability sniff |
+| `GET /api/lucid/status` | JSON | Bearer-authenticated local node/enrollment status (used by `apps/lucid-macos`) |
+| `POST /api/lucid/enroll` | JSON | Bearer-authenticated opaque network invitation enrollment |
+| `POST /api/lucid/invitations` | JSON | Bearer-authenticated one-time invitation creation on a serving contributor |
 
 **Response headers:**
 - `X-Lucid-Routed-Via` — `local` or `peer:<short-id>` (where the job actually ran)
@@ -54,7 +58,7 @@ Per-request decision order (`router.rs`):
 4. Resolve the signed model alias to an exact CID and discover eligible serving peers → **live relay**, with ordered fallback peers for failover before any output begins. v1 batch compatibility is explicit; it cannot count as live-stream acceptance.
 5. Nobody serves it → **refuse**.
 
-**Inbound relay (serving side)** verifies the manifest, requires an operator-authorized signer **and** binds that signer to the delivering libp2p PeerId (`src/router.rs:1903-1930`). Identity binding does not authorize a stranger. Token budgets outside the configured ceiling are rejected; prompt and concurrency bounds apply before dispatch. The explicit `allow_unauthenticated_jobs = true` escape hatch bypasses authorization for isolated development; it is not the public-network default.
+**Inbound relay (serving side)** verifies the manifest, requires an operator-authorized signer **and** binds that signer to the delivering libp2p PeerId (`src/router/mod.rs`). Identity binding does not authorize a stranger. Token budgets outside the configured ceiling are rejected; prompt and concurrency bounds apply before dispatch. The explicit `allow_unauthenticated_jobs = true` escape hatch bypasses authorization for isolated development; it is not the public-network default.
 
 **Receipt verify+bind (SEC-05)** — a peer-served `SignedReceipt` is checked four ways before it is trusted: signature, `job_id` bind to the dispatched manifest, `worker_pubkey → delivering PeerId` bind, and a commitment replay over the received chunks.
 
@@ -94,9 +98,16 @@ Loaded models are advertised on the Kademlia DHT under `b"phase/model/" || model
 --llama-server-binary <PATH>     llama-server path (resolved absolute at startup; SEC-04)
 --llama-n-gpu-layers <INT>       GPU layers (default -1 = all)
 --llama-ctx-size <USIZE>         context window (default 8192)
+--mlx-server-binary <PATH>       pinned `mlx_lm.server` entry point (required with `--worker mlx`)
+--mlx-model-bundle <PATH>        read-only canonical MLX model bundle (required with `--worker mlx`)
+--mlx-model-alias <ALIAS>        canonical alias for MLX bundle (required with `--worker mlx`)
+--mlx-server-port <U16>          loopback port for `mlx_lm.server` (default 0 = ephemeral)
 --policy-config <PATH>           policy.toml override
+--control-token-file <PATH>      private bearer-token file for `/api/lucid/*` local control endpoints
 --identity-path <PATH>           persistent libp2p identity (default ~/.config/phase/identity.key)
 --libp2p-port <U16>              listen port (default 0 = ephemeral; set e.g. 4001 for WAN)
+--listen-address <MULTIADDR>     explicit direct listen multiaddr (repeatable)
+--outbound-only                  outbound + reserved relay circuits only (no direct listeners/mDNS/DCUtR)
 --bootstrap-peer <MULTIADDR>     dial on startup (repeatable)
 --relay-peer <MULTIADDR>         peer-pinned relay candidate (repeatable)
 --bootstrap-dns <DOMAIN>         TXT-record bootstrap, PeerID-pinned (repeatable; SEC-09)

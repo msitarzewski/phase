@@ -8,21 +8,21 @@ See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale
 
 ## Status
 
-**Reviewed: 2026-11-07.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
+**Reviewed: 2026-11-22.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
 
 - **Phase Core** — **complete** (Nov 2025 → May 2026). The libp2p + Ed25519 substrate, extracted from the legacy `daemon/` tree into six publishable Apache-2.0 library crates plus the repositioned Plasm reference node.
 - **LUCID v0.1 / v0.1.1** — **shipped and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts. A public foundation relay was deployed in May; current fleet availability requires fresh operational evidence.
-- **LUCID v0.2** — **implemented checkpoint, unreleased.** Verified content pull/alias/provider records, live peer streams, relay/AutoNAT/DCUtR machinery, local reputation and bounded redundancy, and an experimental MLX adapter are implemented. Physical cross-network/NAT acceptance, real large-artifact resume, real MLX acceptance, independent correctness validation, and the remaining qualification matrix are open. [Authoritative tracker](memory-bank/releases/lucid-v0.2/README.md).
-- **Security hardening** — **shipped in May 2026** (PR #9). Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate. Current dependency security requires a fresh audit.
+- **LUCID v0.2** — **implemented checkpoint, unreleased.** Verified content pull/alias/provider records, live peer streams, relay/AutoNAT/DCUtR machinery, local reputation and bounded redundancy, an experimental MLX adapter, authenticated local enrollment control (`crates/lucidd/src/consumer.rs`), a native macOS SwiftUI consumer app (`apps/lucid-macos/`), and installable GitHub Release packaging (`.github/workflows/release.yml`, `scripts/install-lucid.sh`, `scripts/fleet-install.sh`) are implemented. Physical cross-network/NAT acceptance, real large-artifact resume, real MLX acceptance, independent correctness validation, and the remaining qualification matrix are open. [Authoritative tracker](memory-bank/releases/lucid-v0.2/README.md) · [Physical test runbook](memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22).
+- **Security hardening** — **shipped in May 2026** (PR #9) and refreshed in November 2026. Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate.
 
 **Validated on real hardware:**
 - Two-node, DHT-routed inference demo — one machine loads a model, another `curl`s `localhost:11434/api/chat` and gets a signed result routed over libp2p.
 - Real embeddings on Apple Metal — `nomic-embed-text` via `/api/embed`, 768-dim vectors with correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
 - An authz-gate demo — default-deny rejects an unauthorized routed job; the operator escape hatch accepts it with `X-Lucid-Receipt-Verified: true`.
 
-**Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md), not a claim of fresh qualification or a released v0.2.
+**Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md), not a claim of fresh qualification or a released v0.2.
 
-**November follow-up:** the November 7 macOS run and separate real llama-server/Gemma smoke passed, while repeated backend suites exposed an intermittent fixture startup failure. The November 9 CI repair updates the affected dependencies, isolates macOS fixture subprocesses and corrects the relay idle-timeout assertion. The macOS workspace passes 460 tests (2 ignored), formatting and strict Clippy; the dependency audit reports zero vulnerabilities and zero yanked packages under the existing policy. Four transitive unmaintained warnings remain visible. See [current qualification evidence](memory-bank/progress.md#ci-security-and-test-reliability-refresh-2026-11-09); physical-network and release acceptance gates remain open.
+**November 2026 local QA (`feat/lucid-consumer-experience`):** after the November 9 CI/security repair and the November 22 workspace/runtime efficiency pass ([task record](memory-bank/tasks/2026-11/261122_workspace-and-runtime-efficiency.md)), macOS ARM64 passes **492 Rust tests (2 ignored)**, **11 macOS Swift tests (`-warnings-as-errors`)**, formatting, strict all-target Clippy, `cargo audit` (0 vulnerabilities; 4 allowed transitive unmaintained warnings), and `cargo deny`. Physical fleet qualification (Cloud Relay + behind-NAT Ubuntu Desktop/Ubuntu Laptop/Mac M1 Max + cellular Mac M5 Max), Linux x86_64/ARM64 reruns on current source, real MLX acceptance, and release gates remain open.
 
 ---
 
@@ -78,21 +78,24 @@ The protocol remains workload-neutral. Implementation does not imply release acc
 
 ```
 phase/
-├── Cargo.toml                 # Workspace root, resolver = 2
+├── Cargo.toml                 # Workspace root, resolver = 2, [workspace.dependencies]
+├── apps/
+│   └── lucid-macos/           # Native SwiftUI macOS 14+ consumer app (AGPL-3.0-or-later)
 ├── crates/
 │   ├── phase-identity/        # Persistent Ed25519 node identity        Apache-2.0
 │   ├── phase-net/             # libp2p 0.56 / Kademlia / mDNS / Noise+QUIC + job-relay   Apache-2.0
 │   ├── phase-manifest/        # SignedManifest<T>, generic over payload  Apache-2.0
 │   ├── phase-receipt/         # SignedReceipt<T> + commitment accumulator Apache-2.0
 │   ├── phase-protocol/        # JobSpec {Wasm,Inference,Embedding} + Worker trait + JobStream  Apache-2.0
-│   ├── phase-artifact-server/ # Content-addressed HTTP server            Apache-2.0
+│   ├── phase-artifact-server/ # Standalone content-addressed HTTP server Apache-2.0
 │   ├── plasm/                 # Reference WASM Phase node (plasmd)        Apache-2.0
 │   └── lucidd/                # LUCID inference Phase node (lucidd)       AGPL-3.0-or-later
+├── scripts/phase-validate.sh  # Fingerprinted local/Linux/release/security/qualification runner
 ├── php-sdk/                   # PHP client SDK (legacy + phase-receipt:v1: signing)
 ├── wasm-examples/             # Source for hello.wasm
 ├── examples/                  # hello.wasm artifact + PHP demos
 ├── boot/                      # Phase Boot (USB/netboot initramfs)
-├── dist/                      # Pre-built binaries per target triple + demo asciinema
+├── dist/                      # Packaging READMEs per target triple + demo asciinema (binaries via Releases)
 ├── docs/                      # Additional documentation
 ├── memory-bank/               # Project documentation (MISSION, decisions, progress, releases, tasks)
 └── CLAUDE.md / AGENTS.md      # AI-assist development workflow
@@ -101,14 +104,14 @@ phase/
 ### Crate dependency graph
 
 ```
-phase-identity   ← leaf
+phase-artifact-server  ← standalone leaf (content-addressed HTTP range server)
+phase-identity         ← leaf
   ├── phase-net
   ├── phase-manifest
   └── phase-receipt
           └── phase-protocol
-                  ├── phase-artifact-server  (also depends on phase-net)
-                  ├── plasm                  (WASM reference node)
-                  └── lucidd                 (inference flagship)
+                  ├── plasm    (WASM reference node; also depends on phase-artifact-server)
+                  └── lucidd   (inference flagship; also depends on phase-artifact-server)
 ```
 
 No upward references. Build order is top to bottom.
