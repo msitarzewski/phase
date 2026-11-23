@@ -36,10 +36,8 @@
 //! reassemble from `delta.content` like the OpenAI flavour, and it doesn't
 //! emit the `data: [DONE]` sentinel — easier to parse correctly with the
 //! tiny SSE splitter below. Chat-template formatting is handled
-//! client-side: we render the conversation into a single prompt string
-//! before sending. With `--jinja` enabled on the server, the OpenAI path
-//! would handle the template — but rendering ourselves keeps the worker
-//! deterministic across llama-server versions.
+//! by the owned server through `/apply-template`, using the loaded GGUF
+//! metadata and `--jinja`, before the same native completion stream starts.
 //!
 //! ## What this file deliberately does NOT do
 //!
@@ -62,9 +60,9 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use phase_identity::NodeIdentity;
 use phase_protocol::{
-    ChatRole, CommitmentAccumulator, Completion, EmbeddingJobSpec, InferenceJobSpec, JobEvent,
-    JobHandle, JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream,
-    OutputChunk, SamplingParams, SignedManifest, Worker, WorkerError,
+    CommitmentAccumulator, Completion, EmbeddingJobSpec, InferenceJobSpec, JobEvent, JobHandle,
+    JobHandleProducer, JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream, OutputChunk,
+    SamplingParams, SignedManifest, Worker, WorkerError,
 };
 use phase_receipt::ReceiptBuilder;
 use serde::Deserialize;
@@ -87,13 +85,19 @@ const MAX_SEED: u64 = i32::MAX as u64;
 const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_SEQUENCE_CHARS: usize = 256;
 
+use crate::backend_io::{
+    append_sse_chunk, read_limited_body, take_next_sse_frame, BackendBodyReadError,
+};
+#[cfg(test)]
+use crate::backend_io::{extend_limited_body, SseFrameTooLarge, MAX_SSE_FRAME_BYTES};
+
 /// Native llama.cpp responses cross a process boundary and are untrusted even
 /// though the HTTP socket is loopback-only.
-const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const SSE_INGEST_SLICE_BYTES: usize = 4 * 1024;
 const MAX_BACKEND_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_BACKEND_ERROR_TEXT_CHARS: usize = 1_024;
 const MAX_EMBEDDING_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHAT_TEMPLATE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EMBEDDING_INPUTS: usize = 128;
 const MAX_EMBEDDING_ENTRY_CHARS: usize = 64 * 1024;
 const MAX_EMBEDDING_TOTAL_CHARS: usize = 256 * 1024;
@@ -295,8 +299,19 @@ impl LlamaCppWorker {
             model_id.to_string()
         };
 
-        // This covers every mutation involved in a cold load. It also acts as
-        // same-key single-flight: a waiter re-checks the map after the winner
+        // Fast path: warm hits avoid serializing behind an unrelated cold
+        // model load (which can hold `load_gate` for up to `model_load_timeout`).
+        if let Some(existing) = self.inner.loaded_models.get(&load_key) {
+            if !existing
+                .failed_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Slow path: serialize every mutation involved in a cold load or dead-
+        // model replacement. A waiter re-checks the map after the winner
         // inserts and returns that exact process instead of spawning a
         // duplicate. Loading is serialized intentionally because each cold
         // start can consume gigabytes of RAM.
@@ -544,7 +559,7 @@ impl Worker for LlamaCppWorker {
                 // loading. Sampling fields cross a trust boundary here: they
                 // must not overwrite server-owned fields or rely on
                 // llama.cpp-specific permissive defaults.
-                let request = build_completion_request(&inference)
+                let mut request = build_completion_request(&inference)
                     .map_err(|e| WorkerError::BadManifest(format!("invalid sampling: {e}")))?;
 
                 // Load the model up front so dispatch-time errors are
@@ -553,6 +568,16 @@ impl Worker for LlamaCppWorker {
                 // this point the only failure mode is in-stream. The chat
                 // path always loads the non-embedding flavour.
                 let model = self.ensure_loaded(&inference.model_cid, false).await?;
+                if !inference.messages.is_empty() {
+                    apply_chat_template(
+                        &self.inner.client,
+                        model.port,
+                        &inference,
+                        &mut request,
+                        self.inner.config.per_request_idle_timeout,
+                    )
+                    .await?;
+                }
 
                 let (handle, producer) = JobHandle::new(job_id);
                 let identity = self.inner.identity.clone();
@@ -1109,107 +1134,6 @@ fn sanitize_bounded_log_text(input: &[u8], max_chars: usize, truncated: bool) ->
 // Inference path
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq, Eq)]
-enum BackendBodyReadError {
-    TooLarge { limit: usize },
-    Transport(String),
-}
-
-impl std::fmt::Display for BackendBodyReadError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooLarge { limit } => {
-                write!(
-                    formatter,
-                    "backend response body exceeded {limit} byte limit"
-                )
-            }
-            Self::Transport(error) => write!(formatter, "backend response read failed: {error}"),
-        }
-    }
-}
-
-fn extend_limited_body(
-    body: &mut BytesMut,
-    chunk: &[u8],
-    limit: usize,
-) -> Result<(), BackendBodyReadError> {
-    if chunk.len() > limit.saturating_sub(body.len()) {
-        return Err(BackendBodyReadError::TooLarge { limit });
-    }
-    body.extend_from_slice(chunk);
-    Ok(())
-}
-
-async fn read_limited_body(
-    response: reqwest::Response,
-    limit: usize,
-) -> Result<Bytes, BackendBodyReadError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(BackendBodyReadError::TooLarge { limit });
-    }
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or(0)
-        .min(limit);
-    let mut body = BytesMut::with_capacity(initial_capacity);
-    let mut chunks = response.bytes_stream();
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|error| BackendBodyReadError::Transport(error.to_string()))?;
-        extend_limited_body(&mut body, &chunk, limit)?;
-    }
-    Ok(body.freeze())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SseFrameTooLarge;
-
-impl std::fmt::Display for SseFrameTooLarge {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "llama-server SSE frame exceeded {MAX_SSE_FRAME_BYTES} byte limit"
-        )
-    }
-}
-
-/// Refuse an oversized first frame before copying a delimiter-free chunk into
-/// the accumulation buffer. A subsequent frame in a multi-frame chunk is
-/// checked by [`take_next_sse_frame`] after its predecessor is removed.
-fn append_sse_chunk(buffer: &mut BytesMut, chunk: &[u8]) -> Result<(), SseFrameTooLarge> {
-    let first_boundary = if buffer.last() == Some(&b'\n') && chunk.first() == Some(&b'\n') {
-        Some(buffer.len().saturating_sub(1))
-    } else {
-        find_double_newline(chunk).map(|position| buffer.len().saturating_add(position))
-    };
-    let accumulated = buffer.len().saturating_add(chunk.len());
-    if first_boundary
-        .map(|position| position > MAX_SSE_FRAME_BYTES)
-        .unwrap_or(accumulated > MAX_SSE_FRAME_BYTES)
-    {
-        return Err(SseFrameTooLarge);
-    }
-    buffer.extend_from_slice(chunk);
-    Ok(())
-}
-
-fn take_next_sse_frame(buffer: &mut BytesMut) -> Result<Option<Bytes>, SseFrameTooLarge> {
-    match find_double_newline(buffer) {
-        Some(position) if position > MAX_SSE_FRAME_BYTES => Err(SseFrameTooLarge),
-        Some(position) => {
-            let mut framed = buffer.split_to(position + 2);
-            framed.truncate(position);
-            Ok(Some(framed.freeze()))
-        }
-        None if buffer.len() > MAX_SSE_FRAME_BYTES => Err(SseFrameTooLarge),
-        None => Ok(None),
-    }
-}
-
 /// Build the native llama.cpp completion request from a validated allowlist.
 ///
 /// `SamplingParams` is intentionally extensible at the protocol layer, but the
@@ -1224,7 +1148,11 @@ struct CompletionRequest {
 }
 
 fn build_completion_request(inference: &InferenceJobSpec) -> Result<CompletionRequest, String> {
-    let prompt = render_prompt(inference);
+    let prompt = if inference.messages.is_empty() {
+        inference.prompt.clone().unwrap_or_default()
+    } else {
+        String::new() // Replaced by the loaded model's template before dispatch.
+    };
     let prompt_chars = prompt.chars().count() as u64;
     let mut body = validated_sampling_params(&inference.sampling)?;
 
@@ -1971,11 +1899,6 @@ fn validate_completion_eof(saw_terminal_stop: bool, buffered: &[u8]) -> Result<(
     }
 }
 
-/// Find the first `\n\n` separator in a buffer (the SSE record boundary).
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
-}
-
 /// Strip the `data: ` SSE prefix. Returns `None` for non-data frames
 /// (comments, retries, named events) — we don't care about any of them.
 fn strip_sse_data_prefix(frame: &[u8]) -> Option<&[u8]> {
@@ -1996,40 +1919,59 @@ fn strip_sse_data_prefix(frame: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Render an `InferenceJobSpec` to a single prompt string suitable for
-/// the native `/completion` endpoint. Keeps the chat-template rendering
-/// client-side (see module-level docs).
-///
-/// Format mirrors the conservative Alpaca-style framing that most open
-/// chat models still understand even without `--jinja` doing the heavy
-/// lifting:
-///
-/// ```text
-/// <|system|>You are helpful.
-/// <|user|>Hello.
-/// <|assistant|>
-/// ```
-fn render_prompt(spec: &InferenceJobSpec) -> String {
-    if spec.messages.is_empty() {
-        return spec.prompt.clone().unwrap_or_default();
+/// Use the loaded model's own chat template without changing the native
+/// completion stream or its receipt commitment. Never fall back to generic
+/// role markers when the backend cannot format this conversation.
+async fn apply_chat_template(
+    client: &reqwest::Client,
+    port: u16,
+    inference: &InferenceJobSpec,
+    request: &mut CompletionRequest,
+    deadline: Duration,
+) -> Result<(), WorkerError> {
+    #[derive(Deserialize)]
+    struct TemplateResponse {
+        prompt: String,
     }
-    let mut out = String::new();
-    for msg in &spec.messages {
-        out.push_str(role_tag(&msg.role));
-        out.push_str(&msg.content);
-        out.push('\n');
-    }
-    out.push_str("<|assistant|>\n");
-    out
-}
-
-fn role_tag(role: &ChatRole) -> &'static str {
-    match role {
-        ChatRole::System => "<|system|>",
-        ChatRole::User => "<|user|>",
-        ChatRole::Assistant => "<|assistant|>",
-        ChatRole::Tool => "<|tool|>",
-    }
+    let formatted = timeout(deadline, async {
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/apply-template"))
+            // This backend exports plain text, without a reasoning-channel
+            // parser. Ask the model template for its supported non-thinking
+            // path rather than leaking raw reasoning control tokens.
+            .json(&serde_json::json!({
+                "messages": inference.messages,
+                "add_generation_prompt": true,
+                "chat_template_kwargs": {"enable_thinking": false},
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                WorkerError::Other(format!("chat template request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(WorkerError::Other(format!(
+                "chat template request returned {}",
+                response.status()
+            )));
+        }
+        let bytes = read_limited_body(response, MAX_CHAT_TEMPLATE_BODY_BYTES)
+            .await
+            .map_err(|error| {
+                WorkerError::Other(format!("chat template response failed: {error}"))
+            })?;
+        let response: TemplateResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| WorkerError::Other("invalid chat template response".into()))?;
+        if response.prompt.is_empty() {
+            return Err(WorkerError::Other("empty chat template response".into()));
+        }
+        Ok(response.prompt)
+    })
+    .await
+    .map_err(|_| WorkerError::Other("chat template request timed out".into()))??;
+    request.prompt_chars = formatted.chars().count() as u64;
+    request.body["prompt"] = serde_json::Value::String(formatted);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,704 +2004,4 @@ impl Drop for Inner {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use phase_manifest::ManifestBuilder;
-    use phase_protocol::{ChatMessage, SignedReceipt};
-
-    async fn exercise_raw_sse(body: &'static [u8]) -> (Vec<JobEvent>, SignedReceipt<JobResult>) {
-        use tokio::io::AsyncWriteExt as _;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test backend");
-        let port = listener.local_addr().expect("test backend address").port();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept request");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            loop {
-                let read = socket.read(&mut chunk).await.expect("read request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            socket
-                .write_all(headers.as_bytes())
-                .await
-                .expect("write response headers");
-            socket.write_all(body).await.expect("write SSE body");
-            socket.shutdown().await.expect("close response");
-        });
-
-        let failed = Arc::new(Notify::new());
-        let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let model = Arc::new(LoadedModel {
-            port,
-            last_used: Mutex::new(Instant::now()),
-            failed,
-            failed_flag,
-            supervisor: tokio::spawn(std::future::pending::<()>()),
-        });
-        let manifest_hash = [0x61; 32];
-        let (handle, producer) = JobHandle::new(JobId(manifest_hash));
-        let events = run_inference(
-            reqwest::Client::new(),
-            model,
-            CompletionRequest {
-                body: serde_json::json!({"prompt": "test", "stream": true}),
-                prompt_chars: 4,
-            },
-            manifest_hash,
-            producer,
-            NodeIdentity::generate(),
-            Duration::from_secs(1),
-        )
-        .collect::<Vec<_>>()
-        .await;
-        let receipt = handle.finish().await.expect("signed failure receipt");
-        server.await.expect("test backend exits");
-        (events, receipt)
-    }
-
-    fn inference_with_sampling(
-        entries: &[(&str, &str)],
-        max_tokens: Option<u32>,
-    ) -> InferenceJobSpec {
-        let mut sampling = SamplingParams::default();
-        for (key, value) in entries {
-            sampling
-                .params
-                .insert((*key).to_string(), (*value).to_string());
-        }
-        InferenceJobSpec {
-            model_cid: "test-model".to_string(),
-            messages: Vec::new(),
-            prompt: Some("trusted prompt".to_string()),
-            resume_from: None,
-            sampling,
-            max_tokens,
-            stream: true,
-        }
-    }
-
-    #[test]
-    fn completion_request_rejects_server_owned_sampling_fields() {
-        for key in ["n_predict", "prompt", "messages", "stream", "cache_prompt"] {
-            let spec = inference_with_sampling(&[(key, "1")], Some(32));
-            let error = build_completion_request(&spec).expect_err("reserved key must fail");
-            assert!(
-                error.contains("server-owned"),
-                "unexpected error for {key}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn completion_request_always_sets_bounded_server_n_predict() {
-        let absent = inference_with_sampling(&[], None);
-        let request = build_completion_request(&absent).expect("default request");
-        assert_eq!(
-            request.body["n_predict"],
-            serde_json::json!(DEFAULT_N_PREDICT)
-        );
-
-        let oversized = inference_with_sampling(&[], Some(u32::MAX));
-        let request = build_completion_request(&oversized).expect("clamped request");
-        assert_eq!(request.body["n_predict"], serde_json::json!(MAX_N_PREDICT));
-
-        let zero = inference_with_sampling(&[], Some(0));
-        let request = build_completion_request(&zero).expect("minimum request");
-        assert_eq!(request.body["n_predict"], serde_json::json!(1));
-    }
-
-    #[test]
-    fn completion_request_rejects_negative_oversized_and_unknown_sampling() {
-        for (key, value) in [
-            ("temperature", "-0.1"),
-            ("temperature", "2.1"),
-            ("top_p", "1.1"),
-            ("min_p", "-0.1"),
-            ("repetition_penalty", "0"),
-            ("top_k", "-1"),
-            ("top_k", "1001"),
-            ("seed", "-1"),
-            ("seed", "2147483648"),
-            ("temperature", r#""0.7""#),
-            ("top_k", "1.5"),
-            ("stop", r#""END""#),
-            ("future_llama_flag", "true"),
-        ] {
-            let spec = inference_with_sampling(&[(key, value)], Some(32));
-            assert!(
-                build_completion_request(&spec).is_err(),
-                "expected {key}={value} to be rejected"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_reserved_sampling_before_model_load() {
-        let spec = inference_with_sampling(&[("n_predict", "-1")], Some(u32::MAX));
-        let manifest = ManifestBuilder::new(JobSpec::Inference(spec))
-            .sign_with(&NodeIdentity::generate())
-            .expect("sign manifest");
-        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-
-        let error = match worker.execute(manifest).await {
-            Ok(_) => panic!("reserved sampling key must fail dispatch"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, WorkerError::BadManifest(_)));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_multimodal_images_before_model_load() {
-        let mut spec = inference_with_sampling(&[], Some(32));
-        spec.messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: "describe this".to_string(),
-            images: vec!["not-decoded-or-forwarded".to_string()],
-        });
-        let manifest = ManifestBuilder::new(JobSpec::Inference(spec))
-            .sign_with(&NodeIdentity::generate())
-            .expect("sign manifest");
-        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-
-        let error = match worker.execute(manifest).await {
-            Ok(_) => panic!("multimodal input must fail before model lookup"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, WorkerError::BadManifest(message) if message.contains("multimodal"))
-        );
-    }
-
-    #[tokio::test]
-    async fn embedding_bounds_fail_before_model_load() {
-        let identity = NodeIdentity::generate();
-        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-        for input in [
-            Vec::new(),
-            vec![String::new()],
-            vec!["x".repeat(MAX_EMBEDDING_ENTRY_CHARS + 1)],
-            vec!["x".to_string(); MAX_EMBEDDING_INPUTS + 1],
-            vec!["x".repeat(MAX_EMBEDDING_ENTRY_CHARS); 5],
-        ] {
-            let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
-                model_cid: "does-not-load".to_string(),
-                input,
-            }))
-            .sign_with(&identity)
-            .expect("sign manifest");
-            let error = match worker.execute(manifest).await {
-                Ok(_) => panic!("invalid embedding must fail before model lookup"),
-                Err(error) => error,
-            };
-            assert!(matches!(error, WorkerError::BadManifest(_)));
-        }
-
-        assert!(validate_embedding_spec(&EmbeddingJobSpec {
-            model_cid: "cid".to_string(),
-            input: vec!["ok".to_string()],
-        })
-        .is_ok());
-    }
-
-    #[tokio::test]
-    async fn occupied_loopback_port_is_never_reserved_for_llama() {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("occupy loopback port");
-        let port = listener.local_addr().expect("occupied address").port();
-        assert!(port < u16::MAX, "ephemeral port must have a successor");
-        let worker = LlamaCppWorker::new(
-            NodeIdentity::generate(),
-            LlamaCppConfig {
-                server_port_range: port..port + 1,
-                ..LlamaCppConfig::default()
-            },
-        );
-
-        assert!(matches!(
-            worker.allocate_port().await,
-            Err(WorkerError::Capacity)
-        ));
-        assert!(worker.inner.ports_in_use.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn loopback_client_refuses_backend_redirects() {
-        use tokio::io::AsyncWriteExt as _;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind redirect server");
-        let port = listener.local_addr().expect("redirect address").port();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept request");
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await.expect("read request");
-            socket
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://192.0.2.1/exfiltrate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("write redirect");
-        });
-        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-
-        let response = worker
-            .inner
-            .client
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .send()
-            .await
-            .expect("receive redirect response");
-        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
-        server.await.expect("redirect server exits");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn loopback_client_ignores_environment_proxy() {
-        use tokio::io::AsyncWriteExt as _;
-
-        const CHILD_MARKER: &str = "LUCID_LLAMA_NO_PROXY_CHILD";
-        const TARGET_URL: &str = "LUCID_LLAMA_NO_PROXY_TARGET";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-            let response = worker
-                .inner
-                .client
-                .get(std::env::var(TARGET_URL).expect("child target URL"))
-                .send()
-                .await
-                .expect("direct loopback request");
-            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-            return;
-        }
-
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind direct target");
-        let target_port = target.local_addr().expect("target address").port();
-        let target_task = tokio::spawn(async move {
-            let (mut socket, _) = target.accept().await.expect("accept direct request");
-            let mut request = [0_u8; 1024];
-            let _ = socket
-                .read(&mut request)
-                .await
-                .expect("read direct request");
-            socket
-                .write_all(
-                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("write direct response");
-        });
-        let hostile_proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind hostile proxy");
-        let proxy_port = hostile_proxy.local_addr().expect("proxy address").port();
-        let proxy_url = format!("http://127.0.0.1:{proxy_port}");
-        let test_name = "worker_llama::tests::loopback_client_ignores_environment_proxy";
-        let output =
-            tokio::process::Command::new(std::env::current_exe().expect("current test executable"))
-                .arg("--exact")
-                .arg(test_name)
-                .arg("--nocapture")
-                .env(CHILD_MARKER, "1")
-                .env(TARGET_URL, format!("http://127.0.0.1:{target_port}/health"))
-                .env("HTTP_PROXY", &proxy_url)
-                .env("http_proxy", &proxy_url)
-                .env("ALL_PROXY", &proxy_url)
-                .env("all_proxy", &proxy_url)
-                .env("NO_PROXY", "")
-                .env("no_proxy", "")
-                .output()
-                .await
-                .expect("run isolated proxy child test");
-        assert!(
-            output.status.success(),
-            "proxy child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::timeout(Duration::from_secs(2), target_task)
-            .await
-            .expect("client bypasses proxy and reaches target")
-            .expect("target task exits");
-        drop(hostile_proxy);
-    }
-
-    #[tokio::test]
-    async fn concurrent_cold_loads_are_serialized_before_capacity_mutation() {
-        let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-        let guard = worker.inner.load_gate.lock().await;
-        let contender = worker.clone();
-        let task =
-            tokio::spawn(async move { contender.ensure_loaded("missing-model", false).await });
-
-        assert!(tokio::time::timeout(Duration::from_millis(25), task)
-            .await
-            .is_err());
-        drop(guard);
-
-        // The timed-out JoinHandle was dropped, not the underlying task. A
-        // second direct call proves the gate is usable and fails at the model
-        // boundary rather than leaking a port reservation.
-        assert!(matches!(
-            worker.ensure_loaded("missing-model", false).await,
-            Err(WorkerError::ArtifactUnavailable(_))
-        ));
-        assert!(worker.inner.ports_in_use.lock().await.is_empty());
-    }
-
-    #[test]
-    fn completion_request_rejects_oversized_stop_sequences() {
-        let too_many = serde_json::to_string(&vec!["x"; MAX_STOP_SEQUENCES + 1]).unwrap();
-        let spec = inference_with_sampling(&[("stop", &too_many)], Some(32));
-        assert!(build_completion_request(&spec).is_err());
-
-        let too_long = "x".repeat(MAX_STOP_SEQUENCE_CHARS + 1);
-        let encoded = serde_json::to_string(&vec![too_long]).unwrap();
-        let spec = inference_with_sampling(&[("stop", &encoded)], Some(32));
-        assert!(build_completion_request(&spec).is_err());
-    }
-
-    #[test]
-    fn completion_request_forwards_only_validated_sampling() {
-        let spec = inference_with_sampling(
-            &[
-                ("temperature", "0.7"),
-                ("top_p", "0.9"),
-                ("top_k", "40"),
-                ("min_p", "0.05"),
-                ("repetition_penalty", "1.1"),
-                ("seed", "42"),
-                ("stop", r#"["END","STOP"]"#),
-            ],
-            Some(64),
-        );
-        let request = build_completion_request(&spec).expect("valid request");
-        let body = request.body;
-
-        assert_eq!(body["prompt"], serde_json::json!("trusted prompt"));
-        assert_eq!(body["stream"], serde_json::json!(true));
-        assert_eq!(body["cache_prompt"], serde_json::json!(true));
-        assert_eq!(body["n_predict"], serde_json::json!(64));
-        assert_eq!(body["temperature"], serde_json::json!(0.7));
-        assert_eq!(body["top_p"], serde_json::json!(0.9));
-        assert_eq!(body["top_k"], serde_json::json!(40));
-        assert_eq!(body["min_p"], serde_json::json!(0.05));
-        assert_eq!(body["repetition_penalty"], serde_json::json!(1.1));
-        assert_eq!(body["seed"], serde_json::json!(42));
-        assert_eq!(body["stop"], serde_json::json!(["END", "STOP"]));
-        assert_eq!(request.prompt_chars, 14);
-    }
-
-    #[test]
-    fn resolve_model_path_accepts_real_file_in_dir() {
-        // SEC-04: a legitimate id resolves to `model_dir/<id>.gguf`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let model = dir.path().join("qwen3.gguf");
-        std::fs::write(&model, b"gguf").expect("touch model");
-        let resolved = resolve_model_path(dir.path(), "qwen3").expect("resolve ok");
-        // Canonicalized on both sides — compare against the canonical file.
-        assert_eq!(resolved, model.canonicalize().unwrap());
-        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
-    }
-
-    #[test]
-    fn resolve_model_path_rejects_traversal_and_separators() {
-        // SEC-04: traversal / separators / absolute ids never resolve.
-        let dir = tempfile::tempdir().expect("tempdir");
-        for bad in [
-            "../../etc/passwd",
-            "..",
-            "a/b",
-            "a\\b",
-            "/etc/passwd",
-            "/tmp/x.gguf",
-        ] {
-            assert!(
-                resolve_model_path(dir.path(), bad).is_err(),
-                "expected reject for {bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_model_path_rejects_leading_dash_empty_and_nul() {
-        // SEC-04: leading `-` (arg injection), empty, and embedded NUL.
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(resolve_model_path(dir.path(), "--flag").is_err());
-        assert!(resolve_model_path(dir.path(), "-rf").is_err());
-        assert!(resolve_model_path(dir.path(), "").is_err());
-        assert!(resolve_model_path(dir.path(), "x\0y").is_err());
-    }
-
-    #[test]
-    fn resolve_model_path_oracle_closed_same_client_error() {
-        // SEC-04: a not-found id and a parse-/shape-rejected id collapse to
-        // the SAME generic client-facing error string. `ensure_loaded` maps
-        // both Err reasons to `ArtifactUnavailable("model unavailable")`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Both of these are `Err(_)` at the resolver; the caller maps them
-        // to one constant string, so the client cannot distinguish them.
-        let not_found = resolve_model_path(dir.path(), "definitely-not-here");
-        let bad_shape = resolve_model_path(dir.path(), "../escape");
-        assert!(not_found.is_err());
-        assert!(bad_shape.is_err());
-        let client_err =
-            |_: String| WorkerError::ArtifactUnavailable("model unavailable".into()).to_string();
-        assert_eq!(
-            client_err(not_found.unwrap_err()),
-            client_err(bad_shape.unwrap_err())
-        );
-    }
-
-    #[test]
-    fn strip_sse_data_prefix_handles_space() {
-        let frame = b"data: {\"x\":1}";
-        assert_eq!(strip_sse_data_prefix(frame), Some(&b"{\"x\":1}"[..]));
-    }
-
-    #[test]
-    fn strip_sse_data_prefix_handles_no_space() {
-        let frame = b"data:{\"x\":1}";
-        assert_eq!(strip_sse_data_prefix(frame), Some(&b"{\"x\":1}"[..]));
-    }
-
-    #[test]
-    fn strip_sse_data_prefix_skips_non_data() {
-        let frame = b": comment";
-        assert_eq!(strip_sse_data_prefix(frame), None);
-    }
-
-    #[test]
-    fn malformed_sse_data_frame_is_a_terminal_protocol_error() {
-        let error = decode_completion_frame(br#"{"content":"partial","stop":tru}"#)
-            .expect_err("malformed JSON must never be skipped");
-        assert!(error.contains("malformed llama-server SSE data frame"));
-    }
-
-    #[test]
-    fn eof_without_explicit_stop_frame_can_never_be_success() {
-        assert_eq!(validate_completion_eof(true, b""), Ok(()));
-
-        let clean_eof = validate_completion_eof(false, b"")
-            .expect_err("clean transport EOF is not a model terminal event");
-        assert!(clean_eof.contains("without explicit stop:true"));
-
-        let partial_eof = validate_completion_eof(false, br#"data: {"content":"partial"}"#)
-            .expect_err("unterminated frame must fail closed");
-        assert!(partial_eof.contains("unterminated byte(s)"));
-        assert!(partial_eof.contains("no stop:true terminal frame"));
-    }
-
-    #[tokio::test]
-    async fn backend_eof_without_stop_emits_only_signed_error_terminal() {
-        let (events, receipt) =
-            exercise_raw_sse(b"data: {\"content\":\"partial\",\"stop\":false}\n\n").await;
-        assert!(matches!(events.first(), Some(JobEvent::Output(_))));
-        assert!(matches!(
-            events.last(),
-            Some(JobEvent::Final {
-                result: JobResult {
-                    completion: Completion::Error,
-                    ..
-                },
-                error: Some(error),
-            }) if error.contains("without explicit stop:true")
-        ));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            JobEvent::Final {
-                result: JobResult {
-                    completion: Completion::Stop | Completion::Length,
-                    ..
-                },
-                ..
-            }
-        )));
-        assert_eq!(receipt.result.completion, Completion::Error);
-        let mut replay = CommitmentAccumulator::new();
-        for event in &events {
-            if let JobEvent::Output(chunk) = event {
-                replay.update(chunk);
-            }
-        }
-        let (commitment, count) = replay.finalize();
-        assert_eq!(receipt.result.output_commitment, commitment);
-        assert_eq!(receipt.result.output_chunk_count, count);
-    }
-
-    #[tokio::test]
-    async fn malformed_backend_sse_emits_only_signed_error_terminal() {
-        let (events, receipt) =
-            exercise_raw_sse(b"data: {\"content\":\"partial\",\"stop\":tru}\n\n").await;
-        assert!(matches!(
-            events.as_slice(),
-            [JobEvent::Final {
-                result: JobResult {
-                    completion: Completion::Error,
-                    ..
-                },
-                error: Some(error),
-            }] if error.contains("malformed llama-server SSE data frame")
-        ));
-        assert_eq!(receipt.result.completion, Completion::Error);
-    }
-
-    #[test]
-    fn find_double_newline_finds_first() {
-        let buf = b"hello\n\nworld\n\nbye";
-        assert_eq!(find_double_newline(buf), Some(5));
-    }
-
-    #[test]
-    fn delimiter_free_oversized_sse_is_rejected_before_buffer_growth() {
-        let existing = vec![b'x'; MAX_SSE_FRAME_BYTES];
-        let mut buffer = BytesMut::from(existing.as_slice());
-
-        assert_eq!(append_sse_chunk(&mut buffer, b"x"), Err(SseFrameTooLarge));
-        assert_eq!(buffer.len(), MAX_SSE_FRAME_BYTES);
-
-        let mut oversized_frame = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
-        oversized_frame.extend_from_slice(b"\n\n");
-        let mut empty = BytesMut::new();
-        assert_eq!(
-            append_sse_chunk(&mut empty, &oversized_frame),
-            Err(SseFrameTooLarge)
-        );
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn limited_body_rejects_oversized_chunks_without_partial_append() {
-        let mut body = BytesMut::new();
-        extend_limited_body(&mut body, b"12345678", 8).expect("exact limit is accepted");
-        assert_eq!(&body[..], b"12345678");
-
-        assert_eq!(
-            extend_limited_body(&mut body, b"9", 8),
-            Err(BackendBodyReadError::TooLarge { limit: 8 })
-        );
-        assert_eq!(&body[..], b"12345678");
-    }
-
-    #[test]
-    fn child_log_text_is_control_safe_and_character_bounded() {
-        let mut hostile = b"prefix\r\n\x1b[31m\0".to_vec();
-        hostile.extend(std::iter::repeat_n(b'x', 128));
-
-        let sanitized = sanitize_bounded_log_text(&hostile, 32, false);
-        assert!(sanitized.chars().count() <= 32);
-        assert!(sanitized.chars().all(|character| !character.is_control()));
-        assert!(sanitized.ends_with("...[truncated]"));
-        assert!(!sanitized.contains('\u{1b}'));
-        assert!(!sanitized.contains('\n'));
-
-        let explicitly_truncated = sanitize_bounded_log_text(b"short", 32, true);
-        assert!(explicitly_truncated.ends_with("...[truncated]"));
-    }
-
-    #[test]
-    fn parse_embedding_accepts_top_level_object() {
-        let raw = br#"{"embedding":[0.1,0.2,0.3]}"#;
-        let v = parse_embedding_response(raw).expect("parse");
-        assert_eq!(v, vec![0.1f32, 0.2, 0.3]);
-    }
-
-    #[test]
-    fn parse_embedding_accepts_array_of_objects() {
-        let raw = br#"[{"embedding":[1.0,2.0],"index":0}]"#;
-        let v = parse_embedding_response(raw).expect("parse");
-        assert_eq!(v, vec![1.0f32, 2.0]);
-    }
-
-    #[test]
-    fn parse_embedding_accepts_data_wrapper() {
-        let raw = br#"{"data":[{"embedding":[4.0,5.0,6.0]}]}"#;
-        let v = parse_embedding_response(raw).expect("parse");
-        assert_eq!(v, vec![4.0f32, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn parse_embedding_accepts_nested_array_of_objects() {
-        // The REAL llama.cpp native /embedding endpoint wraps the pooled
-        // vector in an OUTER array: `[{"index":0,"embedding":[[...]]}]`. The
-        // Earlier fixture coverage used a flat array and missed this; a live
-        // nomic-embed run returned zero vectors until the parser descended one
-        // level. Take row 0 (the pooled vector).
-        let raw = br#"[{"index":0,"embedding":[[7.0,8.0,9.0]]}]"#;
-        let v = parse_embedding_response(raw).expect("parse");
-        assert_eq!(v, vec![7.0f32, 8.0, 9.0]);
-    }
-
-    #[test]
-    fn parse_embedding_accepts_nested_top_level_object() {
-        // Same nesting under the top-level `{"embedding":[[...]]}` shape.
-        let raw = br#"{"embedding":[[1.5,2.5]]}"#;
-        let v = parse_embedding_response(raw).expect("parse");
-        assert_eq!(v, vec![1.5f32, 2.5]);
-    }
-
-    #[test]
-    fn parse_embedding_rejects_non_numeric_and_missing() {
-        assert!(parse_embedding_response(br#"{"nope":1}"#).is_none());
-        assert!(parse_embedding_response(br#"{"embedding":["x"]}"#).is_none());
-        assert!(parse_embedding_response(br#"{"embedding":[]}"#).is_none());
-        assert!(parse_embedding_response(b"not json").is_none());
-    }
-
-    #[test]
-    fn render_prompt_empty_messages_uses_prompt() {
-        let spec = InferenceJobSpec {
-            model_cid: "x".to_string(),
-            messages: vec![],
-            prompt: Some("Hello.".to_string()),
-            resume_from: None,
-            sampling: Default::default(),
-            max_tokens: None,
-            stream: true,
-        };
-        assert_eq!(render_prompt(&spec), "Hello.");
-    }
-
-    #[test]
-    fn render_prompt_renders_chat_roles() {
-        let spec = InferenceJobSpec {
-            model_cid: "x".to_string(),
-            messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "Be helpful.".to_string(),
-                    images: vec![],
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: "Hi.".to_string(),
-                    images: vec![],
-                },
-            ],
-            prompt: None,
-            resume_from: None,
-            sampling: Default::default(),
-            max_tokens: None,
-            stream: true,
-        };
-        let rendered = render_prompt(&spec);
-        assert!(rendered.contains("<|system|>Be helpful."));
-        assert!(rendered.contains("<|user|>Hi."));
-        assert!(rendered.ends_with("<|assistant|>\n"));
-    }
-}
+mod tests;

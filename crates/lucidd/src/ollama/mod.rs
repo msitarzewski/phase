@@ -138,6 +138,8 @@ struct TagModel {
     size: Option<u64>,
     digest: String,
     details: TagModelDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_lucid_access: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +266,10 @@ pub struct AppState {
     /// llama.cpp nodes and consume-only caches, absent from the explicit echo
     /// development fixture unless an artifact store was requested.
     pub content_plane: Option<std::sync::Arc<crate::content::ContentPlane>>,
+    /// Private native-app control; never shared with chat clients.
+    pub consumer: Arc<crate::consumer::ConsumerControl>,
+    pub discovery: Arc<phase_net::Discovery>,
+    pub started_at: tokio::time::Instant,
 }
 
 /// HTTP header that flips this request to local-only mode. Honored on
@@ -272,7 +278,7 @@ pub struct AppState {
 pub const HEADER_LOCAL_ONLY: &str = "x-lucid-local-only";
 
 /// HTTP response header advertising where the request was actually
-/// served. `local` or `peer:<short>`; omitted on Refused.
+/// served. `local` or `peer`; omitted on Refused.
 pub const HEADER_ROUTED_VIA: &str = "x-lucid-routed-via";
 
 /// SEC-05: HTTP response header reporting whether a peer-served job's signed
@@ -313,6 +319,7 @@ fn loopback_cors() -> CorsLayer {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([
             header::CONTENT_TYPE,
+            header::AUTHORIZATION,
             HeaderName::from_static(HEADER_LOCAL_ONLY),
         ])
         .expose_headers([
@@ -378,6 +385,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/embed", post(handle_embed))
         .route("/api/embeddings", post(handle_embeddings))
         .route("/api/pull", post(handle_pull))
+        .route("/api/lucid/status", get(handle_consumer_status))
+        .route(
+            "/api/lucid/enroll",
+            post(handle_consumer_enroll).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/lucid/invitations",
+            post(handle_create_invitation).layer(DefaultBodyLimit::max(1024)),
+        )
         // Health check for liveness probes.
         .route("/", get(|| async { "lucidd ready: see /api/version" }))
         // Log unsupported routes while preserving an honest 404 contract.
@@ -403,17 +419,19 @@ const LOG_FIELD_CAP: usize = 256;
 ///   marker when truncated so the cap is visible in the log.
 fn sanitize_for_log(input: &str) -> String {
     let mut out = String::with_capacity(input.len().min(LOG_FIELD_CAP));
+    let mut count = 0usize;
     for ch in input.chars() {
         // Strip C0 controls (< 0x20) and DEL (0x7f). This covers \r, \n,
         // \t, NUL, and the ESC (0x1b) that introduces ANSI sequences.
         if (ch as u32) < 0x20 || ch == '\u{7f}' {
             continue;
         }
-        if out.chars().count() >= LOG_FIELD_CAP {
+        if count >= LOG_FIELD_CAP {
             out.push('…');
             break;
         }
         out.push(ch);
+        count += 1;
     }
     out
 }
@@ -464,6 +482,26 @@ fn public_route_explanation(input: &str) -> String {
     public
 }
 
+fn public_routed_via(decision: &RouteDecision) -> Option<String> {
+    match decision.via {
+        RouteVia::Local => Some("local".to_string()),
+        RouteVia::Peer { .. } => Some("peer".to_string()),
+        RouteVia::Refused { .. } => None,
+    }
+}
+
+fn public_dispatch_error(error: &RouterError) -> &'static str {
+    match error {
+        RouterError::Relay(detail) if detail.contains("not authorized") => {
+            "Access is not authorized. Join with a valid network invitation."
+        }
+        RouterError::Relay(_) => "Network model request failed. Check your connection or retry.",
+        RouterError::Worker(_) => "Local model execution failed.",
+        RouterError::Refused { .. } => "Request refused by operator policy.",
+        RouterError::NoLocalWorker => "No eligible model worker is available.",
+    }
+}
+
 async fn unknown(req: axum::http::Request<Body>) -> impl IntoResponse {
     // SEC-10: log only the path (not query/fragment), sanitized + capped.
     // The method is from a fixed HTTP enum, not attacker-shaped free text.
@@ -482,6 +520,125 @@ async fn handle_version() -> Json<VersionResponse> {
     })
 }
 
+fn authorize_control(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if state.consumer.authorize_bearer(authorization) {
+        None
+    } else {
+        Some(control_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "Local control authorization required."}),
+        ))
+    }
+}
+
+fn control_response(status: StatusCode, value: serde_json::Value) -> Response {
+    let mut response = (status, Json(value)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let connected = matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.discovery.reachability_snapshot(),
+        )
+        .await,
+        Ok(Ok(snapshot)) if !snapshot.connections.is_empty()
+    );
+    let connection = if connected {
+        "connected"
+    } else if state.started_at.elapsed() < std::time::Duration::from_secs(15) {
+        "connecting"
+    } else {
+        "offline"
+    };
+    let mut cids = std::collections::HashSet::new();
+    for model in state.registry.local_installed_async().await {
+        cids.insert(model.model_cid);
+    }
+    for model in state.registry.local_models_async().await {
+        cids.insert(model.model_cid);
+    }
+    for model in state.registry.cached_network_models().await {
+        cids.insert(model.caps.model_cid);
+    }
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "state": connection,
+            "model_count": cids.len(),
+            "enrollment": state.consumer.enrollment_status(),
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollRequest {
+    invitation: String,
+}
+
+async fn handle_consumer_enroll(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EnrollRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    match state.consumer.enroll(&request.invitation).await {
+        Ok(status) => control_response(StatusCode::ACCEPTED, serde_json::json!(status)),
+        Err(_) => control_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "Invitation is invalid, expired, or enrollment is unavailable."}),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateInvitationRequest {
+    #[serde(default = "default_invitation_ttl")]
+    ttl_seconds: u64,
+}
+
+fn default_invitation_ttl() -> u64 {
+    15 * 60
+}
+
+async fn handle_create_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitationRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    if state.registry.local_models_async().await.is_empty() {
+        return control_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "This node is not serving models."}),
+        );
+    }
+    match state.consumer.create_invitation(request.ttl_seconds).await {
+        Ok(invitation) => control_response(StatusCode::CREATED, serde_json::json!(invitation)),
+        Err(_) => control_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "Could not create invitation. Check its lifetime and pending invitation limit."}),
+        ),
+    }
+}
+
 async fn handle_tags(State(state): State<AppState>) -> Json<TagsResponse> {
     let installed = state.registry.local_installed_async().await;
     let mut loaded_only = state.registry.local_models_async().await;
@@ -495,17 +652,42 @@ async fn handle_tags(State(state): State<AppState>) -> Json<TagsResponse> {
             .cmp(&right.model_id)
             .then_with(|| left.model_cid.0.cmp(&right.model_cid.0))
     });
-    Json(TagsResponse {
-        models: installed
-            .iter()
-            .map(tag_model_from_installed)
-            .chain(
-                loaded_only
-                    .iter()
-                    .map(|caps| tag_model_from_caps(state.verified_model_dir.as_deref(), caps)),
-            )
-            .collect(),
-    })
+    let mut models = installed
+        .iter()
+        .map(tag_model_from_installed)
+        .collect::<Vec<_>>();
+    for caps in &loaded_only {
+        models.push(tag_model_from_caps_async(state.verified_model_dir.as_deref(), caps).await);
+    }
+    let mut known = installed
+        .iter()
+        .map(|model| model.model_cid)
+        .collect::<std::collections::HashSet<_>>();
+    known.extend(loaded_only.iter().map(|caps| caps.model_cid));
+    match state.registry.discover_network_models().await {
+        Ok(remote) => {
+            let authorized = state
+                .consumer
+                .authorized_issuers()
+                .iter()
+                .filter_map(|key| crate::registry::peer_id_from_ed25519_pubkey(key).ok())
+                .collect::<std::collections::HashSet<_>>();
+            for entry in remote {
+                if !known.insert(entry.caps.model_cid) {
+                    continue;
+                }
+                let access = if entry.providers.iter().any(|peer| authorized.contains(peer)) {
+                    "authorized"
+                } else {
+                    "access_not_confirmed"
+                };
+                models.push(tag_model_from_network(&entry, access));
+            }
+        }
+        Err(error) => tracing::debug!(%error, "network model catalog unavailable"),
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.model.cmp(&b.model)));
+    Json(TagsResponse { models })
 }
 
 async fn handle_show(State(state): State<AppState>, Json(req): Json<ShowRequest>) -> Response {
@@ -525,7 +707,32 @@ async fn handle_show(State(state): State<AppState>, Json(req): Json<ShowRequest>
     }
     let resolved = match resolve_local_model_caps(&state, &requested).await {
         Ok(Some(caps)) => caps,
-        Ok(None) => return unknown_model_response(&requested),
+        Ok(None) => {
+            let requested = ollama_routing_model_name(&requested);
+            let cid = crate::registry::ModelCid::from_hex(&requested).ok();
+            let candidates = state
+                .registry
+                .discover_network_models()
+                .await
+                .unwrap_or_default();
+            let matches = candidates
+                .iter()
+                .filter(|model| {
+                    cid == Some(model.caps.model_cid) || model.caps.model_id == requested
+                })
+                .collect::<Vec<_>>();
+            return match matches.as_slice() {
+                [model] => Json(show_response_from_caps(&model.caps)).into_response(),
+                [] => unknown_model_response(&requested),
+                _ => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Model name is ambiguous. Choose its exact catalog identifier."
+                    })),
+                )
+                    .into_response(),
+            };
+        }
         Err(error) => {
             tracing::warn!(
                 model = %sanitize_for_log(&requested),
@@ -563,6 +770,7 @@ fn tag_model_from_installed(model: &crate::registry::InstalledModel) -> TagModel
             families: vec![family],
             quantization_level: "unknown".to_string(),
         },
+        x_lucid_access: None,
     }
 }
 
@@ -574,15 +782,24 @@ async fn handle_ps() -> Json<PsResponse> {
     Json(PsResponse { models: Vec::new() })
 }
 
-fn tag_model_from_caps(
+async fn tag_model_from_caps_async(
     verified_model_dir: Option<&std::path::Path>,
     caps: &crate::registry::ModelCapabilities,
 ) -> TagModel {
-    let size = verified_model_dir.and_then(|dir| {
-        std::fs::metadata(dir.join(format!("{}.gguf", caps.model_cid.to_hex())))
+    let size = match verified_model_dir {
+        Some(dir) => tokio::fs::metadata(dir.join(format!("{}.gguf", caps.model_cid.to_hex())))
+            .await
             .ok()
-            .map(|metadata| metadata.len())
-    });
+            .map(|metadata| metadata.len()),
+        None => None,
+    };
+    tag_model_from_caps_with_size(size, caps)
+}
+
+fn tag_model_from_caps_with_size(
+    size: Option<u64>,
+    caps: &crate::registry::ModelCapabilities,
+) -> TagModel {
     let name = ollama_model_name(&caps.model_id);
     TagModel {
         name: name.clone(),
@@ -591,7 +808,20 @@ fn tag_model_from_caps(
         size,
         digest: format!("sha256:{}", caps.model_cid.to_hex()),
         details: model_details_from_caps(caps),
+        x_lucid_access: None,
     }
+}
+
+fn tag_model_from_network(model: &crate::registry::NetworkModel, access: &'static str) -> TagModel {
+    let mut tag = tag_model_from_caps_with_size(model.size_bytes, &model.caps);
+    // Open WebUI uses `model` as the dispatch ID and `name` for display.
+    // Bind selection to exact bytes even when publishers reuse a human alias.
+    tag.model = model.caps.model_cid.to_hex();
+    if let Some(format) = &model.format {
+        tag.details.format = Some(format.clone());
+    }
+    tag.x_lucid_access = Some(access);
+    tag
 }
 
 fn model_details_from_caps(caps: &crate::registry::ModelCapabilities) -> TagModelDetails {
@@ -787,8 +1017,14 @@ fn invalid_request_response(message: &str) -> Response {
 }
 
 fn validate_chat_request(request: &ChatRequest) -> Result<(), &'static str> {
-    if request.keep_alive.is_some() || request.format.is_some() || request.tools.is_some() {
-        return Err("keep_alive, structured format, and tools are not supported");
+    if request.keep_alive.is_some() {
+        return Err("keep_alive is not supported; contributor policy controls model residency");
+    }
+    if request.format.is_some() {
+        return Err("structured format is not supported");
+    }
+    if request.tools.is_some() {
+        return Err("tools are not supported");
     }
     let mut total_chars = 0usize;
     for message in &request.messages {
@@ -940,7 +1176,7 @@ async fn handle_generate(
         tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/generate");
         return refused_response(reason);
     }
-    let routed_via = decision.header_value();
+    let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
         routed_via = routed_via.as_deref().unwrap_or("unknown"),
@@ -973,11 +1209,7 @@ async fn handle_generate(
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "manifest signing failed (/api/generate)");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("manifest signing failed: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "manifest signing failed").into_response();
         }
     };
 
@@ -987,10 +1219,7 @@ async fn handle_generate(
             Err(RouterError::Refused { reason }) => return refused_response(&reason),
             Err(e) => {
                 tracing::error!(error = %e, "router dispatch failed (/api/generate)");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("router dispatch failed: {e}"),
-                )
+                return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e))
                     .into_response();
             }
         };
@@ -1173,7 +1402,7 @@ async fn handle_chat(
         tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/chat");
         return refused_response(reason);
     }
-    let routed_via = decision.header_value();
+    let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
         routed_via = routed_via.as_deref().unwrap_or("unknown"),
@@ -1217,11 +1446,7 @@ async fn handle_chat(
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "manifest signing failed (/api/chat)");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("manifest signing failed: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "manifest signing failed").into_response();
         }
     };
 
@@ -1231,10 +1456,7 @@ async fn handle_chat(
             Err(RouterError::Refused { reason }) => return refused_response(&reason),
             Err(e) => {
                 tracing::error!(error = %e, "router dispatch failed");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("router dispatch failed: {e}"),
-                )
+                return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e))
                     .into_response();
             }
         };
@@ -1505,7 +1727,7 @@ fn validate_embedding_values(vector: &[f32]) -> Result<(), String> {
 struct EmbedOutcome {
     /// Per-input embedding vectors, ordered by `OutputChunk::seq`.
     vectors: Vec<Vec<f32>>,
-    /// `X-Lucid-Routed-Via` value (`local` / `peer:<short>`), if any.
+    /// `X-Lucid-Routed-Via` value (`local` / `peer`), if any.
     routed_via: Option<String>,
     /// `X-Lucid-Receipt-Verified` value (peer path only), if any.
     receipt_verified: Option<&'static str>,
@@ -1542,7 +1764,7 @@ async fn run_embedding(
         tracing::info!(model = %sanitize_for_log(model), reason = %reason, "router refused /api/embed");
         return Err(Box::new(refused_response(reason)));
     }
-    let routed_via = decision.header_value();
+    let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
         routed_via = routed_via.as_deref().unwrap_or("unknown"),
@@ -1559,11 +1781,7 @@ async fn run_embedding(
         Err(e) => {
             tracing::error!(error = %e, "manifest signing failed (/api/embed)");
             return Err(Box::new(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("manifest signing failed: {e}"),
-                )
-                    .into_response(),
+                (StatusCode::INTERNAL_SERVER_ERROR, "manifest signing failed").into_response(),
             ));
         }
     };
@@ -1577,11 +1795,7 @@ async fn run_embedding(
             Err(e) => {
                 tracing::error!(error = %e, "router dispatch failed (/api/embed)");
                 return Err(Box::new(
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("router dispatch failed: {e}"),
-                    )
-                        .into_response(),
+                    (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e)).into_response(),
                 ));
             }
         };
@@ -1887,9 +2101,10 @@ fn pull_network_stream(
                         }
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "peer-to-peer model pull failed");
                             yield Ok::<Bytes, std::convert::Infallible>(json_line(serde_json::json!({
                                 "status": "error",
-                                "error": error.to_string(),
+                                "error": public_content_error(&error),
                             })));
                         }
                         Err(error) => {
@@ -1935,11 +2150,11 @@ fn pull_progress_line(progress: PullProgress) -> Bytes {
             cid,
             completed,
             total,
-            provider,
+            provider: _,
         } => serde_json::json!({
             "status": "downloading", "phase": "downloading",
             "digest": format!("sha256:{cid}"), "completed": completed,
-            "total": total, "provider": provider,
+            "total": total,
         }),
         PullProgress::Verifying { cid, total } => serde_json::json!({
             "status": "verifying", "phase": "verifying",
@@ -1968,6 +2183,26 @@ fn json_line(value: serde_json::Value) -> Bytes {
     Bytes::from(bytes)
 }
 
+fn public_content_error(error: &ContentError) -> &'static str {
+    match error {
+        ContentError::UnknownAlias => "Model alias is unknown or has no signed mapping.",
+        ContentError::AliasConflict => "Signed model records conflict. Select an exact model CID.",
+        ContentError::PinMismatch => "No signed model record matches the requested selection.",
+        ContentError::UnsupportedFormat(_) => "The model format is not supported.",
+        ContentError::ModelTooLarge { .. } => "The model exceeds the local pull limit.",
+        ContentError::NoProviders => "No authenticated provider is available for this model.",
+        ContentError::Transfer(_) | ContentError::ProvidersExhausted { .. } => {
+            "Model transfer failed. Check your connection or retry."
+        }
+        ContentError::DeadlineExceeded => "Model transfer exceeded its deadline.",
+        ContentError::Verification(_) => "Model content verification or installation failed.",
+        ContentError::Cancelled => "Model transfer was cancelled.",
+        ContentError::Configuration(_) | ContentError::Registration(_) => {
+            "The local model store could not complete the request."
+        }
+    }
+}
+
 fn pull_content_error_response(error: ContentError) -> Response {
     let status = match &error {
         ContentError::UnknownAlias => StatusCode::NOT_FOUND,
@@ -1988,7 +2223,7 @@ fn pull_content_error_response(error: ContentError) -> Response {
     };
     (
         status,
-        Json(serde_json::json!({ "status": "error", "error": error.to_string() })),
+        Json(serde_json::json!({ "status": "error", "error": public_content_error(&error) })),
     )
         .into_response()
 }
@@ -2197,6 +2432,10 @@ fn execution_failure_reason(
     terminal: &HttpTerminal,
     verification: ReceiptVerification,
 ) -> Option<String> {
+    if terminal.output_error.is_none() && terminal.error.is_some() {
+        tracing::warn!(error = ?terminal.error, "model execution terminal failed");
+        return Some("model execution failed".to_string());
+    }
     terminal
         .failure_reason()
         .or_else(|| peer_receipt_failure_reason(verification).map(str::to_string))
@@ -2209,6 +2448,11 @@ fn apply_result_headers(
     route_explanation: Option<&str>,
 ) {
     if let Some(routed_via) = routed_via {
+        let routed_via = if routed_via.starts_with("peer:") {
+            "peer"
+        } else {
+            routed_via
+        };
         if let Ok(value) = routed_via.parse() {
             resp.headers_mut().insert(HEADER_ROUTED_VIA, value);
         }
@@ -2358,544 +2602,4 @@ fn hex32(b: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn output_chunk(seq: u64, kind: &str, data: impl Into<Bytes>) -> OutputChunk {
-        OutputChunk {
-            kind: kind.to_string(),
-            data: data.into(),
-            seq,
-        }
-    }
-
-    #[test]
-    fn http_manifest_is_short_lived_and_remote_valid() {
-        let identity = NodeIdentity::generate();
-        let job_spec = JobSpec::Embedding(phase_protocol::EmbeddingJobSpec {
-            model_cid: "test-model".to_string(),
-            input: vec!["hello".to_string()],
-        });
-        let manifest = http_manifest(job_spec)
-            .sign_with(&identity)
-            .expect("sign HTTP manifest");
-
-        manifest
-            .verify_for_remote_execution()
-            .expect("HTTP manifest meets remote policy");
-        let ttl = manifest
-            .expires_at
-            .expect("HTTP manifest has expiry")
-            .signed_duration_since(manifest.created_at);
-        assert!(ttl > chrono::Duration::minutes(4));
-        assert!(ttl <= chrono::Duration::minutes(5));
-    }
-
-    #[test]
-    fn registry_metadata_uses_real_capabilities_without_fake_zero_fields() {
-        let cid = crate::registry::ModelCid([9u8; 32]);
-        let mut caps =
-            crate::registry::ModelCapabilities::now("qwen3", cid, "Q4_K_M", 32_768, 2, "llama.cpp");
-        caps.advertised_at = 0;
-
-        let listing = serde_json::to_value(tag_model_from_caps(None, &caps))
-            .expect("serialize registry-backed tag");
-        assert_eq!(listing["name"], "qwen3:latest");
-        assert_eq!(listing["model"], "qwen3:latest");
-        assert_eq!(listing["digest"], format!("sha256:{}", cid.to_hex()));
-        assert_ne!(listing["digest"], format!("sha256:{}", "0".repeat(64)));
-        assert_eq!(listing["modified_at"], "1970-01-01T00:00:00.000000000Z");
-        assert!(
-            listing.get("size").is_none(),
-            "unknown size must be omitted"
-        );
-        assert_eq!(listing["details"]["format"], "gguf");
-        assert_eq!(listing["details"]["quantization_level"], "Q4_K_M");
-
-        let shown = serde_json::to_value(show_response_from_caps(&caps))
-            .expect("serialize registry-backed show response");
-        assert_eq!(shown["model_info"]["phase.model_cid"], cid.to_hex());
-        assert_eq!(shown["model_info"]["phase.context_length"], 32_768);
-        assert!(shown.get("modelfile").is_none());
-        assert!(shown.get("template").is_none());
-        assert!(shown.get("parameters").is_none());
-    }
-
-    #[test]
-    fn show_merges_verified_install_metadata_with_loaded_capabilities() {
-        let cid = crate::registry::ModelCid([17u8; 32]);
-        let installed = crate::registry::InstalledModel {
-            model_id: "qwen3".to_string(),
-            model_cid: cid,
-            format: "gguf".to_string(),
-            size_bytes: 42_000,
-            installed_at: 123,
-        };
-        let caps =
-            crate::registry::ModelCapabilities::now("qwen3", cid, "Q4_K_M", 32_768, 2, "llama.cpp");
-
-        let shown = serde_json::to_value(show_response_from_installed_and_caps(
-            &installed,
-            Some(&caps),
-        ))
-        .expect("serialize merged show response");
-        assert_eq!(shown["model_info"]["phase.model_cid"], cid.to_hex());
-        assert_eq!(
-            shown["model_info"]["phase.verification"],
-            "content_verified"
-        );
-        assert_eq!(shown["model_info"]["phase.size_bytes"], 42_000);
-        assert_eq!(shown["model_info"]["phase.backend"], "llama.cpp");
-        assert_eq!(shown["model_info"]["phase.context_length"], 32_768);
-        assert_eq!(shown["details"]["format"], "gguf");
-        assert_eq!(shown["details"]["quantization_level"], "Q4_K_M");
-        assert_eq!(shown["capabilities"], serde_json::json!(["completion"]));
-    }
-
-    #[test]
-    fn ollama_latest_suffix_routes_to_verified_base_alias() {
-        assert_eq!(ollama_routing_model_name("echo:latest"), "echo");
-        assert_eq!(ollama_routing_model_name("QWEN3:latest"), "qwen3");
-        assert_eq!(ollama_routing_model_name("qwen3:q4"), "qwen3:q4");
-    }
-
-    #[tokio::test]
-    async fn ps_does_not_invent_runtime_residency_records() {
-        let Json(response) = handle_ps().await;
-        assert!(response.models.is_empty());
-    }
-
-    #[test]
-    fn unknown_show_and_unconfigured_pull_are_explicit_errors() {
-        assert_eq!(
-            unknown_model_response("not-loaded").status(),
-            StatusCode::NOT_FOUND
-        );
-
-        for streaming in [false, true] {
-            let response = pull_unavailable_response("model store not configured", streaming);
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            if streaming {
-                assert_eq!(
-                    response
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok()),
-                    Some("application/x-ndjson")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn live_peer_verification_stays_pending_until_receipt_arrives() {
-        assert_eq!(ReceiptVerification::Pending.header_value(), Some("pending"));
-        assert_eq!(
-            finalized_receipt_verification(ReceiptVerification::Pending, true),
-            ReceiptVerification::Verified
-        );
-        assert_eq!(
-            finalized_receipt_verification(ReceiptVerification::Pending, false),
-            ReceiptVerification::Failed
-        );
-        assert_eq!(
-            finalized_receipt_verification(ReceiptVerification::Verified, false),
-            ReceiptVerification::Failed,
-            "a pre-verified route still must surface its delivered receipt"
-        );
-    }
-
-    #[test]
-    fn terminal_error_and_missing_final_are_http_failures() {
-        let missing = HttpTerminal::default();
-        assert!(missing
-            .failure_reason()
-            .expect("missing Final fails")
-            .contains("without a terminal"));
-
-        let mut errored = HttpTerminal::default();
-        errored.observe(Completion::Error, Some("backend exploded".to_string()));
-        assert_eq!(
-            execution_failure_reason(&errored, ReceiptVerification::Verified).as_deref(),
-            Some("backend exploded")
-        );
-
-        let mut duplicate = HttpTerminal::default();
-        duplicate.observe(Completion::Stop, None);
-        duplicate.observe(Completion::Stop, None);
-        assert!(duplicate
-            .failure_reason()
-            .expect("duplicate Final fails")
-            .contains("multiple terminal"));
-    }
-
-    #[test]
-    fn peer_failure_response_is_non_success_with_truthful_header() {
-        for (verification, expected_header) in [
-            (ReceiptVerification::Failed, "false"),
-            (ReceiptVerification::Unverifiable, "unverifiable"),
-        ] {
-            let response = execution_failure_response(
-                "untrusted peer result".to_string(),
-                Some("peer:test"),
-                verification,
-                Some("bounded route summary"),
-            );
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(HEADER_RECEIPT_VERIFIED)
-                    .and_then(|value| value.to_str().ok()),
-                Some(expected_header)
-            );
-            assert!(!response.headers().contains_key("x-phase-receipt"));
-        }
-
-        let verified_error = execution_failure_response(
-            "verified worker failure".to_string(),
-            Some("peer:test"),
-            ReceiptVerification::Verified,
-            None,
-        );
-        assert_eq!(verified_error.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            verified_error
-                .headers()
-                .get(HEADER_RECEIPT_VERIFIED)
-                .and_then(|value| value.to_str().ok()),
-            Some("true"),
-            "receipt validity and execution success are distinct"
-        );
-    }
-
-    #[test]
-    fn stream_terminal_carries_final_verification_or_error() {
-        let mut successful_terminal = HttpTerminal::default();
-        successful_terminal.observe(Completion::Stop, None);
-        let verified_receipt = FinishedReceipt {
-            verification: ReceiptVerification::Verified,
-            commitment: Some([7u8; 32]),
-        };
-        let mut successful = serde_json::json!({ "done": true, "done_reason": "stop" });
-        annotate_stream_terminal(&mut successful, &successful_terminal, &verified_receipt);
-        assert_eq!(successful["x_lucid_receipt_verified"], "true");
-        assert_eq!(successful["x_phase_commitment"], hex32(&[7u8; 32]));
-        assert!(successful.get("error").is_none());
-
-        let failed_receipt = FinishedReceipt {
-            verification: ReceiptVerification::Failed,
-            commitment: None,
-        };
-        let mut failed = serde_json::json!({ "done": true, "done_reason": "stop" });
-        annotate_stream_terminal(&mut failed, &successful_terminal, &failed_receipt);
-        assert_eq!(failed["x_lucid_receipt_verified"], "false");
-        assert_eq!(failed["done_reason"], "error");
-        assert!(failed["error"].as_str().unwrap().contains("receipt"));
-        assert!(failed.get("x_phase_commitment").is_none());
-
-        let mut errored_terminal = HttpTerminal::default();
-        errored_terminal.observe(Completion::Error, Some("worker failed".to_string()));
-        let mut verified_error = serde_json::json!({ "done": true, "done_reason": "error" });
-        annotate_stream_terminal(&mut verified_error, &errored_terminal, &verified_receipt);
-        assert_eq!(verified_error["x_lucid_receipt_verified"], "true");
-        assert_eq!(verified_error["error"], "worker failed");
-        assert!(verified_error.get("x_phase_commitment").is_none());
-    }
-
-    #[test]
-    fn sanitize_strips_crlf_and_ansi() {
-        // SEC-10: CRLF (log forging) and ESC/CSI (ANSI abuse) are dropped,
-        // yielding a single-line, escape-free string.
-        let evil = "/api/\r\nFAKE-LOG-LINE\x1b[31mred\x1b[0m\x00\x7f";
-        let s = sanitize_for_log(evil);
-        assert!(!s.contains('\r'));
-        assert!(!s.contains('\n'));
-        assert!(!s.contains('\x1b'));
-        assert!(!s.contains('\x00'));
-        assert!(!s.contains('\x7f'));
-        // Visible content survives.
-        assert!(s.contains("/api/"));
-        assert!(s.contains("FAKE-LOG-LINE"));
-        assert!(s.contains("red"));
-    }
-
-    #[test]
-    fn sanitize_caps_length() {
-        // SEC-10: a 10 KB path is capped at LOG_FIELD_CAP (+ ellipsis).
-        let huge = "/".to_string() + &"a".repeat(10_000);
-        let s = sanitize_for_log(&huge);
-        // chars(): cap content chars plus the trailing ellipsis marker.
-        assert!(s.chars().count() <= LOG_FIELD_CAP + 1);
-        assert!(s.ends_with('…'));
-    }
-
-    #[test]
-    fn sanitize_passes_clean_path_through() {
-        // SEC-10: a normal path is unchanged.
-        let clean = "/api/chat";
-        assert_eq!(sanitize_for_log(clean), clean);
-    }
-
-    #[test]
-    fn embed_input_accepts_single_string() {
-        // Ollama's `/api/embed` allows `input` as a bare string; the
-        // `untagged` enum should pick `One` and normalize to a 1-element vec.
-        let req: EmbedRequest =
-            serde_json::from_str(r#"{"model":"m","input":"hello"}"#).expect("parse single");
-        let inputs = req.input.expect("input present").into_vec();
-        assert_eq!(inputs, vec!["hello".to_string()]);
-    }
-
-    #[test]
-    fn embed_input_accepts_array_of_strings() {
-        // …and as an array; the same enum should pick `Many` and pass it
-        // through unchanged, preserving order.
-        let req: EmbedRequest =
-            serde_json::from_str(r#"{"model":"m","input":["x","y"]}"#).expect("parse array");
-        let inputs = req.input.expect("input present").into_vec();
-        assert_eq!(inputs, vec!["x".to_string(), "y".to_string()]);
-    }
-
-    #[test]
-    fn embed_input_refuses_unknown_fields() {
-        let parsed = serde_json::from_str::<EmbedRequest>(
-            r#"{"model":"m","input":"z","future_backend_knob":true}"#,
-        );
-        assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn nested_messages_and_legacy_embeddings_refuse_unknown_fields() {
-        assert!(serde_json::from_str::<WireMessage>(
-            r#"{"role":"user","content":"x","future_field":true}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<EmbeddingsRequest>(
-            r#"{"model":"m","prompt":"x","future_field":true}"#
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn text_output_requires_token_kind_contiguous_sequence_and_utf8() {
-        let mut next = 0;
-        let first = output_chunk(0, "token", Bytes::from_static(b"hello"));
-        assert_eq!(validated_text_chunk(&first, &mut next).unwrap(), "hello");
-        assert_eq!(next, 1);
-
-        let wrong_kind = output_chunk(1, "embedding", Bytes::from_static(b"[]"));
-        assert!(validated_text_chunk(&wrong_kind, &mut next)
-            .unwrap_err()
-            .contains("non-token"));
-
-        let wrong_seq = output_chunk(2, "token", Bytes::from_static(b"later"));
-        assert!(validated_text_chunk(&wrong_seq, &mut next)
-            .unwrap_err()
-            .contains("out-of-sequence"));
-
-        let non_utf8 = output_chunk(1, "token", Bytes::from_static(&[0xff, 0xfe]));
-        assert!(validated_text_chunk(&non_utf8, &mut next)
-            .unwrap_err()
-            .contains("non-UTF-8"));
-        assert_eq!(next, 1, "invalid chunks must not advance the sequence");
-    }
-
-    #[test]
-    fn embedding_collector_preserves_input_order_and_exact_count() {
-        let mut collector = EmbeddingCollector::new(2);
-        collector.observe(&output_chunk(
-            1,
-            "embedding",
-            Bytes::from_static(br#"[3.0,4.0]"#),
-        ));
-        collector.observe(&output_chunk(
-            0,
-            "embedding",
-            Bytes::from_static(br#"[1.0,2.0]"#),
-        ));
-        assert_eq!(
-            collector.finish().unwrap(),
-            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
-        );
-
-        let missing = EmbeddingCollector::new(1);
-        assert!(missing.finish().unwrap_err().contains("fewer"));
-
-        let mut extra = EmbeddingCollector::new(1);
-        extra.observe(&output_chunk(
-            1,
-            "embedding",
-            Bytes::from_static(br#"[1.0]"#),
-        ));
-        assert!(extra.finish().unwrap_err().contains("extra"));
-
-        let mut duplicate = EmbeddingCollector::new(1);
-        let vector = output_chunk(0, "embedding", Bytes::from_static(br#"[1.0]"#));
-        duplicate.observe(&vector);
-        duplicate.observe(&vector);
-        assert!(duplicate.finish().unwrap_err().contains("duplicate"));
-    }
-
-    #[test]
-    fn embedding_collector_rejects_wrong_kind_malformed_and_invalid_vectors() {
-        for (chunk, expected) in [
-            (
-                output_chunk(0, "token", Bytes::from_static(b"text")),
-                "non-embedding",
-            ),
-            (
-                output_chunk(0, "embedding", Bytes::from_static(b"not-json")),
-                "malformed",
-            ),
-            (
-                output_chunk(0, "embedding", Bytes::from_static(b"[]")),
-                "dimension",
-            ),
-        ] {
-            let mut collector = EmbeddingCollector::new(1);
-            collector.observe(&chunk);
-            assert!(collector.finish().unwrap_err().contains(expected));
-        }
-
-        let mut inconsistent = EmbeddingCollector::new(2);
-        inconsistent.observe(&output_chunk(
-            0,
-            "embedding",
-            Bytes::from_static(br#"[1.0]"#),
-        ));
-        inconsistent.observe(&output_chunk(
-            1,
-            "embedding",
-            Bytes::from_static(br#"[1.0,2.0]"#),
-        ));
-        assert!(inconsistent.finish().unwrap_err().contains("inconsistent"));
-
-        assert!(validate_embedding_values(&[f32::NAN])
-            .unwrap_err()
-            .contains("non-finite"));
-        assert!(validate_embedding_values(&[f32::INFINITY])
-            .unwrap_err()
-            .contains("non-finite"));
-    }
-
-    #[test]
-    fn route_explanation_is_bounded_control_safe_and_identifier_redacted() {
-        let peer_shaped = "A".repeat(52);
-        let raw = format!(
-            "local evidence\r\nselected {peer_shaped} \u{1b}[31m{}",
-            "x".repeat(400)
-        );
-        let public = public_route_explanation(&raw);
-        assert!(public.is_ascii());
-        assert!(public.len() <= MAX_ROUTE_EXPLANATION_BYTES);
-        assert!(!public.contains('\r'));
-        assert!(!public.contains('\n'));
-        assert!(!public.contains('\u{1b}'));
-        assert!(!public.contains(&peer_shaped));
-        assert!(public.contains("[redacted]"));
-        assert!(HeaderValue::from_str(&public).is_ok());
-    }
-
-    #[test]
-    fn ollama_options_are_bounded_and_signed_into_sampling() {
-        let options = serde_json::json!({
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1,
-            "seed": 42,
-            "stop": ["END"],
-            "num_predict": 128,
-        });
-        let (sampling, max_tokens) = parse_ollama_options(Some(&options)).unwrap();
-        assert_eq!(max_tokens, 128);
-        assert_eq!(sampling.params["temperature"], "0.7");
-        assert_eq!(sampling.params["repetition_penalty"], "1.1");
-        assert_eq!(sampling.params["stop"], r#"["END"]"#);
-    }
-
-    #[test]
-    fn ollama_options_refuse_unknown_unbounded_and_duplicate_controls() {
-        for options in [
-            serde_json::json!({"future_backend_knob": true}),
-            serde_json::json!({"num_predict": 0}),
-            serde_json::json!({"num_predict": 8193}),
-            serde_json::json!({"repeat_penalty": 1.1, "repetition_penalty": 1.2}),
-            serde_json::json!(["not", "an", "object"]),
-        ] {
-            assert!(
-                parse_ollama_options(Some(&options)).is_err(),
-                "expected options to be refused: {options}"
-            );
-        }
-    }
-
-    #[test]
-    fn request_validators_refuse_ignored_controls_and_unbounded_inputs() {
-        let chat: ChatRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "alien", "content": "x"}],
-        }))
-        .unwrap();
-        assert!(validate_chat_request(&chat).is_err());
-
-        let chat_with_image: ChatRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "x", "images": ["abc"]}],
-        }))
-        .unwrap();
-        assert!(validate_chat_request(&chat_with_image).is_err());
-
-        let generate: GenerateRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "prompt": "x", "template": "ignored-before-this-fix"
-        }))
-        .unwrap();
-        assert!(validate_generate_request(&generate).is_err());
-
-        assert!(validate_embedding_input(&vec!["x".to_string(); MAX_EMBED_INPUTS + 1]).is_err());
-        assert!(validate_embedding_input(&["x".repeat(MAX_HTTP_INPUT_CHARS + 1)]).is_err());
-    }
-
-    #[test]
-    fn pull_name_hygiene_accepts_plain_names() {
-        // Ordinary model names (the only thing that can resolve to a local
-        // GGUF) pass the guard.
-        for name in ["qwen3", "llama3.1", "nomic-embed-text", "gpt-oss"] {
-            assert!(pull_name_is_safe(name), "expected {name:?} to be allowed");
-        }
-    }
-
-    #[test]
-    fn pull_name_hygiene_rejects_traversal_and_flags() {
-        // SEC-04 parity with worker_llama::resolve_model_path: separators,
-        // `..`, leading `-`, and empty are all rejected before the filesystem
-        // is ever touched.
-        for name in [
-            "",
-            "../etc/passwd",
-            "..",
-            "foo/bar",
-            "foo\\bar",
-            "-rf",
-            "--flag",
-            "a/../b",
-        ] {
-            assert!(!pull_name_is_safe(name), "expected {name:?} to be rejected");
-        }
-    }
-
-    #[test]
-    fn pull_selection_parses_exact_cid_and_publisher_pins_strictly() {
-        let cid = crate::registry::ModelCid([0x7a; 32]);
-        let publisher = PeerId::random();
-        assert_eq!(
-            parse_pull_selection(Some(&cid.to_hex()), Some(&publisher.to_string())).unwrap(),
-            PullSelection {
-                exact_cid: Some(cid),
-                publisher: Some(publisher),
-            }
-        );
-        assert!(parse_pull_selection(Some("sha256:not-canonical"), None).is_err());
-        assert!(parse_pull_selection(None, Some("not-a-peer-id")).is_err());
-    }
-}
+mod tests;

@@ -15,6 +15,8 @@
 // lucidd's source against an `unsafe` regression.
 #![deny(unsafe_code)]
 
+pub(crate) mod backend_io;
+pub mod consumer;
 pub mod content;
 pub mod dht_transport;
 pub mod echo;

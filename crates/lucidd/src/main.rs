@@ -153,6 +153,10 @@ struct Cli {
     #[arg(long)]
     policy_config: Option<PathBuf>,
 
+    /// Private file containing the local native-control API bearer token.
+    #[arg(long)]
+    control_token_file: Option<PathBuf>,
+
     /// Append-only local execution-evidence store. By default this is placed
     /// beside the persistent identity as `reputation-evidence-v1.log`, which
     /// keeps evidence scoped to the observer PeerId that produced it.
@@ -195,6 +199,16 @@ struct Cli {
     /// be written, etc.
     #[arg(long, default_value_t = 0)]
     libp2p_port: u16,
+
+    /// Explicit direct listen multiaddrs, e.g. /ip4/127.0.0.1/tcp/4001.
+    /// Defaults to IPv4/IPv6 wildcard TCP listeners when not outbound-only.
+    #[arg(long = "listen-address", value_name = "MULTIADDR")]
+    listen_addresses: Vec<String>,
+
+    /// Connect through outbound transports and reserved relay circuits only.
+    /// Disables direct peer listeners, multicast discovery and hole punching.
+    #[arg(long, default_value_t = false)]
+    outbound_only: bool,
 
     /// Multiaddrs of bootstrap peers to dial on startup. Repeatable.
     /// Format: `/ip4/x.x.x.x/tcp/<port>/p2p/<peer-id>` or
@@ -688,6 +702,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--no-relay-server and --no-autonat-server require --mode infrastructure".into(),
         );
     }
+    if cli.outbound_only && cli.mode == NodeMode::Infrastructure {
+        return Err("--outbound-only cannot be combined with --mode infrastructure".into());
+    }
+    if cli.listen_addresses.len() > 4 {
+        return Err("at most four explicit --listen-address values are allowed".into());
+    }
+    if cli.outbound_only && !cli.listen_addresses.is_empty() {
+        return Err("--outbound-only cannot be combined with --listen-address".into());
+    }
     let worker_choice = if no_local_worker {
         None
     } else {
@@ -756,6 +779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reachability = if cli.mode == NodeMode::Infrastructure {
         ReachabilityConfig {
             role: ReachabilityRole::Infrastructure,
+            outbound_only: false,
             autonat_server: !cli.no_autonat_server,
             relay_server: (!cli.no_relay_server).then(RelayServerLimits::default),
             // The upstream rendezvous store has TTL bounds but no global,
@@ -765,7 +789,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..ReachabilityConfig::default()
         }
     } else {
-        ReachabilityConfig::default()
+        ReachabilityConfig {
+            outbound_only: cli.outbound_only,
+            ..ReachabilityConfig::default()
+        }
     };
     let discovery = Arc::new(Discovery::new_with_reachability(disc_config, reachability)?);
 
@@ -777,23 +804,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // random (the historical default; fine on LAN where mDNS handles
     // discovery). Port `>0` = stable, suitable for WAN bootstrap-peer
     // multiaddrs and for routers that need a known forward port.
-    let listen_v4 = format!("/ip4/0.0.0.0/tcp/{}", cli.libp2p_port);
-    let listen_v6 = format!("/ip6/::/tcp/{}", cli.libp2p_port);
-    let listen_v4_ok = match discovery.listen(&listen_v4).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, addr = %listen_v4, "discovery IPv4 listen failed");
-            false
-        }
+    let direct_addresses = if cli.listen_addresses.is_empty() {
+        vec![
+            format!("/ip4/0.0.0.0/tcp/{}", cli.libp2p_port),
+            format!("/ip6/::/tcp/{}", cli.libp2p_port),
+        ]
+    } else {
+        cli.listen_addresses.clone()
     };
-    let listen_v6_ok = match discovery.listen(&listen_v6).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, addr = %listen_v6, "discovery IPv6 listen failed");
-            false
+    let mut direct_listening = false;
+    if !cli.outbound_only {
+        for address in direct_addresses {
+            match discovery.listen(&address).await {
+                Ok(()) => direct_listening = true,
+                Err(error) => tracing::warn!(%error, "discovery direct listen failed"),
+            }
         }
-    };
-    if cli.mode == NodeMode::Infrastructure && !listen_v4_ok && !listen_v6_ok {
+    }
+    if cli.mode == NodeMode::Infrastructure && !direct_listening {
         return Err("infrastructure mode could not establish any libp2p listener".into());
     }
     for address in &cli.external_addresses {
@@ -877,13 +905,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| identity_sidecar_path(&identity_path, ".alias-replay-state-v1.json"));
     let registry = Arc::new(ModelRegistry::new_with_alias_replay_state(
         node_identity.clone(),
-        transport,
+        transport.clone(),
         alias_replay_path,
     )?);
 
     // Operator policy. The engine seeds `~/.config/lucidd/policy.toml`
     // on first run with a fully-commented default.
     let policy = Arc::new(PolicyEngine::load_or_default(cli.policy_config.clone()).await?);
+    let consumer = lucidd::consumer::ConsumerControl::open(
+        node_identity.clone(),
+        transport,
+        policy.clone(),
+        identity_sidecar_path(&identity_path, ".enrollment-v1.json"),
+        cli.control_token_file
+            .clone()
+            .unwrap_or_else(|| identity_sidecar_path(&identity_path, ".control-token")),
+    )?;
+    let _enrollment_server = consumer.spawn_server();
 
     // Llama execution is rooted in verified content, never directly in the
     // operator's mutable source directory. Consume-only nodes also get a
@@ -1304,6 +1342,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         artifact_store,
         verified_model_dir,
         content_plane,
+        consumer,
+        discovery,
+        started_at: tokio::time::Instant::now(),
     };
     let app = ollama_router(state);
 
@@ -1326,6 +1367,26 @@ fn validate_http_bind_addr(addr: SocketAddr) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_consumer_cli_uses_explicit_private_control_and_outbound_mode() {
+        let cli = Cli::try_parse_from([
+            "lucidd",
+            "--mode",
+            "consume-only",
+            "--outbound-only",
+            "--control-token-file",
+            "/tmp/lucid-private/control.token",
+        ])
+        .expect("native consumer CLI contract");
+        assert!(cli.outbound_only);
+        assert_eq!(cli.mode, NodeMode::ConsumeOnly);
+        assert_eq!(
+            cli.control_token_file,
+            Some(PathBuf::from("/tmp/lucid-private/control.token"))
+        );
+        assert!(cli.listen_addresses.is_empty());
+    }
 
     #[test]
     fn unauthenticated_http_bind_is_loopback_only() {

@@ -1,26 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "phase-net"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "libp2p, Kademlia DHT, mDNS, and Noise+QUIC transport for decentralized Phase peer discovery and capability advertisement."
-authors = ["Michael Sitarzewski"]
-repository = "https://github.com/msitarzewski/phase"
+authors.workspace = true
+repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-# Sibling Phase library crates. phase-identity supplies the persistent
-# Ed25519 keypair the libp2p PeerId is derived from; phase-protocol supplies
-# JobSpecKind so capability advertisements speak in workload-agnostic terms
-# rather than WASM-specific runtime strings.
 phase-identity = { path = "../phase-identity", version = "0.1.0" }
 phase-protocol = { path = "../phase-protocol", version = "0.1.0" }
 
-# Networking (libp2p). Same feature set as the daemon historically used, plus
-# `request-response` for the JobOffer wire-level send path that M2 introduces.
-libp2p = { version = "0.56", features = [
+libp2p = { workspace = true, features = [
     "kad",
     "noise",
     "tcp",
@@ -38,37 +32,23 @@ libp2p = { version = "0.56", features = [
     "json",
     "cbor",
 ] }
-# Official generic substream behaviour used by the distinct v2 live relay
-# protocol. This keeps token/event streaming on the existing libp2p swarm
-# while leaving v1 request/response compatibility explicit.
 libp2p-stream = "0.4.0-alpha"
 
-# Async runtime + stream plumbing.
-tokio = { version = "1.0", features = ["full"] }
-futures = "0.3"
-async-trait = "0.1"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+futures.workspace = true
+async-trait.workspace = true
 
-# Serialization. JobOffer / JobResponse / JobRequirements stay on the wire
-# as JSON for protocol compatibility with the November 2025 MVP.
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_bytes = "0.11"
-base64 = "0.22"
-postcard = { version = "1", features = ["use-std"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+base64.workspace = true
+postcard.workspace = true
 
-# Cryptography. Used only to bridge phase-identity's Ed25519 secret into the
-# libp2p Keypair — the actual signing live in phase-identity / phase-receipt.
-ed25519-dalek = "2.1"
-
-# Logging.
-tracing = "0.1"
-
-# Error handling.
-anyhow = "1.0"
-thiserror = "2.0"
-
-# Capability discovery defaults.
-num_cpus = "1.0"
+ed25519-dalek.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+num_cpus.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }

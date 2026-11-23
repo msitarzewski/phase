@@ -166,11 +166,10 @@ impl PolicyConfig {
     ///    local-dev mode).
     /// 2. Otherwise the key must appear in `authorized_submitters`.
     ///
-    /// NOTE (SEC-06 / PeerID-bind): the relay handler (`router.rs`) now ALSO
-    /// accepts a signer whose Ed25519 key derives to the delivering libp2p
-    /// `PeerId` — implemented in `make_inbound_relay_handler` as an
-    /// alternative acceptance path alongside this allowlist. This method
-    /// remains the allowlist-only check; the bind is applied by the handler.
+    /// The relay handler additionally requires the signer's key to derive to
+    /// the delivering libp2p PeerId. That binding does not authorize a
+    /// stranger. This config-only method checks the allowlist; PolicyEngine
+    /// also accepts unexpired, explicitly issued enrollment grants.
     pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
         if self.allow_unauthenticated_jobs {
             return true;
@@ -257,12 +256,40 @@ pub struct PolicyState {
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Precompiled runtime policy. Stored behind an `Arc` so hot-path reads
+/// (`should_serve`, `should_serve_self`) clone only a pointer and evaluate
+/// precompiled `glob::Pattern`s instead of cloning `PolicyConfig` and
+/// reparsing globs on every request.
+struct CompiledPolicy {
+    config: PolicyConfig,
+    serve_globs: Vec<glob::Pattern>,
+}
+
+impl CompiledPolicy {
+    fn new(config: PolicyConfig) -> Self {
+        let serve_globs = config
+            .serve_models
+            .iter()
+            .filter_map(|pattern| glob::Pattern::new(pattern).ok())
+            .collect();
+        Self {
+            config,
+            serve_globs,
+        }
+    }
+
+    fn matches_model(&self, model_id: &str) -> bool {
+        self.serve_globs.iter().any(|pat| pat.matches(model_id))
+    }
+}
+
 /// The policy engine. Cheap to clone (everything is `Arc`); the engine owns
 /// a background watcher task that polls system state and reloads config on
 /// file change. Drop the engine to stop the watcher.
 pub struct PolicyEngine {
-    config: Arc<RwLock<PolicyConfig>>,
+    policy: Arc<RwLock<Arc<CompiledPolicy>>>,
     state: Arc<RwLock<PolicyState>>,
+    enrollment: RwLock<Option<Arc<crate::consumer::EnrollmentStore>>>,
     config_path: Option<PathBuf>,
     _watcher_handle: Option<JoinHandle<()>>,
 }
@@ -296,14 +323,15 @@ impl PolicyEngine {
             PolicyConfig::default()
         };
 
-        let config = Arc::new(RwLock::new(config));
+        let policy = Arc::new(RwLock::new(Arc::new(CompiledPolicy::new(config))));
         let state = Arc::new(RwLock::new(PolicyState::default()));
 
-        let watcher_handle = spawn_watcher(config.clone(), state.clone(), resolved.clone());
+        let watcher_handle = spawn_watcher(policy.clone(), state.clone(), resolved.clone());
 
         Ok(Self {
-            config,
+            policy,
             state,
+            enrollment: RwLock::new(None),
             config_path: resolved,
             _watcher_handle: Some(watcher_handle),
         })
@@ -316,9 +344,10 @@ impl PolicyEngine {
         // turn one fault into a node-wide policy-check outage. The guarded
         // data (config/state) is plain data with no broken invariant, so
         // reading through the poison is safe.
-        self.config
+        self.policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .config
             .clone()
     }
 
@@ -326,18 +355,35 @@ impl PolicyEngine {
     /// submit work? Reads the live config under the lock. Cheap; never held
     /// across an `.await`.
     pub fn is_authorized_submitter(&self, pubkey_hex: &str) -> bool {
-        self.config
+        let configured = self
+            .policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .is_authorized_submitter(pubkey_hex)
+            .config
+            .is_authorized_submitter(pubkey_hex);
+        configured
+            || self.enrollment.read().ok().is_some_and(|store| {
+                store
+                    .as_ref()
+                    .is_some_and(|store| store.is_authorized(pubkey_hex))
+            })
+    }
+
+    /// Attach durable grants created by explicit local operator invitations.
+    /// Other model/resource policy and signer-to-transport binding still apply.
+    pub fn attach_enrollment_store(&self, store: Arc<crate::consumer::EnrollmentStore>) {
+        if let Ok(mut enrollment) = self.enrollment.write() {
+            *enrollment = Some(store);
+        }
     }
 
     /// SEC-01: clamp a manifest-supplied `max_tokens` to the live operator
     /// ceiling.
     pub fn clamp_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
-        self.config
+        self.policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .config
             .clamp_max_tokens(requested)
     }
 
@@ -351,13 +397,18 @@ impl PolicyEngine {
     /// because the router's bookkeeping is per-request and lives closer to
     /// the dispatch path.
     pub fn should_serve(&self, model_id: &str, current_concurrency: u32) -> PolicyDecision {
-        let config = self
-            .config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let state = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let decision = decide(&config, &state, model_id, current_concurrency);
+        let compiled = Arc::clone(&self.policy.read().unwrap_or_else(|e| e.into_inner()));
+        let (on_battery, temperature_c) = {
+            let s = self.state.read().unwrap_or_else(|e| e.into_inner());
+            (s.on_battery, s.temperature_c)
+        };
+        let decision = decide_compiled(
+            &compiled,
+            on_battery,
+            temperature_c,
+            model_id,
+            current_concurrency,
+        );
         // Best-effort record of the last decision. We try a non-blocking
         // write so a contended watcher tick can't stall a request; if it
         // fails we accept a stale `last_decision` snapshot.
@@ -375,12 +426,8 @@ impl PolicyEngine {
     /// themselves. It still respects manual_pause: an explicit operator
     /// "this node is off" wins. No new config knob; this is correct semantics.
     pub fn should_serve_self(&self, model_id: &str) -> PolicyDecision {
-        let config = self
-            .config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        decide_self(&config, model_id)
+        let compiled = Arc::clone(&self.policy.read().unwrap_or_else(|e| e.into_inner()));
+        decide_self(&compiled.config, model_id)
     }
 
     /// Flip the operator-controlled manual pause. The change is durable for
@@ -388,8 +435,10 @@ impl PolicyEngine {
     /// concern (M7 future work — the operator can also just edit the
     /// config file).
     pub async fn set_manual_pause(&self, paused: bool) {
-        let mut c = self.config.write().unwrap_or_else(|e| e.into_inner());
-        c.manual_pause = paused;
+        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        let mut updated = guard.config.clone();
+        updated.manual_pause = paused;
+        *guard = Arc::new(CompiledPolicy::new(updated));
     }
 
     /// Force a re-read of the config file. Used by the SIGHUP handler and
@@ -404,7 +453,8 @@ impl PolicyEngine {
         let new = tokio::task::spawn_blocking(move || read_config(&path))
             .await
             .context("reload join")??;
-        *self.config.write().unwrap_or_else(|e| e.into_inner()) = new;
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(CompiledPolicy::new(new));
         if let Some(p) = &self.config_path {
             tracing::info!(path = %p.display(), "policy config reloaded");
         }
@@ -422,8 +472,9 @@ impl PolicyEngine {
         // the engine — `None` keeps this constructor usable from plain
         // `#[test]` functions (not just `#[tokio::test]`).
         Self {
-            config: Arc::new(RwLock::new(config)),
+            policy: Arc::new(RwLock::new(Arc::new(CompiledPolicy::new(config)))),
             state: Arc::new(RwLock::new(state)),
+            enrollment: RwLock::new(None),
             config_path: None,
             _watcher_handle: None,
         }
@@ -440,12 +491,32 @@ impl PolicyEngine {
 // Pure decision function (no I/O — easy to test)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn decide(
     config: &PolicyConfig,
     state: &PolicyState,
     model_id: &str,
     current_concurrency: u32,
 ) -> PolicyDecision {
+    let compiled = CompiledPolicy::new(config.clone());
+    decide_compiled(
+        &compiled,
+        state.on_battery,
+        state.temperature_c,
+        model_id,
+        current_concurrency,
+    )
+}
+
+fn decide_compiled(
+    compiled: &CompiledPolicy,
+    on_battery: Option<bool>,
+    temperature_c: Option<f32>,
+    model_id: &str,
+    current_concurrency: u32,
+) -> PolicyDecision {
+    let config = &compiled.config;
+
     // 1. Manual override wins.
     if config.manual_pause {
         return PolicyDecision::Pause {
@@ -455,7 +526,7 @@ fn decide(
 
     // 2. On battery — only if we *know* we're on battery. `None` (desktop /
     //    unknown) is treated as "fine to serve".
-    if config.auto_pause_on_battery && state.on_battery == Some(true) {
+    if config.auto_pause_on_battery && on_battery == Some(true) {
         return PolicyDecision::Pause {
             reason: PauseReason::OnBattery,
         };
@@ -464,10 +535,9 @@ fn decide(
     // 3. Thermal threshold. If the threshold is set and we have a reading
     //    above it, pause. A missing sensor is "fine to serve" — operators
     //    on hardware without sensors can pause manually.
-    if let (Some(threshold), Some(current)) = (
-        config.auto_pause_on_thermal_threshold_c,
-        state.temperature_c,
-    ) {
+    if let (Some(threshold), Some(current)) =
+        (config.auto_pause_on_thermal_threshold_c, temperature_c)
+    {
         if current > threshold {
             return PolicyDecision::Pause {
                 reason: PauseReason::ThermalLimit {
@@ -495,10 +565,8 @@ fn decide(
         };
     }
 
-    // 6. Model allowlist (glob). Operators write things like
-    //    `["qwen3-*", "deepseek-v3-*"]`; we match the request's `model_id`
-    //    against each pattern and accept on first hit.
-    if !matches_any_glob(&config.serve_models, model_id) {
+    // 6. Model allowlist (precompiled globs).
+    if !compiled.matches_model(model_id) {
         return PolicyDecision::Pause {
             reason: PauseReason::ModelNotInAllowlist {
                 model_id: model_id.to_string(),
@@ -523,6 +591,7 @@ fn decide_self(config: &PolicyConfig, _model_id: &str) -> PolicyDecision {
     PolicyDecision::Allow
 }
 
+#[cfg(test)]
 fn matches_any_glob(patterns: &[String], model_id: &str) -> bool {
     patterns.iter().any(|p| {
         glob::Pattern::new(p)
@@ -636,12 +705,13 @@ enum WatcherEvent {
 }
 
 fn spawn_watcher(
-    config: Arc<RwLock<PolicyConfig>>,
+    policy: Arc<RwLock<Arc<CompiledPolicy>>>,
     state: Arc<RwLock<PolicyState>>,
     config_path: Option<PathBuf>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<WatcherEvent>(16);
+        let prober = Arc::new(std::sync::Mutex::new(SystemProber::new()));
 
         // --- filesystem watcher ---
         // `notify`'s watcher emits events on a crossbeam channel. We adapt
@@ -688,8 +758,8 @@ fn spawn_watcher(
                         let read = tokio::task::spawn_blocking(move || read_config(&p_clone)).await;
                         match read {
                             Ok(Ok(new)) => {
-                                if let Ok(mut guard) = config.write() {
-                                    *guard = new;
+                                if let Ok(mut guard) = policy.write() {
+                                    *guard = Arc::new(CompiledPolicy::new(new));
                                 }
                                 tracing::info!(path = %p.display(), "policy config reloaded");
                             }
@@ -707,10 +777,16 @@ fn spawn_watcher(
                     }
                 }
                 WatcherEvent::PollState => {
-                    let probed = tokio::task::spawn_blocking(probe_system_state)
-                        .await
-                        .ok()
-                        .unwrap_or_default();
+                    let prober_ref = Arc::clone(&prober);
+                    let probed = tokio::task::spawn_blocking(move || {
+                        prober_ref
+                            .lock()
+                            .map(|mut guard| guard.probe())
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .ok()
+                    .unwrap_or_default();
                     if let Ok(mut s) = state.write() {
                         s.on_battery = probed.on_battery;
                         s.temperature_c = probed.temperature_c;
@@ -791,10 +867,57 @@ struct ProbedState {
     temperature_c: Option<f32>,
 }
 
-fn probe_system_state() -> ProbedState {
-    ProbedState {
-        on_battery: probe_battery(),
-        temperature_c: probe_temperature(),
+/// Reusable sensor handle kept alive on the background policy watcher so
+/// `sysinfo::Components` is enumerated once and refreshed once per tick
+/// instead of re-enumerating + double-refreshing every 30 seconds.
+struct SystemProber {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    components: Option<sysinfo::Components>,
+}
+
+impl SystemProber {
+    fn new() -> Self {
+        Self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            components: None,
+        }
+    }
+
+    fn probe(&mut self) -> ProbedState {
+        ProbedState {
+            on_battery: probe_battery(),
+            temperature_c: self.probe_temperature(),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn probe_temperature(&mut self) -> Option<f32> {
+        let components = match self.components.as_mut() {
+            Some(existing) => {
+                existing.refresh();
+                existing
+            }
+            None => self
+                .components
+                .insert(sysinfo::Components::new_with_refreshed_list()),
+        };
+        let mut hottest: Option<f32> = None;
+        for comp in components.iter() {
+            let t = comp.temperature();
+            if t.is_nan() || t <= 0.0 {
+                continue;
+            }
+            hottest = Some(match hottest {
+                Some(prev) if prev >= t => prev,
+                _ => t,
+            });
+        }
+        hottest
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn probe_temperature(&mut self) -> Option<f32> {
+        None
     }
 }
 
@@ -821,36 +944,6 @@ fn probe_battery() -> Option<bool> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn probe_battery() -> Option<bool> {
-    None
-}
-
-/// Hottest component temperature in °C across the available sensors. `None`
-/// if no usable sensor is exposed by the OS.
-///
-/// `sysinfo 0.32::Component::temperature()` returns `f32` directly. `NaN`
-/// or negative values mean "no reading"; we filter those out so callers see
-/// a real temperature or `None`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn probe_temperature() -> Option<f32> {
-    use sysinfo::Components;
-    let mut components = Components::new_with_refreshed_list();
-    components.refresh();
-    let mut hottest: Option<f32> = None;
-    for comp in components.iter() {
-        let t = comp.temperature();
-        if t.is_nan() || t <= 0.0 {
-            continue;
-        }
-        hottest = Some(match hottest {
-            Some(prev) if prev >= t => prev,
-            _ => t,
-        });
-    }
-    hottest
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn probe_temperature() -> Option<f32> {
     None
 }
 

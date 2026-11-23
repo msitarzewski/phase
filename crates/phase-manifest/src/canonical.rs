@@ -34,16 +34,10 @@ pub(crate) fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, Man
 fn sort_value(v: Value) -> Value {
     match v {
         Value::Object(map) => {
-            let mut sorted = Map::new();
-            // BTreeMap-style ordering by sorting keys first.
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            for k in keys {
-                // `map` was consumed by `keys()` above — we need to retrieve
-                // the entry. `Map` doesn't let us move out, so we clone the
-                // value (cheap enough for manifest payloads). To avoid the
-                // clone we'd need to drain via `into_iter` and sort the vec.
-                let val = map.get(&k).cloned().unwrap_or(Value::Null);
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            let mut sorted = Map::with_capacity(entries.len());
+            for (k, val) in entries {
                 sorted.insert(k, sort_value(val));
             }
             Value::Object(sorted)

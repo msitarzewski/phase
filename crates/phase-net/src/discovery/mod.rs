@@ -22,14 +22,18 @@ use libp2p::{
     autonat, connection_limits, dcutr, identify,
     identity::Keypair,
     kad::{
-        store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent, GetRecordOk,
-        Mode as KademliaMode, QueryId, QueryResult,
+        store::MemoryStore, Behaviour as KademliaBehaviour, Event as KademliaEvent, GetProvidersOk,
+        GetRecordOk, Mode as KademliaMode, QueryId, QueryResult,
     },
     mdns,
     multiaddr::Protocol,
     relay, rendezvous,
     request_response::{self, cbor, json, OutboundRequestId, ProtocolSupport, ResponseChannel},
-    swarm::{behaviour::toggle::Toggle, ConnectionId, NetworkBehaviour, SwarmEvent},
+    swarm::{
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
+        ConnectionId, NetworkBehaviour, SwarmEvent,
+    },
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use phase_identity::NodeIdentity;
@@ -79,6 +83,10 @@ pub const MAX_KAD_RECORD_KEY_BYTES: usize = 512;
 pub const MAX_KAD_RECORD_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_KAD_RECORD_VALUES_PER_QUERY: usize = 256;
 pub const MAX_KAD_RECORD_BYTES_PER_QUERY: usize = 4 * 1024 * 1024;
+pub const MAX_PROVIDER_PEERS_PER_QUERY: usize = 64;
+const MAX_PENDING_PROVIDER_QUERIES: usize = 32;
+const MAX_PENDING_RELAY_LISTENS: usize = 32;
+const DISCOVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Callback the daemon registers to serve inbound JobRelay requests.
 ///
@@ -532,6 +540,10 @@ impl RendezvousServerLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachabilityConfig {
     pub role: ReachabilityRole,
+    /// Disable direct listeners, multicast discovery and hole-punch/probe
+    /// listeners. Reserved relay circuits remain available over outbound
+    /// control connections; this mode never exposes infrastructure services.
+    pub outbound_only: bool,
     pub relay_client: bool,
     pub dcutr: bool,
     pub identify: bool,
@@ -546,6 +558,7 @@ impl Default for ReachabilityConfig {
     fn default() -> Self {
         Self {
             role: ReachabilityRole::Peer,
+            outbound_only: false,
             relay_client: true,
             dcutr: true,
             identify: true,
@@ -560,6 +573,11 @@ impl Default for ReachabilityConfig {
 
 impl ReachabilityConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.outbound_only && self.role == ReachabilityRole::Infrastructure {
+            return Err(anyhow!(
+                "outbound-only peers cannot run infrastructure services"
+            ));
+        }
         if self.role == ReachabilityRole::Peer
             && (self.relay_server.is_some()
                 || self.autonat_server
@@ -609,6 +627,7 @@ pub struct ReachabilityConnection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachabilitySnapshot {
     pub role: ReachabilityRole,
+    pub outbound_only: bool,
     pub active_path: ReachabilityPath,
     pub nat: NatReachability,
     pub listen_addresses: Vec<Multiaddr>,
@@ -625,34 +644,44 @@ pub struct RendezvousPeer {
     pub ttl_seconds: u64,
 }
 
-/// Combined network behaviour: Kademlia DHT + mDNS local discovery +
-/// JSON-coded request/response for JobOffer.
-#[derive(NetworkBehaviour)]
-struct CombinedBehaviour {
-    /// Hard swarm-level bounds apply before any application protocol is
-    /// negotiated. This protects rendezvous/relay deployments as well as the
-    /// LUCID-specific substreams below.
-    connection_limits: connection_limits::Behaviour,
-    kademlia: KademliaBehaviour<MemoryStore>,
-    mdns: mdns::tokio::Behaviour,
-    relay_client: Toggle<relay::client::Behaviour>,
-    relay_server: Toggle<relay::Behaviour>,
-    dcutr: Toggle<dcutr::Behaviour>,
-    identify: Toggle<identify::Behaviour>,
-    autonat_client: Toggle<autonat::v2::client::Behaviour>,
-    autonat_server: Toggle<autonat::v2::server::Behaviour>,
-    rendezvous_client: Toggle<rendezvous::client::Behaviour>,
-    rendezvous_server: Toggle<rendezvous::server::Behaviour>,
-    job_offer: json::Behaviour<JobOffer, JobResponse>,
-    /// LUCID M5 peer-relay request/response. CBOR-encoded so the binary
-    /// payload (bincode `SignedManifest<JobSpec>` / `Vec<JobEvent>`) doesn't
-    /// suffer the 4-5× blow-up JSON's u8 arrays cause.
-    job_relay: cbor::Behaviour<JobRelayRequest, JobRelayResponse>,
-    /// Distinct v2 bidirectional substreams. The behaviour only negotiates
-    /// and opens streams; Phase's bounded frame codec and state machine live
-    /// in this module and `protocol.rs`.
-    job_relay_stream: libp2p_stream::Behaviour,
+#[allow(
+    unreachable_code,
+    reason = "libp2p NetworkBehaviour derive emits unreachable arms for Infallible sub-behaviours on Rust 1.100+"
+)]
+mod combined_behaviour {
+    use super::*;
+
+    /// Combined network behaviour: Kademlia DHT + mDNS local discovery +
+    /// JSON-coded request/response for JobOffer.
+    #[derive(NetworkBehaviour)]
+    pub(super) struct CombinedBehaviour {
+        /// Hard swarm-level bounds apply before any application protocol is
+        /// negotiated. This protects rendezvous/relay deployments as well as the
+        /// LUCID-specific substreams below.
+        pub(super) connection_limits: connection_limits::Behaviour,
+        pub(super) kademlia: KademliaBehaviour<MemoryStore>,
+        pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(super) relay_client: Toggle<relay::client::Behaviour>,
+        pub(super) relay_server: Toggle<relay::Behaviour>,
+        pub(super) dcutr: Toggle<dcutr::Behaviour>,
+        pub(super) identify: Toggle<identify::Behaviour>,
+        pub(super) autonat_client: Toggle<autonat::v2::client::Behaviour>,
+        pub(super) autonat_server: Toggle<autonat::v2::server::Behaviour>,
+        pub(super) rendezvous_client: Toggle<rendezvous::client::Behaviour>,
+        pub(super) rendezvous_server: Toggle<rendezvous::server::Behaviour>,
+        pub(super) job_offer: json::Behaviour<JobOffer, JobResponse>,
+        /// LUCID M5 peer-relay request/response. CBOR-encoded so the binary
+        /// payload (bincode `SignedManifest<JobSpec>` / `Vec<JobEvent>`) doesn't
+        /// suffer the 4-5× blow-up JSON's u8 arrays cause.
+        pub(super) job_relay: cbor::Behaviour<JobRelayRequest, JobRelayResponse>,
+        /// Distinct v2 bidirectional substreams. The behaviour only negotiates
+        /// and opens streams; Phase's bounded frame codec and state machine live
+        /// in this module and `protocol.rs`.
+        pub(super) job_relay_stream: libp2p_stream::Behaviour,
+    }
 }
+
+use combined_behaviour::{CombinedBehaviour, CombinedBehaviourEvent};
 
 /// Discovery configuration.
 #[derive(Debug, Clone)]
@@ -742,6 +771,14 @@ enum Command {
     GetKadRecord {
         key: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<Vec<u8>>>>,
+    },
+    StartProvidingKey {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetProviderPeers {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<PeerId>>>,
     },
     SendJobOffer {
         peer: PeerId,
@@ -852,10 +889,14 @@ impl Discovery {
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|key, relay_client| {
                 // Create mDNS behaviour for local network discovery.
-                let mdns_behaviour = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )?;
+                let mdns_behaviour = if reachability.outbound_only {
+                    None
+                } else {
+                    Some(mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        key.public().to_peer_id(),
+                    )?)
+                };
 
                 // JSON-coded request/response for JobOffer. SEC-06: cap both
                 // directions — a JobOffer is a small fixed-shape struct, so an
@@ -900,8 +941,7 @@ impl Discovery {
                     .as_ref()
                     .map(|limits| relay::Behaviour::new(local_peer_id, limits.to_libp2p_config()))
                     .into();
-                let dcutr = reachability
-                    .dcutr
+                let dcutr = (reachability.dcutr && !reachability.outbound_only)
                     .then(|| dcutr::Behaviour::new(local_peer_id))
                     .into();
                 let identify = reachability
@@ -917,8 +957,7 @@ impl Discovery {
                         )
                     })
                     .into();
-                let autonat_client = reachability
-                    .autonat_client
+                let autonat_client = (reachability.autonat_client && !reachability.outbound_only)
                     .then(autonat::v2::client::Behaviour::default)
                     .into();
                 let autonat_server = reachability
@@ -946,7 +985,7 @@ impl Discovery {
                             .with_max_established(Some(256)),
                     ),
                     kademlia: kad_behaviour,
-                    mdns: mdns_behaviour,
+                    mdns: mdns_behaviour.into(),
                     relay_client,
                     relay_server,
                     dcutr,
@@ -1295,6 +1334,34 @@ impl Discovery {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::GetKadRecord { key, reply: tx })
+            .await
+            .map_err(|_| anyhow!("Discovery driver shut down"))?;
+        rx.await
+            .map_err(|_| anyhow!("Discovery driver dropped reply"))?
+    }
+
+    /// Advertise this peer as a provider for an opaque, bounded application
+    /// key. Completion reflects the Kademlia operation, not an application
+    /// trust or availability verdict.
+    pub async fn start_providing_key(&self, key: Vec<u8>) -> Result<()> {
+        validate_kad_record_key(&key)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StartProvidingKey { key, reply: tx })
+            .await
+            .map_err(|_| anyhow!("Discovery driver shut down"))?;
+        rx.await
+            .map_err(|_| anyhow!("Discovery driver dropped reply"))?
+    }
+
+    /// Discover at most [`MAX_PROVIDER_PEERS_PER_QUERY`] distinct provider
+    /// identities for an opaque application key. Callers must authenticate
+    /// the application records served by those peers independently.
+    pub async fn get_provider_peers(&self, key: Vec<u8>) -> Result<Vec<PeerId>> {
+        validate_kad_record_key(&key)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::GetProviderPeers { key, reply: tx })
             .await
             .map_err(|_| anyhow!("Discovery driver shut down"))?;
         rx.await
@@ -2176,6 +2243,8 @@ struct Driver {
     nat_reachability: NatReachability,
     observed_addresses: Vec<Multiaddr>,
     connection_paths: HashMap<ConnectionId, ReachabilityConnection>,
+    pending_relay_listens: Vec<PendingRelayListen>,
+    pending_provider_queries: HashMap<QueryId, PendingProviderQuery>,
     pending_rendezvous_registrations: PendingRendezvousRegistrations,
     pending_rendezvous_discoveries: PendingRendezvousDiscoveries,
     /// Outstanding SendJobOffer requests, keyed by libp2p's outbound id.
@@ -2195,6 +2264,72 @@ struct Driver {
     /// execution from the swarm event loop — one slow job no longer stalls
     /// peer connectivity.
     relay_reply_tx: mpsc::Sender<(ResponseChannel<JobRelayResponse>, JobRelayResponse)>,
+}
+
+struct PendingRelayListen {
+    relay_peer: PeerId,
+    address: Multiaddr,
+    reply: oneshot::Sender<Result<()>>,
+    deadline: tokio::time::Instant,
+}
+
+enum ProviderReply {
+    Publish(oneshot::Sender<Result<()>>),
+    Lookup(oneshot::Sender<Result<Vec<PeerId>>>),
+}
+
+struct PendingProviderQuery {
+    reply: ProviderReply,
+    peers: Vec<PeerId>,
+    deadline: tokio::time::Instant,
+}
+
+impl PendingProviderQuery {
+    fn insert(&mut self, peer: PeerId) {
+        if self.peers.len() < MAX_PROVIDER_PEERS_PER_QUERY && !self.peers.contains(&peer) {
+            self.peers.push(peer);
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match &self.reply {
+            ProviderReply::Publish(reply) => reply.is_closed(),
+            ProviderReply::Lookup(reply) => reply.is_closed(),
+        }
+    }
+
+    fn complete(mut self, error: Option<anyhow::Error>) {
+        match self.reply {
+            ProviderReply::Publish(reply) => {
+                let _ = reply.send(error.map_or(Ok(()), Err));
+            }
+            ProviderReply::Lookup(reply) => {
+                self.peers.sort_unstable();
+                let result = match error {
+                    Some(error) if self.peers.is_empty() => Err(error),
+                    _ => Ok(self.peers),
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+/// A circuit reservation must use an established direct control connection.
+/// Otherwise relay-client's dial can collide with an already-pending bootstrap
+/// dial, close the reservation listener, and leave no circuit to advertise.
+fn relay_control_peer(address: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    let mut control = Multiaddr::empty();
+    for protocol in address.iter() {
+        if matches!(protocol, Protocol::P2pCircuit) {
+            return match control.iter().last() {
+                Some(Protocol::P2p(peer)) => Some((peer, control)),
+                _ => None,
+            };
+        }
+        control.push(protocol);
+    }
+    None
 }
 
 type RendezvousRegistrationKey = (PeerId, rendezvous::Namespace);
@@ -2251,6 +2386,124 @@ fn validate_kad_record_key(key: &[u8]) -> Result<()> {
 }
 
 impl Driver {
+    fn has_direct_connection(&self, peer: &PeerId) -> bool {
+        self.connection_paths.values().any(|connection| {
+            connection.peer_id == *peer
+                && matches!(
+                    connection.path,
+                    ReachabilityPath::Direct | ReachabilityPath::Dcutr
+                )
+        })
+    }
+
+    fn listen(&mut self, raw: String, reply: oneshot::Sender<Result<()>>) {
+        let address = match raw.parse::<Multiaddr>() {
+            Ok(address) => address,
+            Err(error) => {
+                let _ = reply.send(Err(anyhow!("parse listen address: {error}")));
+                return;
+            }
+        };
+        let relay = relay_control_peer(&address);
+        if self.reachability.outbound_only && relay.is_none() {
+            let _ = reply.send(Err(anyhow!("outbound-only mode refuses direct listeners")));
+            return;
+        }
+        if let Some((relay_peer, control_address)) = relay {
+            if !self.has_direct_connection(&relay_peer) {
+                if self.pending_relay_listens.len() >= MAX_PENDING_RELAY_LISTENS {
+                    let _ = reply.send(Err(anyhow!("relay-listener operation capacity reached")));
+                    return;
+                }
+                let options = DialOpts::peer_id(relay_peer)
+                    .condition(PeerCondition::NotDialing)
+                    .addresses(vec![control_address])
+                    .build();
+                match self.swarm.dial(options) {
+                    Ok(()) | Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {
+                        self.pending_relay_listens.push(PendingRelayListen {
+                            relay_peer,
+                            address,
+                            reply,
+                            deadline: tokio::time::Instant::now() + DISCOVERY_OPERATION_TIMEOUT,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(anyhow!("connect relay control peer: {error}")));
+                    }
+                }
+                return;
+            }
+        }
+        let result = self
+            .swarm
+            .listen_on(address.clone())
+            .map(|_| {
+                info!("Listening on: {}", address);
+            })
+            .map_err(anyhow::Error::from);
+        let _ = reply.send(result);
+    }
+
+    fn finish_relay_listens(&mut self, peer: PeerId, failure: Option<&str>) {
+        let pending = std::mem::take(&mut self.pending_relay_listens);
+        for request in pending {
+            if request.relay_peer != peer {
+                self.pending_relay_listens.push(request);
+                continue;
+            }
+            if request.reply.is_closed() {
+                continue;
+            }
+            if let Some(reason) = failure {
+                let _ = request
+                    .reply
+                    .send(Err(anyhow!("relay control connection failed: {reason}")));
+            } else if request.deadline <= tokio::time::Instant::now() {
+                let _ = request
+                    .reply
+                    .send(Err(anyhow!("relay control connection timed out")));
+            } else {
+                let result = self
+                    .swarm
+                    .listen_on(request.address)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from);
+                let _ = request.reply.send(result);
+            }
+        }
+    }
+
+    fn expire_operations(&mut self) {
+        let now = tokio::time::Instant::now();
+        let pending = std::mem::take(&mut self.pending_relay_listens);
+        for request in pending {
+            if request.reply.is_closed() {
+                continue;
+            }
+            if request.deadline <= now {
+                let _ = request
+                    .reply
+                    .send(Err(anyhow!("relay control connection timed out")));
+            } else {
+                self.pending_relay_listens.push(request);
+            }
+        }
+        let expired = self
+            .pending_provider_queries
+            .iter()
+            .filter_map(|(id, query)| (query.deadline <= now || query.is_closed()).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(mut query) = self.swarm.behaviour_mut().kademlia.query_mut(&id) {
+                query.finish();
+            }
+            if let Some(query) = self.pending_provider_queries.remove(&id) {
+                query.complete(Some(anyhow!("provider operation timed out")));
+            }
+        }
+    }
+
     async fn run(
         swarm: Swarm<CombinedBehaviour>,
         mut cmd_rx: mpsc::Receiver<Command>,
@@ -2273,6 +2526,8 @@ impl Driver {
             nat_reachability: NatReachability::Unknown,
             observed_addresses: Vec::new(),
             connection_paths: HashMap::new(),
+            pending_relay_listens: Vec::new(),
+            pending_provider_queries: HashMap::new(),
             pending_rendezvous_registrations: HashMap::new(),
             pending_rendezvous_discoveries: HashMap::new(),
             pending_offers: HashMap::new(),
@@ -2282,8 +2537,14 @@ impl Driver {
             relay_reply_tx,
         };
 
+        let mut operation_expiry = tokio::time::interval(Duration::from_millis(200));
+        operation_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = operation_expiry.tick(), if !driver.pending_relay_listens.is_empty()
+                    || !driver.pending_provider_queries.is_empty() => {
+                    driver.expire_operations();
+                }
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(c) => driver.handle_command(c),
@@ -2307,14 +2568,7 @@ impl Driver {
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::Listen { addr, reply } => {
-                let res = (|| -> Result<()> {
-                    let listen_addr: Multiaddr =
-                        addr.parse().context("Failed to parse listen address")?;
-                    self.swarm.listen_on(listen_addr.clone())?;
-                    info!("Listening on: {}", listen_addr);
-                    Ok(())
-                })();
-                let _ = reply.send(res);
+                self.listen(addr, reply);
             }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
@@ -2394,7 +2648,9 @@ impl Driver {
                     Err(e) => {
                         warn!("DHT bootstrap failed (normal for standalone nodes): {}", e);
                         warn!("Node will wait for incoming connections or manual peer additions");
-                        info!("mDNS is active for local network peer discovery");
+                        if !self.reachability.outbound_only {
+                            info!("mDNS is active for local network peer discovery");
+                        }
                         Ok(()) // Not fatal.
                     }
                 };
@@ -2483,6 +2739,57 @@ impl Driver {
                         values: Vec::new(),
                         total_bytes: 0,
                         truncated: false,
+                    },
+                );
+            }
+            Command::StartProvidingKey { key, reply } => {
+                if self.pending_provider_queries.len() >= MAX_PENDING_PROVIDER_QUERIES {
+                    let _ = reply.send(Err(anyhow!("provider operation capacity reached")));
+                    return;
+                }
+                let result = validate_kad_record_key(&key).and_then(|()| {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .start_providing(libp2p::kad::RecordKey::new(&key))
+                        .map_err(|error| anyhow!("start provider advertisement: {error}"))
+                });
+                match result {
+                    Ok(query) => {
+                        self.pending_provider_queries.insert(
+                            query,
+                            PendingProviderQuery {
+                                reply: ProviderReply::Publish(reply),
+                                peers: Vec::new(),
+                                deadline: tokio::time::Instant::now() + DISCOVERY_OPERATION_TIMEOUT,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Command::GetProviderPeers { key, reply } => {
+                if let Err(error) = validate_kad_record_key(&key) {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                if self.pending_provider_queries.len() >= MAX_PENDING_PROVIDER_QUERIES {
+                    let _ = reply.send(Err(anyhow!("provider operation capacity reached")));
+                    return;
+                }
+                let query = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .get_providers(libp2p::kad::RecordKey::new(&key));
+                self.pending_provider_queries.insert(
+                    query,
+                    PendingProviderQuery {
+                        reply: ProviderReply::Lookup(reply),
+                        peers: Vec::new(),
+                        deadline: tokio::time::Instant::now() + DISCOVERY_OPERATION_TIMEOUT,
                     },
                 );
             }
@@ -2577,6 +2884,24 @@ impl Driver {
                 self.connection_paths
                     .insert(connection_id, ReachabilityConnection { peer_id, path });
                 info!(%peer_id, ?path, "Connected to peer");
+                if !endpoint.is_relayed() {
+                    self.finish_relay_listens(peer_id, None);
+                }
+            }
+            SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(peer),
+                error,
+                ..
+            } => {
+                // A competing behaviour may skip its dial because the
+                // bootstrap control dial is pending. That is not a failure
+                // of the control connection we are waiting for.
+                if !matches!(error, libp2p::swarm::DialError::DialPeerConditionFalse(_))
+                    && !self.has_direct_connection(&peer)
+                {
+                    self.finish_relay_listens(peer, Some(&error.to_string()));
+                }
+                debug!(%peer, %error, "outbound connection failed");
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -2838,6 +3163,7 @@ impl Driver {
 
         ReachabilitySnapshot {
             role: self.reachability.role,
+            outbound_only: self.reachability.outbound_only,
             active_path,
             nat: self.nat_reachability,
             listen_addresses,
@@ -2917,6 +3243,41 @@ impl Driver {
                         }
                     } else {
                         debug!("get_record event for unknown query id {:?}", id);
+                    }
+                } else if let QueryResult::GetProviders(result) = result {
+                    let mut error = None;
+                    let mut complete = step.last;
+                    if let Some(pending) = self.pending_provider_queries.get_mut(&id) {
+                        match result {
+                            Ok(GetProvidersOk::FoundProviders { providers, .. }) => {
+                                for peer in providers {
+                                    pending.insert(peer);
+                                }
+                                complete |= pending.peers.len() == MAX_PROVIDER_PEERS_PER_QUERY;
+                            }
+                            Ok(GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {}
+                            Err(failure) => {
+                                error = Some(anyhow!("provider lookup failed: {failure}"));
+                                complete = true;
+                            }
+                        }
+                    }
+                    if complete {
+                        if let Some(mut query) = self.swarm.behaviour_mut().kademlia.query_mut(&id)
+                        {
+                            query.finish();
+                        }
+                        if let Some(pending) = self.pending_provider_queries.remove(&id) {
+                            pending.complete(error);
+                        }
+                    }
+                } else if let QueryResult::StartProviding(result) = result {
+                    if let Some(pending) = self.pending_provider_queries.remove(&id) {
+                        pending.complete(
+                            result
+                                .err()
+                                .map(|error| anyhow!("provider publication failed: {error}")),
+                        );
                     }
                 } else {
                     debug!("Outbound query result: {:?}", result);
@@ -3262,1231 +3623,4 @@ mod hex {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inbound_stream_admission_is_combined_global_and_per_peer_bounded() {
-        let admission = InboundStreamAdmission::new(2, 1);
-        let peer_a = PeerId::random();
-        let peer_b = PeerId::random();
-        let peer_c = PeerId::random();
-
-        let a = admission.try_acquire(peer_a).expect("first peer admitted");
-        assert!(
-            admission.try_acquire(peer_a).is_none(),
-            "same peer cannot exceed its cross-protocol stream budget"
-        );
-        let b = admission.try_acquire(peer_b).expect("second peer admitted");
-        assert!(
-            admission.try_acquire(peer_c).is_none(),
-            "relay and blob streams share the same global budget"
-        );
-
-        drop(a);
-        let c = admission
-            .try_acquire(peer_c)
-            .expect("dropping a task releases global and per-peer state");
-        drop((b, c));
-        assert!(admission.per_peer.lock().unwrap().is_empty());
-        assert_eq!(admission.global.available_permits(), 2);
-    }
-
-    #[tokio::test]
-    async fn blob_bandwidth_budget_is_shared_across_same_peer_streams() {
-        let admission = InboundStreamAdmission::new(4, 2);
-        let peer = PeerId::random();
-        let first = admission.try_acquire(peer).expect("first blob stream");
-        let second = admission.try_acquire(peer).expect("second blob stream");
-
-        first
-            .wait_for_blob_budget(BLOB_STREAM_MAX_CHUNK_BYTES)
-            .await;
-        second
-            .wait_for_blob_budget(BLOB_STREAM_MAX_CHUNK_BYTES)
-            .await;
-
-        let windows = admission.blob_bandwidth.lock().expect("bandwidth state");
-        let window = windows.get(&peer).expect("shared peer window");
-        assert_eq!(window.bytes, BLOB_STREAM_MAX_CHUNK_BYTES * 2);
-        drop(windows);
-        drop((first, second));
-        assert!(admission.blob_bandwidth.lock().unwrap().is_empty());
-    }
-
-    struct PendingAfterBytes {
-        bytes: Vec<u8>,
-        offset: usize,
-    }
-
-    impl PendingAfterBytes {
-        fn silent() -> Self {
-            Self {
-                bytes: Vec::new(),
-                offset: 0,
-            }
-        }
-
-        fn with_frame(frame: &JobRelayStreamFrame) -> Self {
-            let encoded = postcard::to_stdvec(frame).expect("encode test frame");
-            let mut bytes = Vec::with_capacity(4 + encoded.len());
-            bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(&encoded);
-            Self { bytes, offset: 0 }
-        }
-    }
-
-    impl AsyncRead for PendingAfterBytes {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            output: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            if self.offset == self.bytes.len() {
-                return std::task::Poll::Pending;
-            }
-            let count = output.len().min(self.bytes.len() - self.offset);
-            output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
-            self.offset += count;
-            std::task::Poll::Ready(Ok(count))
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl AsyncWrite for RecordingWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            bytes: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            std::task::Poll::Ready(Ok(bytes.len()))
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    fn recording_writer() -> (RecordingWriter, Arc<std::sync::Mutex<Vec<u8>>>) {
-        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        (RecordingWriter(bytes.clone()), bytes)
-    }
-
-    fn recorded_control(bytes: &Arc<std::sync::Mutex<Vec<u8>>>) -> JobRelayStreamControl {
-        let bytes = bytes.lock().unwrap();
-        assert!(bytes.len() >= 4, "recorded control has a length prefix");
-        let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-        assert_eq!(bytes.len(), 4 + length);
-        postcard::from_bytes(&bytes[4..]).expect("decode recorded control")
-    }
-
-    #[tokio::test]
-    async fn outbound_live_relay_silence_fails_and_sends_cancel() {
-        let reader = PendingAfterBytes::silent();
-        let (writer, recorded) = recording_writer();
-        let (frames_tx, mut frames_rx) = mpsc::channel(2);
-        let (_controls_tx, controls_rx) = mpsc::channel(1);
-        let job_id = [0x51; 32];
-
-        let task = tokio::spawn(drive_outbound_job_relay_stream(
-            reader,
-            writer,
-            job_id,
-            frames_tx,
-            controls_rx,
-            Duration::from_millis(30),
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        ));
-
-        let failure = tokio::time::timeout(Duration::from_secs(1), frames_rx.recv())
-            .await
-            .expect("silent peer must fail within its idle budget")
-            .expect("driver must report a terminal error")
-            .expect_err("silence cannot be a successful EOF");
-        assert_eq!(failure, "live relay idle timeout reached");
-
-        task.await.expect("driver exits and releases its resources");
-        let cancel = recorded_control(&recorded);
-        assert_eq!(cancel.job_id, job_id);
-        assert!(matches!(
-            cancel.kind,
-            JobRelayStreamControlKind::Cancel { ref reason }
-                if reason == "live relay idle timeout reached"
-        ));
-    }
-
-    #[tokio::test]
-    async fn outbound_live_relay_total_deadline_wins_over_idle_budget() {
-        let reader = PendingAfterBytes::silent();
-        let (writer, recorded) = recording_writer();
-        let (frames_tx, mut frames_rx) = mpsc::channel(2);
-        let (_controls_tx, controls_rx) = mpsc::channel(1);
-        let job_id = [0x52; 32];
-
-        let task = tokio::spawn(drive_outbound_job_relay_stream(
-            reader,
-            writer,
-            job_id,
-            frames_tx,
-            controls_rx,
-            Duration::from_secs(1),
-            tokio::time::Instant::now() + Duration::from_millis(30),
-        ));
-
-        let failure = tokio::time::timeout(Duration::from_secs(1), frames_rx.recv())
-            .await
-            .expect("silent peer must fail at the total deadline")
-            .expect("driver must report a terminal error")
-            .expect_err("deadline cannot be a successful EOF");
-        assert_eq!(failure, "live relay deadline reached");
-
-        task.await.expect("driver exits and releases its resources");
-        let cancel = recorded_control(&recorded);
-        assert!(matches!(
-            cancel.kind,
-            JobRelayStreamControlKind::Cancel { ref reason }
-                if reason == "live relay deadline reached"
-        ));
-    }
-
-    #[tokio::test]
-    async fn outbound_live_relay_enforces_idle_timeout_after_acceptance() {
-        let (frames_tx, mut frames_rx) = mpsc::channel(2);
-        let (_controls_tx, controls_rx) = mpsc::channel(1);
-        let job_id = [0x53; 32];
-        let reader = PendingAfterBytes::with_frame(&JobRelayStreamFrame {
-            schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-            job_id,
-            sequence: 0,
-            kind: JobRelayStreamFrameKind::Accepted,
-        });
-        let (writer, recorded) = recording_writer();
-
-        let task = tokio::spawn(drive_outbound_job_relay_stream(
-            reader,
-            writer,
-            job_id,
-            frames_tx,
-            controls_rx,
-            Duration::from_millis(30),
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        ));
-
-        let accepted = frames_rx
-            .recv()
-            .await
-            .expect("accepted frame")
-            .expect("valid accepted frame");
-        assert!(matches!(accepted.kind, JobRelayStreamFrameKind::Accepted));
-        let failure = tokio::time::timeout(Duration::from_secs(1), frames_rx.recv())
-            .await
-            .expect("accepted-but-silent peer must hit idle timeout")
-            .expect("driver reports timeout")
-            .expect_err("silence after acceptance cannot succeed");
-        assert_eq!(failure, "live relay idle timeout reached");
-
-        task.await.expect("driver exits");
-        let cancel = recorded_control(&recorded);
-        assert!(matches!(
-            cancel.kind,
-            JobRelayStreamControlKind::Cancel { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn outbound_live_relay_enforces_total_deadline_after_acceptance() {
-        let (frames_tx, mut frames_rx) = mpsc::channel(2);
-        let (_controls_tx, controls_rx) = mpsc::channel(1);
-        let job_id = [0x54; 32];
-        let reader = PendingAfterBytes::with_frame(&JobRelayStreamFrame {
-            schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-            job_id,
-            sequence: 0,
-            kind: JobRelayStreamFrameKind::Accepted,
-        });
-        let (writer, recorded) = recording_writer();
-
-        let task = tokio::spawn(drive_outbound_job_relay_stream(
-            reader,
-            writer,
-            job_id,
-            frames_tx,
-            controls_rx,
-            Duration::from_secs(1),
-            tokio::time::Instant::now() + Duration::from_millis(30),
-        ));
-
-        let accepted = frames_rx
-            .recv()
-            .await
-            .expect("accepted frame")
-            .expect("valid accepted frame");
-        assert!(matches!(accepted.kind, JobRelayStreamFrameKind::Accepted));
-        let failure = tokio::time::timeout(Duration::from_secs(1), frames_rx.recv())
-            .await
-            .expect("accepted peer must hit the total deadline")
-            .expect("driver reports deadline")
-            .expect_err("post-acceptance deadline cannot succeed");
-        assert_eq!(failure, "live relay deadline reached");
-
-        task.await.expect("driver exits");
-        let cancel = recorded_control(&recorded);
-        assert!(matches!(
-            cancel.kind,
-            JobRelayStreamControlKind::Cancel { ref reason }
-                if reason == "live relay deadline reached"
-        ));
-    }
-
-    #[test]
-    fn kad_record_accumulator_bounds_count_bytes_values_and_keys() {
-        assert!(validate_kad_record_key(&[]).is_err());
-        assert!(validate_kad_record_key(&vec![0; MAX_KAD_RECORD_KEY_BYTES + 1]).is_err());
-        assert!(validate_kad_record_key(&[1]).is_ok());
-
-        let (reply, _receiver) = oneshot::channel();
-        let mut by_count = PendingGetRecord {
-            reply,
-            values: Vec::new(),
-            total_bytes: 0,
-            truncated: false,
-        };
-        for index in 0..=MAX_KAD_RECORD_VALUES_PER_QUERY {
-            by_count.insert_bounded((index as u32).to_be_bytes().to_vec());
-        }
-        assert_eq!(by_count.values.len(), MAX_KAD_RECORD_VALUES_PER_QUERY);
-        assert!(by_count.truncated);
-
-        let (reply, _receiver) = oneshot::channel();
-        let mut by_bytes = PendingGetRecord {
-            reply,
-            values: Vec::new(),
-            total_bytes: 0,
-            truncated: false,
-        };
-        for index in 0..=MAX_KAD_RECORD_BYTES_PER_QUERY / MAX_KAD_RECORD_VALUE_BYTES {
-            let mut value = vec![0_u8; MAX_KAD_RECORD_VALUE_BYTES];
-            value[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            by_bytes.insert_bounded(value);
-        }
-        assert_eq!(by_bytes.total_bytes, MAX_KAD_RECORD_BYTES_PER_QUERY);
-        assert!(by_bytes.truncated);
-
-        let (reply, _receiver) = oneshot::channel();
-        let mut oversized = PendingGetRecord {
-            reply,
-            values: Vec::new(),
-            total_bytes: 0,
-            truncated: false,
-        };
-        oversized.insert_bounded(vec![0; MAX_KAD_RECORD_VALUE_BYTES + 1]);
-        assert!(oversized.values.is_empty());
-        assert!(oversized.truncated);
-    }
-
-    async fn loopback_dial_addr(discovery: &Discovery) -> Multiaddr {
-        for _ in 0..50 {
-            if let Some(addr) = discovery.listen_addrs().await.unwrap().into_iter().next() {
-                return addr;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("swarm never reported its loopback listen address")
-    }
-
-    async fn wait_for_peer_path(
-        discovery: &Discovery,
-        peer_id: PeerId,
-        accepted: &[ReachabilityPath],
-    ) -> ReachabilitySnapshot {
-        for _ in 0..250 {
-            let snapshot = discovery.reachability_snapshot().await.unwrap();
-            if snapshot.connections.iter().any(|connection| {
-                connection.peer_id == peer_id && accepted.contains(&connection.path)
-            }) {
-                return snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("peer {peer_id} never reached one of the expected paths: {accepted:?}")
-    }
-
-    /// The loopback integration tests each build several independent
-    /// multi-threaded swarms. Running all of them concurrently on a bounded
-    /// four-CPU service creates artificial protocol-negotiation starvation
-    /// that cannot occur within one daemon. Serialize only these heavyweight
-    /// tests; unit tests remain fully parallel.
-    async fn acquire_loopback_test_gate() -> tokio::sync::SemaphorePermit<'static> {
-        static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-        GATE.get_or_init(|| tokio::sync::Semaphore::new(1))
-            .acquire()
-            .await
-            .expect("loopback test gate remains open")
-    }
-
-    fn blob_request(
-        content_id: [u8; 32],
-        offset: u64,
-        metadata: impl Into<Vec<u8>>,
-    ) -> BlobStreamRequest {
-        BlobStreamRequest {
-            schema_version: crate::protocol::BLOB_STREAM_SCHEMA_VERSION,
-            content_id,
-            offset,
-            deadline_unix_ms: unix_time_ms() + 5_000,
-            idle_timeout_ms: 1_000,
-            metadata: metadata.into(),
-        }
-    }
-
-    fn blob_frame(content_id: [u8; 32], kind: BlobStreamFrameKind) -> BlobStreamFrame {
-        BlobStreamFrame {
-            schema_version: crate::protocol::BLOB_STREAM_SCHEMA_VERSION,
-            content_id,
-            kind,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_discovery_creation() {
-        let config = DiscoveryConfig::default();
-        let discovery = Discovery::new(config);
-
-        // mDNS may fail in restricted test environments due to netlink
-        // permissions. That's expected; the daemon still works in production.
-        match discovery {
-            Ok(_) => {
-                // Success — full functionality available.
-            }
-            Err(e) => {
-                let error_msg = format!("{:?}", e);
-                if error_msg.contains("Permission denied") {
-                    eprintln!("Note: mDNS disabled in test (needs network permissions)");
-                } else {
-                    panic!("Unexpected error creating discovery: {:?}", e);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn classify_runtime_recognises_wasmtime_prefix() {
-        use phase_protocol::JobSpecKind;
-        assert_eq!(classify_runtime("wasmtime-27"), Some(JobSpecKind::Wasm));
-        assert_eq!(classify_runtime("wasmtime"), Some(JobSpecKind::Wasm));
-        assert_eq!(classify_runtime("wasm3-0.5"), Some(JobSpecKind::Wasm));
-        assert_eq!(
-            classify_runtime("llama-cpp-b3000"),
-            Some(JobSpecKind::Inference)
-        );
-        assert_eq!(classify_runtime("python-3.11"), None);
-        assert_eq!(classify_runtime(""), None);
-    }
-
-    #[test]
-    fn ordinary_reachability_role_never_enables_servers() {
-        let config = ReachabilityConfig::default();
-        assert_eq!(config.role, ReachabilityRole::Peer);
-        assert!(config.relay_client);
-        assert!(config.dcutr);
-        assert!(config.identify);
-        assert!(config.autonat_client);
-        assert!(config.rendezvous_client);
-        assert!(!config.autonat_server);
-        assert!(config.relay_server.is_none());
-        assert!(config.rendezvous_server.is_none());
-        config.validate().unwrap();
-
-        let peer_server = ReachabilityConfig {
-            relay_server: Some(RelayServerLimits::default()),
-            ..config.clone()
-        };
-        assert!(peer_server.validate().is_err());
-
-        let missing_dcutr_dependency = ReachabilityConfig {
-            relay_client: false,
-            ..config
-        };
-        assert!(missing_dcutr_dependency.validate().is_err());
-    }
-
-    #[test]
-    fn infrastructure_limits_reject_unbounded_values() {
-        let config = ReachabilityConfig {
-            role: ReachabilityRole::Infrastructure,
-            relay_server: Some(RelayServerLimits {
-                max_circuits: MAX_RELAY_CIRCUITS + 1,
-                ..RelayServerLimits::default()
-            }),
-            ..ReachabilityConfig::default()
-        };
-        assert!(config.validate().is_err());
-
-        let config = ReachabilityConfig {
-            role: ReachabilityRole::Infrastructure,
-            rendezvous_server: Some(RendezvousServerLimits {
-                min_ttl_seconds: rendezvous::MIN_TTL,
-                max_ttl_seconds: rendezvous::MAX_TTL + 1,
-            }),
-            ..ReachabilityConfig::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn observable_address_filter_accepts_real_loopback_and_relay_transports() {
-        for address in [
-            "/ip4/127.0.0.1/tcp/4001",
-            "/ip4/192.168.1.8/udp/4001/quic-v1",
-            "/ip6/::1/tcp/4001",
-            "/dns4/relay.example/tcp/443/p2p/12D3KooWJwbyF4d4so1sqd1qsSF24dTDtc3DduLYX7v9VruBfpH7/p2p-circuit",
-        ] {
-            let address: Multiaddr = address.parse().unwrap();
-            assert!(is_observable_address(&address), "rejected {address}");
-        }
-
-        for address in [
-            "/ip4/0.0.0.0/tcp/4001",
-            "/ip4/224.0.0.1/tcp/4001",
-            "/ip6/::/tcp/4001",
-            "/ip6/ff02::1/tcp/4001",
-            "/ip4/127.0.0.1/tcp/0",
-            "/ip4/127.0.0.1/udp/4001",
-            "/ip4/127.0.0.1",
-            "/memory/42",
-        ] {
-            let address: Multiaddr = address.parse().unwrap();
-            assert!(!is_observable_address(&address), "accepted {address}");
-        }
-    }
-
-    #[test]
-    fn rendezvous_namespaces_are_bounded_and_nonempty() {
-        assert!(parse_rendezvous_namespace("phase-workers").is_ok());
-        assert!(parse_rendezvous_namespace("").is_err());
-        assert!(parse_rendezvous_namespace(&"x".repeat(rendezvous::MAX_NAMESPACE + 1)).is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn direct_loopback_connection_is_reported_from_swarm_state() {
-        let _loopback_test = acquire_loopback_test_gate().await;
-        let node_a = Discovery::new(DiscoveryConfig::default()).expect("node A");
-        let node_b = Discovery::new(DiscoveryConfig::default()).expect("node B");
-        let b_peer = *node_b.local_peer_id();
-
-        node_b
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("node B listen");
-        let mut address = loopback_dial_addr(&node_b).await;
-        address.push(Protocol::P2p(b_peer));
-        node_a
-            .dial_peer(&address.to_string())
-            .await
-            .expect("node A dial node B");
-
-        let snapshot = wait_for_peer_path(&node_a, b_peer, &[ReachabilityPath::Direct]).await;
-        assert_eq!(snapshot.role, ReachabilityRole::Peer);
-        assert_eq!(snapshot.active_path, ReachabilityPath::Direct);
-        assert_eq!(snapshot.nat, NatReachability::Unknown);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rendezvous_loopback_registers_and_discovers_signed_peer_record() {
-        let _loopback_test = acquire_loopback_test_gate().await;
-        let server = Discovery::new_with_reachability(
-            DiscoveryConfig::default(),
-            ReachabilityConfig {
-                role: ReachabilityRole::Infrastructure,
-                rendezvous_server: Some(RendezvousServerLimits::default()),
-                ..ReachabilityConfig::default()
-            },
-        )
-        .expect("rendezvous server");
-        let registrant = Discovery::new(DiscoveryConfig::default()).expect("registrant");
-        let discoverer = Discovery::new(DiscoveryConfig::default()).expect("discoverer");
-        let server_peer = *server.local_peer_id();
-        let registrant_peer = *registrant.local_peer_id();
-
-        server
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("server listen");
-        registrant
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("registrant listen");
-        let registrant_addr = loopback_dial_addr(&registrant).await;
-        registrant
-            .add_external_address(registrant_addr.clone())
-            .await
-            .expect("confirm registrant address");
-
-        let mut server_addr = loopback_dial_addr(&server).await;
-        server_addr.push(Protocol::P2p(server_peer));
-        registrant
-            .dial_peer(&server_addr.to_string())
-            .await
-            .expect("registrant dial rendezvous server");
-        discoverer
-            .dial_peer(&server_addr.to_string())
-            .await
-            .expect("discoverer dial rendezvous server");
-        wait_for_peer_path(&registrant, server_peer, &[ReachabilityPath::Direct]).await;
-        wait_for_peer_path(&discoverer, server_peer, &[ReachabilityPath::Direct]).await;
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            registrant.register_rendezvous(
-                server_peer,
-                "phase-workers",
-                Some(rendezvous::DEFAULT_TTL),
-            ),
-        )
-        .await
-        .expect("rendezvous register timed out")
-        .expect("rendezvous register failed");
-
-        let peers = tokio::time::timeout(
-            Duration::from_secs(5),
-            discoverer.discover_rendezvous(server_peer, Some("phase-workers"), 16),
-        )
-        .await
-        .expect("rendezvous discover timed out")
-        .expect("rendezvous discover failed");
-        let discovered = peers
-            .iter()
-            .find(|peer| peer.peer_id == registrant_peer)
-            .expect("registered peer missing from discovery response");
-        assert_eq!(discovered.namespace, "phase-workers");
-        assert!(discovered.addresses.contains(&registrant_addr));
-        assert_eq!(discovered.ttl_seconds, rendezvous::DEFAULT_TTL);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn circuit_relay_loopback_reports_real_relayed_connection() {
-        let _loopback_test = acquire_loopback_test_gate().await;
-        let relay_node = Discovery::new_with_reachability(
-            DiscoveryConfig::default(),
-            ReachabilityConfig {
-                role: ReachabilityRole::Infrastructure,
-                relay_server: Some(RelayServerLimits::default()),
-                ..ReachabilityConfig::default()
-            },
-        )
-        .expect("relay node");
-        // This test proves the relay circuit itself. Disable DCUtR so an
-        // immediate direct-path upgrade cannot replace the relayed connection
-        // before the assertion observes it; DCUtR has separate behavior tests.
-        let relay_only_peer = ReachabilityConfig {
-            dcutr: false,
-            ..ReachabilityConfig::default()
-        };
-        let destination =
-            Discovery::new_with_reachability(DiscoveryConfig::default(), relay_only_peer.clone())
-                .expect("destination");
-        let dialer = Discovery::new_with_reachability(DiscoveryConfig::default(), relay_only_peer)
-            .expect("dialer");
-        let relay_peer = *relay_node.local_peer_id();
-        let destination_peer = *destination.local_peer_id();
-
-        relay_node
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("relay listen");
-        let relay_addr = loopback_dial_addr(&relay_node).await;
-        relay_node
-            .add_external_address(relay_addr.clone())
-            .await
-            .expect("confirm relay address");
-        let mut reservation_addr = relay_addr.clone();
-        reservation_addr.push(Protocol::P2p(relay_peer));
-        reservation_addr.push(Protocol::P2pCircuit);
-        destination
-            .listen(&reservation_addr.to_string())
-            .await
-            .expect("destination relay reservation");
-
-        let relayed_listen_addr = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(address) =
-                    destination
-                        .listen_addrs()
-                        .await
-                        .unwrap()
-                        .into_iter()
-                        .find(|address| {
-                            address
-                                .iter()
-                                .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
-                        })
-                {
-                    break address;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("relay reservation timed out");
-
-        // Establish and observe the dialer's control connection to the relay
-        // before asking libp2p to negotiate the circuit. This separates relay
-        // readiness from the behavior under test (the relayed destination
-        // path) instead of racing both handshakes in one dial command.
-        let mut relay_dial_addr = relay_addr;
-        relay_dial_addr.push(Protocol::P2p(relay_peer));
-        dialer
-            .dial_peer(&relay_dial_addr.to_string())
-            .await
-            .expect("dialer connects to relay");
-        wait_for_peer_path(&dialer, relay_peer, &[ReachabilityPath::Direct]).await;
-
-        dialer
-            .dial_peer(&relayed_listen_addr.to_string())
-            .await
-            .expect("dial destination through relay");
-        let snapshot =
-            wait_for_peer_path(&dialer, destination_peer, &[ReachabilityPath::Relayed]).await;
-        assert!(snapshot.connections.iter().any(|connection| {
-            connection.peer_id == destination_peer && connection.path == ReachabilityPath::Relayed
-        }));
-
-        let relay_snapshot = relay_node.reachability_snapshot().await.unwrap();
-        assert_eq!(relay_snapshot.role, ReachabilityRole::Infrastructure);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn blob_stream_loopback_resumes_streams_rejects_and_bounds_frames() {
-        let _loopback_test = acquire_loopback_test_gate().await;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct CancellationNotice(Arc<AtomicBool>);
-        impl Drop for CancellationNotice {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let requester = Discovery::new(DiscoveryConfig::default()).expect("requester");
-        let server = Discovery::new(DiscoveryConfig::default()).expect("server");
-        let requester_peer = *requester.local_peer_id();
-        let server_peer = *server.local_peer_id();
-        let content_id = [41; 32];
-        let content = Arc::new(b"0123456789".to_vec());
-        let cancellation_seen = Arc::new(AtomicBool::new(false));
-        let resume_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let waiting_after_first_chunk = Arc::new(AtomicBool::new(false));
-
-        server
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("server listen");
-        let mut server_addr = loopback_dial_addr(&server).await;
-        server_addr.push(Protocol::P2p(server_peer));
-        requester
-            .dial_peer(&server_addr.to_string())
-            .await
-            .expect("requester dial server");
-        wait_for_peer_path(&requester, server_peer, &[ReachabilityPath::Direct]).await;
-
-        let served_content = content.clone();
-        let handler_cancellation = cancellation_seen.clone();
-        let handler_resume_release = resume_release.clone();
-        let handler_waiting = waiting_after_first_chunk.clone();
-        server
-            .set_blob_stream_handler(Some(Arc::new(move |peer, request, frames| {
-                let content = served_content.clone();
-                let cancellation = handler_cancellation.clone();
-                let resume_release = handler_resume_release.clone();
-                let waiting_after_first_chunk = handler_waiting.clone();
-                Box::pin(async move {
-                    assert_eq!(peer, requester_peer);
-                    if request.metadata == b"wrong-offset" {
-                        let _ = frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Accepted {
-                                    total_size: content.len() as u64,
-                                    offset: request.offset + 1,
-                                },
-                            ))
-                            .await;
-                        return;
-                    }
-                    if request.metadata == b"oversized" {
-                        let _ = frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Accepted {
-                                    total_size: (BLOB_STREAM_MAX_CHUNK_BYTES + 1) as u64,
-                                    offset: request.offset,
-                                },
-                            ))
-                            .await;
-                        let _ = frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Chunk {
-                                    offset: request.offset,
-                                    bytes: vec![0; BLOB_STREAM_MAX_CHUNK_BYTES + 1],
-                                },
-                            ))
-                            .await;
-                        return;
-                    }
-                    if request.offset > content.len() as u64 {
-                        frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Rejected {
-                                    reason: "requested offset exceeds content size".to_string(),
-                                },
-                            ))
-                            .await
-                            .unwrap();
-                        return;
-                    }
-
-                    frames
-                        .send(blob_frame(
-                            request.content_id,
-                            BlobStreamFrameKind::Accepted {
-                                total_size: content.len() as u64,
-                                offset: request.offset,
-                            },
-                        ))
-                        .await
-                        .unwrap();
-                    if request.metadata == b"cancel" {
-                        let _notice = CancellationNotice(cancellation);
-                        futures::future::pending::<()>().await;
-                        return;
-                    }
-
-                    let start = request.offset as usize;
-                    let first_end = (start + 3).min(content.len());
-                    if start < first_end {
-                        frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Chunk {
-                                    offset: request.offset,
-                                    bytes: content[start..first_end].to_vec(),
-                                },
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                    waiting_after_first_chunk.store(true, Ordering::Release);
-                    let _permit = resume_release
-                        .acquire()
-                        .await
-                        .expect("test gate remains open");
-                    if first_end < content.len() {
-                        frames
-                            .send(blob_frame(
-                                request.content_id,
-                                BlobStreamFrameKind::Chunk {
-                                    offset: first_end as u64,
-                                    bytes: content[first_end..].to_vec(),
-                                },
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                    frames
-                        .send(blob_frame(
-                            request.content_id,
-                            BlobStreamFrameKind::Eof {
-                                offset: content.len() as u64,
-                            },
-                        ))
-                        .await
-                        .unwrap();
-                })
-            })))
-            .unwrap();
-
-        let mut resume_request = blob_request(content_id, 3, b"resume".to_vec());
-        resume_request.idle_timeout_ms = crate::protocol::BLOB_STREAM_MIN_IDLE_TIMEOUT_MS;
-        let control_guard = requester.job_relay_stream_control.lock().await;
-        let open_future = requester.open_blob_stream(server_peer, resume_request);
-        tokio::pin!(open_future);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(350), open_future.as_mut())
-                .await
-                .is_err(),
-            "valid blob idle timeout must not bound control-lock or transport negotiation"
-        );
-        drop(control_guard);
-        let mut resumed = open_future.await.expect("open resumed blob");
-        assert_eq!(resumed.content_id(), &content_id);
-        assert!(matches!(
-            resumed.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Accepted {
-                total_size: 10,
-                offset: 3,
-            }
-        ));
-        let first = resumed.next_frame().await.unwrap();
-        assert_eq!(
-            first.kind,
-            BlobStreamFrameKind::Chunk {
-                offset: 3,
-                bytes: b"345".to_vec(),
-            }
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !waiting_after_first_chunk.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("server reaches deterministic post-chunk gate");
-        assert_eq!(resume_release.available_permits(), 0);
-        resume_release.add_permits(1);
-        assert_eq!(
-            resumed.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Chunk {
-                offset: 6,
-                bytes: b"6789".to_vec(),
-            }
-        );
-        assert_eq!(
-            resumed.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Eof { offset: 10 }
-        );
-
-        let mut rejected = requester
-            .open_blob_stream(server_peer, blob_request(content_id, 11, Vec::new()))
-            .await
-            .expect("open out-of-range request");
-        assert!(matches!(
-            rejected.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Rejected { .. }
-        ));
-
-        let mut wrong_offset = requester
-            .open_blob_stream(
-                server_peer,
-                blob_request(content_id, 0, b"wrong-offset".to_vec()),
-            )
-            .await
-            .expect("open wrong-offset stream");
-        assert!(wrong_offset.next_frame().await.is_err());
-
-        let mut oversized = requester
-            .open_blob_stream(
-                server_peer,
-                blob_request(content_id, 0, b"oversized".to_vec()),
-            )
-            .await
-            .expect("open malformed stream");
-        assert!(matches!(
-            oversized.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Accepted { .. }
-        ));
-        assert!(oversized.next_frame().await.is_err());
-
-        let mut cancelled = requester
-            .open_blob_stream(server_peer, blob_request(content_id, 0, b"cancel".to_vec()))
-            .await
-            .expect("open cancellable stream");
-        assert!(matches!(
-            cancelled.next_frame().await.unwrap().kind,
-            BlobStreamFrameKind::Accepted { .. }
-        ));
-        cancelled.cancel().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !cancellation_seen.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("server handler was not cancelled after stream close");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn live_relay_is_real_ordered_substream_with_cancellation() {
-        let _loopback_test = acquire_loopback_test_gate().await;
-        let node_a = Discovery::new(DiscoveryConfig::default()).expect("node A");
-        let node_b = Discovery::new(DiscoveryConfig::default()).expect("node B");
-        let a_peer = *node_a.local_peer_id();
-        let b_peer = *node_b.local_peer_id();
-
-        node_b
-            .listen("/ip4/127.0.0.1/tcp/0")
-            .await
-            .expect("node B listen");
-        let mut b_addr = loopback_dial_addr(&node_b).await;
-        b_addr.push(libp2p::multiaddr::Protocol::P2p(b_peer));
-        node_a
-            .dial_peer(&b_addr.to_string())
-            .await
-            .expect("node A dials node B");
-        wait_for_peer_path(&node_a, b_peer, &[ReachabilityPath::Direct]).await;
-
-        let terminal_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let waiting_before_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler_release = terminal_release.clone();
-        let handler_waiting = waiting_before_terminal.clone();
-        node_b
-            .set_job_relay_stream_handler(Some(Arc::new(
-                move |peer, open, mut controls, frames| {
-                    let release = handler_release.clone();
-                    let waiting = handler_waiting.clone();
-                    Box::pin(async move {
-                        assert_eq!(peer, a_peer);
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 0,
-                                kind: JobRelayStreamFrameKind::Accepted,
-                            })
-                            .await
-                            .unwrap();
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 1,
-                                kind: JobRelayStreamFrameKind::Event {
-                                    payload: b"first".to_vec(),
-                                    terminal: false,
-                                },
-                            })
-                            .await
-                            .unwrap();
-                        waiting.store(true, std::sync::atomic::Ordering::Release);
-                        let _permit = release.acquire().await.expect("test gate remains open");
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 2,
-                                kind: JobRelayStreamFrameKind::Event {
-                                    payload: b"final".to_vec(),
-                                    terminal: true,
-                                },
-                            })
-                            .await
-                            .unwrap();
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 3,
-                                kind: JobRelayStreamFrameKind::Receipt {
-                                    payload: b"signed-receipt".to_vec(),
-                                },
-                            })
-                            .await
-                            .unwrap();
-                        let _ = controls.recv().await;
-                    })
-                },
-            )))
-            .unwrap();
-
-        let job_id = [21; 32];
-        let control_guard = node_a.job_relay_stream_control.lock().await;
-        let open_future = node_a.open_job_relay_stream(
-            b_peer,
-            JobRelayStreamOpen {
-                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                job_id,
-                payload: b"signed-manifest".to_vec(),
-                deadline_unix_ms: unix_time_ms() + 5_000,
-                idle_timeout_ms: crate::protocol::JOB_RELAY_STREAM_MIN_IDLE_TIMEOUT_MS,
-            },
-        );
-        tokio::pin!(open_future);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(350), open_future.as_mut())
-                .await
-                .is_err(),
-            "valid idle timeout must not bound control-lock or transport negotiation"
-        );
-        drop(control_guard);
-        let mut stream = open_future.await.expect("open live relay stream");
-
-        assert!(matches!(
-            stream.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Accepted
-        ));
-        assert!(matches!(
-            stream.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Event {
-                terminal: false,
-                ..
-            }
-        ));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !waiting_before_terminal.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("server reaches deterministic pre-terminal gate");
-        assert_eq!(terminal_release.available_permits(), 0);
-        terminal_release.add_permits(1);
-        assert!(matches!(
-            stream.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Event { terminal: true, .. }
-        ));
-        assert!(matches!(
-            stream.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Receipt { .. }
-        ));
-        stream.acknowledge_receipt().await.unwrap();
-
-        node_b
-            .set_job_relay_stream_handler(Some(Arc::new(
-                move |_peer, open, mut controls, frames| {
-                    Box::pin(async move {
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 0,
-                                kind: JobRelayStreamFrameKind::Accepted,
-                            })
-                            .await
-                            .unwrap();
-                        let control = controls.recv().await.expect("cancel control");
-                        assert!(matches!(
-                            control.kind,
-                            JobRelayStreamControlKind::Cancel { .. }
-                        ));
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 1,
-                                kind: JobRelayStreamFrameKind::Failed {
-                                    reason: "cancelled".to_string(),
-                                },
-                            })
-                            .await
-                            .unwrap();
-                    })
-                },
-            )))
-            .unwrap();
-
-        let mut cancelled = node_a
-            .open_job_relay_stream(
-                b_peer,
-                JobRelayStreamOpen {
-                    schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                    job_id: [22; 32],
-                    payload: b"signed-manifest".to_vec(),
-                    deadline_unix_ms: unix_time_ms() + 5_000,
-                    idle_timeout_ms: 1_000,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            cancelled.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Accepted
-        ));
-        cancelled.cancel("test cancellation").await.unwrap();
-        assert!(matches!(
-            cancelled.next_frame().await.unwrap().unwrap().kind,
-            JobRelayStreamFrameKind::Failed { .. }
-        ));
-
-        let (cancel_seen_tx, cancel_seen_rx) = oneshot::channel();
-        let cancel_seen_tx = Arc::new(std::sync::Mutex::new(Some(cancel_seen_tx)));
-        node_b
-            .set_job_relay_stream_handler(Some(Arc::new({
-                let cancel_seen_tx = cancel_seen_tx.clone();
-                move |_peer, open, mut controls, frames| {
-                    let cancel_seen_tx = cancel_seen_tx.clone();
-                    Box::pin(async move {
-                        frames
-                            .send(JobRelayStreamFrame {
-                                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                                job_id: open.job_id,
-                                sequence: 0,
-                                kind: JobRelayStreamFrameKind::Accepted,
-                            })
-                            .await
-                            .unwrap();
-                        let control = controls.recv().await.expect("idle cancel control");
-                        assert!(matches!(
-                            control.kind,
-                            JobRelayStreamControlKind::Cancel { .. }
-                        ));
-                        if let Some(tx) = cancel_seen_tx.lock().unwrap().take() {
-                            let _ = tx.send(());
-                        }
-                    })
-                }
-            })))
-            .unwrap();
-
-        let mut silent_after_acceptance = node_a
-            .open_job_relay_stream(
-                b_peer,
-                JobRelayStreamOpen {
-                    schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                    job_id: [23; 32],
-                    payload: b"signed-manifest".to_vec(),
-                    deadline_unix_ms: unix_time_ms() + 5_000,
-                    idle_timeout_ms: 250,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            silent_after_acceptance
-                .next_frame()
-                .await
-                .unwrap()
-                .unwrap()
-                .kind,
-            JobRelayStreamFrameKind::Accepted
-        ));
-        let liveness_failure =
-            tokio::time::timeout(Duration::from_secs(2), silent_after_acceptance.next_frame())
-                .await
-                .expect("silence after Accepted must terminate deterministically");
-        // Either endpoint may reach its idle deadline first. The requester
-        // reports a transport error, while the serving peer sends a validated
-        // Failed frame. Both paths must terminate without successful output.
-        if let Some(Ok(frame)) = liveness_failure {
-            assert!(matches!(
-                frame.kind,
-                JobRelayStreamFrameKind::Failed { ref reason }
-                    if reason == "live relay idle timeout reached"
-            ));
-            assert!(tokio::time::timeout(
-                Duration::from_secs(2),
-                silent_after_acceptance.next_frame(),
-            )
-            .await
-            .expect("failed peer stream must close")
-            .is_none());
-        }
-        tokio::time::timeout(Duration::from_secs(2), cancel_seen_rx)
-            .await
-            .expect("server handler receives cancellation and releases resources")
-            .expect("cancel signal sender remains live");
-    }
-}
+mod tests;

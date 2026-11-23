@@ -53,6 +53,8 @@ struct Config {
     hang_after: Option<usize>,
     fail_health: bool,
     boot_at: std::time::Instant,
+    template_mode: String,
+    required_prompt: Option<String>,
 }
 
 pub(crate) fn run() -> ! {
@@ -100,6 +102,8 @@ async fn run_server() -> ! {
             .and_then(|s| s.parse().ok()),
         fail_health: std::env::var("FAKE_LLAMA_FAIL_HEALTH").is_ok(),
         boot_at: std::time::Instant::now(),
+        template_mode: std::env::var("FAKE_LLAMA_TEMPLATE_MODE").unwrap_or_default(),
+        required_prompt: std::env::var("FAKE_LLAMA_REQUIRED_PROMPT").ok(),
     };
 
     // Optional self-destruct used to simulate a crash mid-stream.
@@ -118,6 +122,7 @@ async fn run_server() -> ! {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/completion", post(handle_completion))
+        .route("/apply-template", post(handle_apply_template))
         .route("/v1/chat/completions", post(handle_completion))
         .route("/embedding", post(handle_embedding))
         .with_state(Arc::new(cfg));
@@ -148,6 +153,31 @@ async fn handle_health(State(cfg): State<Arc<Config>>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "loading model").into_response();
     }
     Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+async fn handle_apply_template(
+    State(cfg): State<Arc<Config>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    if request["add_generation_prompt"] != true
+        || request["chat_template_kwargs"]["enable_thinking"] != false
+        || !request["messages"].is_array()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match cfg.template_mode.as_str() {
+        "invalid" => return Json(serde_json::json!({"prompt": 17})).into_response(),
+        "oversize" => {
+            return Json(serde_json::json!({"prompt": "x".repeat(4 * 1024 * 1024 + 1)}))
+                .into_response()
+        }
+        "hang" => tokio::time::sleep(Duration::from_secs(600)).await,
+        _ => {}
+    }
+    Json(serde_json::json!({"prompt": format!(
+        "<fixture-template>{}</fixture-template>", request["messages"]
+    )}))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -202,9 +232,16 @@ async fn handle_embedding(
 
 async fn handle_completion(
     State(cfg): State<Arc<Config>>,
-    Json(_req): Json<CompletionRequest>,
+    Json(req): Json<CompletionRequest>,
 ) -> Response {
     let cfg = cfg.clone();
+    if cfg
+        .required_prompt
+        .as_ref()
+        .is_some_and(|expected| req.prompt.as_ref() != Some(expected))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let stream = async_stream::stream! {
         for (idx, tok) in cfg.tokens.iter().enumerate() {
             // Hang test: stop emitting but keep socket open. The worker's

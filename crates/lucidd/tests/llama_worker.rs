@@ -331,6 +331,92 @@ async fn happy_path_streams_tokens_and_signs_receipt() {
     assert_ne!(receipt.result.output_commitment, [0u8; 32]);
 }
 
+fn make_chat_manifest(model_id: &str) -> SignedManifest<JobSpec> {
+    let spec = JobSpec::Inference(InferenceJobSpec {
+        model_cid: model_id.into(),
+        messages: vec![phase_protocol::ChatMessage {
+            role: phase_protocol::ChatRole::User,
+            content: "Hi.".into(),
+            images: Vec::new(),
+        }],
+        prompt: Some("must not replace the conversation".into()),
+        resume_from: None,
+        sampling: SamplingParams::default(),
+        max_tokens: Some(32),
+        stream: true,
+    });
+    ManifestBuilder::new(spec)
+        .sign_with(&NodeIdentity::generate())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn model_chat_template_drives_completion_and_preserves_signed_receipt() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    let mut setup = setup("chat-template");
+    let expected = format!(
+        "<fixture-template>{}</fixture-template>",
+        serde_json::json!([{"role": "user", "content": "Hi."}])
+    );
+    setup
+        .config
+        .extra_env
+        .push(("FAKE_LLAMA_REQUIRED_PROMPT".into(), expected));
+    let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
+    let manifest = make_chat_manifest(&setup.model_id);
+    let manifest_hash = manifest.manifest_hash().unwrap();
+    let (handle, mut stream) = worker.execute(manifest).await.expect("template dispatch");
+    let mut chunks = 0;
+    while let Some(event) = stream.next().await {
+        match event {
+            JobEvent::Output(_) => chunks += 1,
+            JobEvent::Final { result, error } => {
+                assert!(
+                    error.is_none(),
+                    "unexpected template execution error: {error:?}"
+                );
+                assert_eq!(result.completion, Completion::Stop);
+            }
+            _ => {}
+        }
+    }
+    assert!(chunks > 0);
+    let receipt = handle.finish().await.expect("template job receipt");
+    assert_eq!(receipt.result.job_spec_hash, manifest_hash);
+    assert_eq!(receipt.result.output_chunk_count, chunks);
+    assert_ne!(receipt.result.output_commitment, [0; 32]);
+}
+
+#[tokio::test]
+async fn chat_template_failures_fail_closed_while_raw_prompts_bypass_template() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    for mode in ["invalid", "oversize", "hang"] {
+        let mut setup = setup(&format!("template-{mode}"));
+        setup
+            .config
+            .extra_env
+            .push(("FAKE_LLAMA_TEMPLATE_MODE".into(), mode.into()));
+        setup.config.per_request_idle_timeout = Duration::from_millis(500);
+        let worker = LlamaCppWorker::new(NodeIdentity::generate(), setup.config);
+        let result = worker.execute(make_chat_manifest(&setup.model_id)).await;
+        let error = match result {
+            Ok(_) => panic!("{mode} template must not dispatch fallback prompt"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("chat template"),
+            "{mode}: {error}"
+        );
+        if mode == "invalid" {
+            let result = run_to_final(&worker, &setup.model_id).await.unwrap();
+            assert_eq!(result.0, Completion::Stop);
+            assert!(result.1.is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn cancellation_mid_stream_yields_cancelled_completion() {
     #[cfg(target_os = "macos")]

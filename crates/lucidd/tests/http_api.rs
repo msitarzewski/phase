@@ -37,6 +37,7 @@ impl TestDaemon {
                 "--worker",
                 "echo",
                 "--no-default-bootstrap",
+                "--outbound-only",
                 "--libp2p-port",
                 "0",
                 "--identity-path",
@@ -111,6 +112,105 @@ fn free_port() -> u16 {
 
 fn read_log(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|error| format!("<log unavailable: {error}>"))
+}
+
+#[tokio::test]
+async fn native_control_requires_private_bearer_and_never_echoes_invitation_secrets() {
+    let daemon = TestDaemon::spawn().await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let path = daemon._temp.path().join("identity.key.control-token");
+    let token = std::fs::read_to_string(path).expect("daemon creates private control token");
+    let token = token.trim();
+    assert_eq!(token.len(), 64);
+    for endpoint in [
+        "/api/lucid/status",
+        "/api/lucid/enroll",
+        "/api/lucid/invitations",
+    ] {
+        let request = if endpoint.ends_with("status") {
+            client.get(daemon.url(endpoint))
+        } else {
+            client
+                .post(daemon.url(endpoint))
+                .json(&if endpoint.ends_with("enroll") {
+                    json!({"invitation":"private-seed-must-not-leak"})
+                } else {
+                    json!({})
+                })
+        };
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = response.text().await.unwrap();
+        assert!(!body.contains(token));
+        assert!(!body.contains("private-seed-must-not-leak"));
+    }
+    let response = client
+        .get(daemon.url("/api/lucid/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: Value = response.json().await.unwrap();
+    assert!(status["enrollment"]["state"].is_string());
+    assert!(status.get("peer_id").is_none());
+    assert!(status.get("addresses").is_none());
+    let response = client
+        .post(daemon.url("/api/lucid/enroll"))
+        .bearer_auth(token)
+        .json(&json!({"invitation":"private-seed-must-not-leak"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response
+        .text()
+        .await
+        .unwrap()
+        .contains("private-seed-must-not-leak"));
+    let response = client
+        .post(daemon.url("/api/lucid/enroll"))
+        .bearer_auth(token)
+        .json(&json!({"invitation":"x".repeat(16 * 1024)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let response = client
+        .post(daemon.url("/api/lucid/invitations"))
+        .bearer_auth(token)
+        .json(&json!({"ttl_seconds":300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let invite: Value = response.json().await.unwrap();
+    assert!(invite["invitation"]
+        .as_str()
+        .unwrap()
+        .starts_with("lucid://join/"));
+}
+
+#[test]
+fn outbound_only_refuses_infrastructure_before_creating_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("must-not-exist.key");
+    let output = Command::new(env!("CARGO_BIN_EXE_lucidd"))
+        .args([
+            "--mode",
+            "infrastructure",
+            "--outbound-only",
+            "--external-address",
+            "/ip4/127.0.0.1/tcp/4001",
+            "--identity-path",
+        ])
+        .arg(&identity)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!identity.exists());
 }
 
 fn assert_local_receipt_headers(response: &reqwest::Response) {
