@@ -34,7 +34,7 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hyper = "1"
-libp2p = "0.56"
+libp2p = "0.57"
 num_cpus = "1.0"
 postcard = { version = "1", features = ["use-std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

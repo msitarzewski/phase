@@ -42,18 +42,6 @@ unmaintained = "workspace"
 # they remain visible in CI output. These mirror `.cargo/audit.toml` (SEC-02)
 # 1:1 so `cargo deny check advisories` agrees with `cargo audit`.
 ignore = [
-    # hickory-proto 0.25.2 reaches us ONLY via libp2p-mdns 0.48 (the latest
-    # published libp2p, 0.56, hard-pins `hickory-proto = "^0.25.2"`, which
-    # cannot accept the patched 0.26.1 line — 0.25 -> 0.26 is a breaking API
-    # change in the crate libp2p-mdns compiles against, so it is an upstream
-    # blocker, not something SEC-02 can patch without forking libp2p).
-    # Reachability: link-local mDNS multicast peer discovery only; it does NOT
-    # perform DNSSEC validation and is not the internet-facing resolver (that
-    # path now uses hickory 0.26). Clear when a libp2p release bumps
-    # libp2p-mdns to hickory-proto 0.26.
-    { id = "RUSTSEC-2026-0119", reason = "O(n^2) name-compression CPU exhaustion; reachable only on the libp2p-mdns 0.25 path, upstream-pinned" },
-    { id = "RUSTSEC-2026-0118", reason = "NSEC3 closest-encloser unbounded loop; DNSSEC code, and the mdns path never validates DNSSEC" },
-
     # nix 0.19.1 is pulled by battery 0.7.8 (latest) ONLY under
     # cfg(any(target_os = "dragonfly", target_os = "freebsd")). Phase ships to
     # aarch64-darwin / aarch64-linux / x86_64-linux exclusively, so this crate
@@ -92,15 +80,10 @@ allow = [
 # ---------------------------------------------------------------------------
 # `cargo deny check bans`
 [bans]
-# We knowingly carry duplicate versions (two hickory-proto lines, one via
-# libp2p-mdns and one via the resolver). Surface dupes as warnings, never fail.
+# Surface duplicate dependency versions as warnings, never a hard error.
 multiple-versions = "warn"
 wildcards = "allow"
-# Known, accepted duplicate(s). Listing them keeps the warning noise focused on
-# NEW dupes rather than the ones we've already reasoned about.
-skip = [
-    { crate = "hickory-proto", reason = "0.25.2 (libp2p-mdns 0.48) + 0.26.1 (resolver); upstream-pinned, see [advisories]" },
-]
+skip = []
 
 # ---------------------------------------------------------------------------
 # `cargo deny check sources`

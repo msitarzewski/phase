@@ -393,7 +393,8 @@ run_security() {
 
     if cargo deny --version >/dev/null 2>&1; then
         # Both Cargo dependency resolution and advisory lookup stay offline.
-        run_step "security-deny" cargo deny --locked --offline check --disable-fetch
+        # Match CI by keeping unmaintained-crate advisories as warnings.
+        run_step "security-deny" cargo deny --locked --offline check --disable-fetch --warn unmaintained
     else
         skip_step "security-deny" "cargo-deny is not installed"
     fi
