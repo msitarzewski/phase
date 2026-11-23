@@ -4,17 +4,16 @@
 # One-command operator setup for a dedicated LUCID Cloud Relay (Linux x86_64/ARM64
 # with a direct static public IPv4).
 #
-# What this script does:
-#   1. Detects or validates the host's public IPv4 (rejecting loopback, RFC1918,
-#      and Tailscale CGNAT 100.64.0.0/10 addresses).
-#   2. Delegates binary download, SHA-256 verification, systemd user unit
-#      install, and ~/.config/lucidd/infrastructure.env creation to
-#      `scripts/install-lucid.sh --setup-relay`.
-#   3. Opens inbound TCP 4001 ONLY in ufw when ufw is active (never touches
-#      ports 80/443, SSH, Caddy, or Tailscale).
-#   4. Enables user linger + starts `lucidd-relay.service`.
-#   5. Extracts the relay's PeerId and prints the exact DNS TXT record value
-#      for `bootstrap.phasebased.net`.
+# Security & isolation:
+#   - NEVER runs `lucidd` as root. If invoked as root (typical on fresh VPS
+#     droplets), creates a locked-down unprivileged `lucid` service user
+#     (`/usr/sbin/nologin`, zero sudo) and installs a sandboxed systemd unit
+#     (`User=lucid`, `NoNewPrivileges=true`, `ProtectSystem=strict`,
+#     `ProtectHome=read-only`, `MemoryDenyWriteExecute=true`).
+#   - Verifies the downloaded release archive against SHA256SUMS.txt fail-closed.
+#   - Opens ONLY inbound TCP 4001 in ufw (leaves 80/443, SSH, Caddy, and
+#     Tailscale untouched).
+#   - Rejects loopback, RFC1918, and Tailscale CGNAT (100.64.0.0/10) IPs.
 
 set -euo pipefail
 
@@ -23,6 +22,7 @@ TAG="${PHASE_RELEASE_TAG:-v0.2.0-rc3}"
 PUBLIC_IP=""
 SKIP_FIREWALL=0
 PREFIX="${HOME}/.local"
+SERVICE_USER="lucid"
 
 usage() {
     cat <<'EOF'
@@ -35,7 +35,7 @@ Options:
   --ip IPV4             Static public IPv4 address (auto-detected if omitted)
   --tag TAG             GitHub Release tag to install (default: v0.2.0-rc3)
   --repo OWNER/REPO     GitHub repository (default: msitarzewski/phase)
-  --prefix DIR          Install prefix for bin/lucidd (default: ~/.local)
+  --prefix DIR          Install prefix for bin/lucidd (non-root mode, default: ~/.local)
   --no-firewall         Skip adding the `ufw allow 4001/tcp` rule
   -h, --help            Show this help
 EOF
@@ -55,10 +55,6 @@ done
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "ERROR: Cloud Relay setup must run on Linux." >&2
-    exit 1
-fi
-if [[ "$(id -u)" -eq 0 ]]; then
-    echo "ERROR: Run this script as your normal operator user (not root). It will use sudo only for ufw/loginctl." >&2
     exit 1
 fi
 
@@ -81,7 +77,6 @@ is_public_ipv4() {
 }
 
 if [[ -z "$PUBLIC_IP" ]]; then
-    # Prefer the primary non-Tailscale interface address, then fall back to HTTPS IP lookup.
     if command -v ip >/dev/null 2>&1; then
         CANDIDATE="$(ip -4 -o addr show scope global 2>/dev/null | awk '!/tailscale|docker|br-|veth/ { split($4, a, "/"); print a[1] }' | head -n 1 || true)"
         if [[ -n "$CANDIDATE" ]] && is_public_ipv4 "$CANDIDATE"; then
@@ -103,40 +98,138 @@ fi
 
 echo "==> Setting up LUCID Cloud Relay (${TAG}) on public IPv4 ${PUBLIC_IP}:4001"
 
-# Reuse install-lucid.sh (local checkout if present, otherwise fetch pinned tag).
+# Locate or download install-lucid.sh once.
+TMP_INSTALLER=""
+cleanup() {
+    if [[ -n "$TMP_INSTALLER" ]]; then
+        rm -f "$TMP_INSTALLER"
+    fi
+}
+trap cleanup EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/install-lucid.sh" ]]; then
-    bash "$SCRIPT_DIR/install-lucid.sh" \
-        --repo "$REPO" --tag "$TAG" --prefix "$PREFIX" --setup-relay "$PUBLIC_IP"
+    INSTALLER="$SCRIPT_DIR/install-lucid.sh"
 else
     TMP_INSTALLER="$(mktemp)"
-    trap 'rm -f "$TMP_INSTALLER"' EXIT
     curl -fsSL --proto '=https' --tlsv1.2 \
         "https://raw.githubusercontent.com/${REPO}/${TAG}/scripts/install-lucid.sh" \
         -o "$TMP_INSTALLER"
-    bash "$TMP_INSTALLER" \
-        --repo "$REPO" --tag "$TAG" --prefix "$PREFIX" --setup-relay "$PUBLIC_IP"
+    chmod 0755 "$TMP_INSTALLER"
+    INSTALLER="$TMP_INSTALLER"
 fi
 
-if [[ "$SKIP_FIREWALL" -eq 0 ]] && command -v ufw >/dev/null 2>&1; then
-    if sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
-        echo "==> Allowing inbound TCP 4001/tcp in ufw (leaving 80/443, SSH, Caddy, Tailscale untouched)..."
-        sudo ufw allow 4001/tcp comment "LUCID libp2p relay"
-    else
-        echo "Note: ufw is installed but inactive; no ufw rule changed."
+if [[ "$(id -u)" -eq 0 ]]; then
+    # Root mode: create dedicated unprivileged service user `lucid` (never runs lucidd as root).
+    if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+        echo "==> Creating unprivileged service account '${SERVICE_USER}' (no login shell, no sudo)..."
+        useradd --system --create-home --home-dir "/home/${SERVICE_USER}" --shell /usr/sbin/nologin "$SERVICE_USER"
     fi
-fi
+    SVC_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
+    SVC_PREFIX="${SVC_HOME}/.local"
+    chmod 0750 "$SVC_HOME"
 
-echo "==> Enabling user linger and starting lucidd-relay.service..."
-sudo loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable --now lucidd-relay.service
-systemctl --user restart lucidd-relay.service
+    # Install binary as unprivileged user (SHA-256 verified fail-closed).
+    su -s /bin/bash "$SERVICE_USER" -c \
+        "bash $(printf '%q' "$INSTALLER") --repo $(printf '%q' "$REPO") --tag $(printf '%q' "$TAG") --prefix $(printf '%q' "$SVC_PREFIX")"
+
+    install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "${SVC_HOME}/.config/lucidd" "${SVC_HOME}/.config/phase"
+    ENV_FILE="${SVC_HOME}/.config/lucidd/infrastructure.env"
+    cat > "$ENV_FILE" <<EOF
+# Configured by setup-cloud-relay.sh
+LUCIDD_EXTERNAL_ADDRESS=/ip4/${PUBLIC_IP}/tcp/4001
+LUCIDD_LIBP2P_PORT=4001
+EOF
+    chown "${SERVICE_USER}:${SERVICE_USER}" "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+
+    UNIT_FILE="/etc/systemd/system/lucidd-relay.service"
+    cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=lucidd — bounded Phase relay/AutoNAT infrastructure node
+Documentation=https://github.com/msitarzewski/phase
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+UMask=0077
+Environment=LUCIDD_LIBP2P_PORT=4001
+Environment=LUCIDD_PORT=11434
+Environment=LUCIDD_HOST=127.0.0.1
+Environment=RUST_LOG=info,phase_net=info,lucidd=info
+EnvironmentFile=${ENV_FILE}
+ExecStart=${SVC_PREFIX}/bin/lucidd --mode infrastructure --libp2p-port \${LUCIDD_LIBP2P_PORT} --external-address \${LUCIDD_EXTERNAL_ADDRESS}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lucidd
+LimitNOFILE=65536
+TasksMax=512
+MemoryMax=1G
+CPUQuota=200%
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${SVC_HOME}/.config/lucidd ${SVC_HOME}/.config/phase
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$UNIT_FILE"
+
+    if [[ "$SKIP_FIREWALL" -eq 0 ]] && command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -qi '^Status: active'; then
+            echo "==> Allowing inbound TCP 4001/tcp in ufw (leaving 80/443, SSH, Caddy, Tailscale untouched)..."
+            ufw allow 4001/tcp comment "LUCID libp2p relay"
+        fi
+    fi
+
+    echo "==> Enabling and starting sandboxed lucidd-relay.service (User=${SERVICE_USER})..."
+    systemctl daemon-reload
+    systemctl enable --now lucidd-relay.service
+    systemctl restart lucidd-relay.service
+    JOURNAL_CMD=(journalctl -u lucidd-relay.service -n 80 --no-pager)
+    STATUS_CMD=(systemctl --no-pager status lucidd-relay.service)
+else
+    bash "$INSTALLER" --repo "$REPO" --tag "$TAG" --prefix "$PREFIX" --setup-relay "$PUBLIC_IP"
+
+    if [[ "$SKIP_FIREWALL" -eq 0 ]] && command -v ufw >/dev/null 2>&1; then
+        if sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
+            echo "==> Allowing inbound TCP 4001/tcp in ufw (leaving 80/443, SSH, Caddy, Tailscale untouched)..."
+            sudo ufw allow 4001/tcp comment "LUCID libp2p relay"
+        fi
+    fi
+
+    echo "==> Enabling user linger and starting lucidd-relay.service..."
+    sudo loginctl enable-linger "$USER"
+    systemctl --user daemon-reload
+    systemctl --user enable --now lucidd-relay.service
+    systemctl --user restart lucidd-relay.service
+    JOURNAL_CMD=(journalctl --user -u lucidd-relay.service -n 80 --no-pager)
+    STATUS_CMD=(systemctl --user --no-pager status lucidd-relay.service)
+fi
 
 echo "==> Waiting for relay PeerId..."
 PEER_ID=""
 for _ in $(seq 1 15); do
-    PEER_ID="$(journalctl --user -u lucidd-relay.service -n 80 --no-pager 2>/dev/null \
+    PEER_ID="$("${JOURNAL_CMD[@]}" 2>/dev/null \
         | grep -oE '12D3KooW[1-9A-HJ-NP-Za-km-z]{40,60}' | tail -n 1 || true)"
     if [[ -n "$PEER_ID" ]]; then
         break
@@ -145,7 +238,7 @@ for _ in $(seq 1 15); do
 done
 
 echo ""
-systemctl --user --no-pager status lucidd-relay.service | head -n 12 || true
+"${STATUS_CMD[@]}" | head -n 12 || true
 echo ""
 
 if [[ -n "$PEER_ID" ]]; then
@@ -163,5 +256,5 @@ if [[ -n "$PEER_ID" ]]; then
     echo "================================================================"
 else
     echo "Cloud Relay started, but PeerId was not spotted in logs yet. Inspect with:"
-    echo "  journalctl --user -u lucidd-relay.service -n 50 --no-pager"
+    echo "  ${JOURNAL_CMD[*]}"
 fi
