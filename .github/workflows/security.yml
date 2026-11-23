@@ -37,18 +37,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write # audit-check publishes its result as a check run.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # RustSec advisory scan. Reads Cargo.lock and `.cargo/audit.toml`
-      # (the SEC-02 ignore list). Vulnerabilities fail; the 4 unmaintained
-      # crates are allowed warnings and exit 0.
+      # Install prebuilt cargo-audit binary (seconds instead of compiling from
+      # source) and scan Cargo.lock with `.cargo/audit.toml`. Vulnerabilities
+      # fail; unmaintained/informational advisories stay visible as warnings.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
       - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
       # cargo-deny: advisories (mirrors audit), licenses, bans, sources.
       # `--warn unmaintained` downgrades unmaintained-crate findings from the
@@ -140,14 +140,14 @@ jobs:
       - name: Swift tests with warnings denied
         run: |
           test "$(id -u)" -ne 0
-          export CLANG_MODULE_CACHE_PATH="$GITHUB_WORKSPACE/target/native-macos-ci/module-cache"
+          export CLANG_MODULE_CACHE_PATH="$RUNNER_TEMP/native-macos-ci/module-cache"
           export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
           mkdir -p "$CLANG_MODULE_CACHE_PATH"
           swift test --package-path apps/lucid-macos \
-            --scratch-path "$GITHUB_WORKSPACE/target/native-macos-ci/tests" \
-            --cache-path "$GITHUB_WORKSPACE/target/native-macos-ci/cache" \
-            --config-path "$GITHUB_WORKSPACE/target/native-macos-ci/config" \
-            --security-path "$GITHUB_WORKSPACE/target/native-macos-ci/security" \
+            --scratch-path "$RUNNER_TEMP/native-macos-ci/tests" \
+            --cache-path "$RUNNER_TEMP/native-macos-ci/cache" \
+            --config-path "$RUNNER_TEMP/native-macos-ci/config" \
+            --security-path "$RUNNER_TEMP/native-macos-ci/security" \
             --disable-sandbox -Xswiftc -module-cache-path \
             -Xswiftc "$CLANG_MODULE_CACHE_PATH" -Xswiftc -warnings-as-errors
 
@@ -155,15 +155,15 @@ jobs:
         run: |
           bash apps/lucid-macos/build-app.sh \
             --daemon "$GITHUB_WORKSPACE/target/debug/lucidd" \
-            --output "$GITHUB_WORKSPACE/target/native-macos-ci/app"
-          codesign --verify --deep --strict target/native-macos-ci/app/LUCID.app
-          plutil -lint target/native-macos-ci/app/LUCID.app/Contents/Info.plist
+            --output "$RUNNER_TEMP/native-macos-ci/app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/native-macos-ci/app/LUCID.app"
+          plutil -lint "$RUNNER_TEMP/native-macos-ci/app/LUCID.app/Contents/Info.plist"
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, json, platform, plistlib, re, subprocess
+          import hashlib, json, os, platform, plistlib, re, subprocess
 
           root = Path.cwd()
-          app = root / 'target/native-macos-ci/app/LUCID.app'
+          app = Path(os.environ['RUNNER_TEMP']) / 'native-macos-ci/app/LUCID.app'
           with (app / 'Contents/Info.plist').open('rb') as f:
               info = plistlib.load(f)
           build = json.loads((app / 'Contents/Resources/build-info.json').read_text())
