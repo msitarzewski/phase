@@ -133,6 +133,45 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Manage and preview Tier-1 Trusted-Circle pipeline sharding (`ShardWorker`).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusterCommand {
+    /// Show this machine's Trusted-Circle cluster opt-in status and memory capacity.
+    Status {
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+    },
+    /// Inspect a local GGUF file header read-only to read architecture & exact layer count.
+    Inspect {
+        /// Path to a local `.gguf` file.
+        path: PathBuf,
+    },
+    /// Preview a coordinator-signed Tier-1 Trusted-Circle layer split across peers.
+    Plan {
+        /// Model name (e.g., `llama3.3:70b-q4_k_m`).
+        #[arg(long)]
+        model: String,
+        /// Optional path to a local `.gguf` file to read exact layer count & size.
+        #[arg(long)]
+        gguf: Option<PathBuf>,
+        /// Transformer layer count when `--gguf` is omitted.
+        #[arg(long, default_value_t = 80)]
+        layers: u32,
+        /// Approximate weight size in GiB when `--gguf` is omitted.
+        #[arg(long, default_value_t = 42)]
+        size_gib: u64,
+        /// Peer capacities in `name:gib:backend` format (at least 2 peers),
+        /// e.g. `--peer desktop-5060ti:12:cuda --peer mac-m1max:24:metal --peer mac-m5max:64:metal`.
+        #[arg(long = "peer", value_name = "NAME:GIB:BACKEND", required = true)]
+        peers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -1735,6 +1774,115 @@ async fn run_cli_subcommand(
                 println!("Saved sanitized benchmark report: {}", out_path.display());
             }
             Ok(())
+        }
+        Command::Cluster { action } => {
+            match action {
+                ClusterCommand::Status { api } => {
+                    let token = load_local_control_token(identity_path, control_token_file)?;
+                    let body: serde_json::Value =
+                        local_control_get(&api, "/api/lucid/cluster", &token).await?;
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                    Ok(())
+                }
+                ClusterCommand::Inspect { path } => {
+                    let meta = lucidd::shard_plan::inspect_gguf_shard_metadata(&path)?;
+                    let gb = (meta.file_size_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+                    println!(
+                        "GGUF: {} | arch={} | layers={} | embed_dim={:?} | size={:.2} GiB",
+                        path.display(),
+                        meta.architecture,
+                        meta.block_count,
+                        meta.embedding_length,
+                        gb
+                    );
+                    Ok(())
+                }
+                ClusterCommand::Plan {
+                    model,
+                    gguf,
+                    layers,
+                    size_gib,
+                    peers,
+                } => {
+                    let coordinator = match identity_path {
+                        Some(p) => NodeIdentity::load_or_create(&p)?,
+                        None => NodeIdentity::load_or_create(&default_identity_path()?)?,
+                    };
+                    let cid_hex = lucidd::ModelCid::development_name_hash(&model).to_hex();
+                    let spec = if let Some(path) = gguf {
+                        let meta = lucidd::shard_plan::inspect_gguf_shard_metadata(&path)?;
+                        lucidd::shard_plan::shard_spec_from_gguf(cid_hex, model.clone(), &meta)
+                    } else {
+                        let meta = lucidd::shard_plan::GgufShardMetadata {
+                            architecture: "llama".to_string(),
+                            block_count: layers,
+                            embedding_length: None,
+                            file_size_bytes: size_gib.saturating_mul(1024 * 1024 * 1024),
+                        };
+                        lucidd::shard_plan::shard_spec_from_gguf(cid_hex, model.clone(), &meta)
+                    };
+
+                    let mut capacities = Vec::with_capacity(peers.len());
+                    for raw in &peers {
+                        let parts: Vec<&str> = raw.split(':').collect();
+                        if parts.len() != 3 {
+                            return Err(format!(
+                                "invalid --peer '{raw}': expected NAME:GIB:BACKEND"
+                            )
+                            .into());
+                        }
+                        let gib: u64 = parts[1].parse()?;
+                        let ephem = NodeIdentity::generate();
+                        capacities.push(lucidd::shard_plan::PeerShardCapacity {
+                            peer_id: parts[0].to_string(),
+                            verifying_key_hex: hex::encode(ephem.peer_id_bytes()),
+                            available_memory_bytes: gib.saturating_mul(1024 * 1024 * 1024),
+                            backend: parts[2].to_string(),
+                        });
+                    }
+
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let signed = lucidd::shard_plan::plan_pipeline_shards(
+                        &coordinator,
+                        &spec,
+                        &capacities,
+                        lucidd::shard_plan::ShardTrustTier::TrustedCircle,
+                        now_ms,
+                        30 * 60 * 1000,
+                    )?;
+                    lucidd::shard_plan::verify_shard_plan(&signed, now_ms)?;
+                    println!(
+                        "Signed Plan: {} | Model: {} ({} layers) | Trust: {}",
+                        signed.plan.plan_id,
+                        signed.plan.model_alias,
+                        signed.plan.total_layers,
+                        signed.plan.trust_label
+                    );
+                    for st in &signed.plan.stages {
+                        let est_gib =
+                            (st.estimated_memory_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+                        println!(
+                        "  Stage {} -> {:<20} layers {:>2}..{:<2} ({:>2} layers, ~{:.2} GiB){}{}",
+                        st.stage_index,
+                        st.peer_id,
+                        st.start_layer,
+                        st.end_layer,
+                        st.end_layer - st.start_layer,
+                        est_gib,
+                        if st.includes_embedding { " [embed]" } else { "" },
+                        if st.includes_lm_head { " [lm_head]" } else { "" }
+                    );
+                    }
+                    println!(
+                        "Coordinator Sig: {}… (verified)",
+                        &signed.coordinator_signature_hex[..24]
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 }

@@ -1,8 +1,8 @@
 # Active Context: Current Sprint
 
-**Last Updated**: 2026-11-23
-**Sprint**: Execute soup-to-nuts physical qualification across Cloud Relay (sole static-IP relay), Ubuntu Desktop (5060ti 16GB, 32GB RAM), Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM), Mac M1 Max (32GB RAM), and Mac M5 Max (128GB RAM, cellular daily driver) using the new self-configuring `lucidd` + cross-platform Tauri v2 desktop app (`.dmg` + `.deb`)
-**Status**: Phase Core, LUCID v0.1, and v0.1.1 remain shipped. On `feat/lucid-consumer-experience`, LUCID v0.2 now includes the self-configuring `lucidd` core & permission-first probe (`node_config.rs`, `runtime_manager.rs`, CLI subcommands `probe`/`models`/`peers`/`invite`/`join`) and the sandboxed cross-platform Tauri v2 + Svelte 5 desktop app (`apps/lucid-desktop/`, producing macOS `.dmg` and Ubuntu `.deb` installers; [261123 task record](tasks/2026-11/261123_apple-simple-lucid-desktop.md)), alongside the 2026-11-22 efficiency pass and `libp2p 0.57` security upgrades (0 vulnerabilities across both root and desktop `Cargo.lock`). This is still not a v0.2 release: bringing up Cloud Relay + `bootstrap.phasebased.net` TXT record, physical two-network/NAT intended stream, real multi-GB pull/resume, real Apple Silicon MLX, Linux x86_64/ARM64 reruns on current source, public rendezvous quotas, correctness-evidence validator, whole-model baseline, ShardWorker research/ADR, and multi-site operations remain open.
+**Last Updated**: 2026-11-25
+**Sprint**: Ship Tier-1 Trusted-Circle `ShardWorker` execution transport (`/phase/shard-stage/1.0.0` + `ShardWorker` + Cluster UI) and execute soup-to-nuts physical qualification across Cloud Relay (sole static-IP relay), Ubuntu Desktop (5060ti 16GB, 32GB RAM), Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM), Mac M1 Max (32GB RAM), and Mac M5 Max (128GB RAM, cellular daily driver) using the self-configuring `lucidd` + cross-platform Tauri v2 desktop app (`.dmg` + `.deb`)
+**Status**: Phase Core, LUCID v0.1, and v0.1.1 remain shipped. On `feat/lucid-consumer-experience` (`b5bcee9`, 6/6 GitHub Actions CI green), LUCID v0.2 now ships: `v0.2.0-rc3` release bundles (macOS `.dmg`, Ubuntu x86_64/ARM64 `.deb`, CLI tarballs), `libp2p 0.57.1`/`wasmtime 36.0.23`/`hickory 0.26.3` (0 RustSec advisories), `scripts/setup-cloud-relay.sh` (unprivileged `lucid` service user), Ollama/LM-Studio/multi-folder hot-import + 1-click P2P pull UI, real-process `/api/lucid/*` boundary tests, fixed `fake_llama_server` `AddrInUse` flake (5/5 repeats green), `lucidd bench` whole-model baseline harness, and Tier-1 `ShardWorker` partition planner + chained stage-receipt verification + draft ADR ([261125 task record](tasks/2026-11/261125_shardworker-foundation-and-bench.md)). This is still not a v0.2 release: bringing up Cloud Relay + `bootstrap.phasebased.net` TXT record, physical two-network/NAT intended stream, real multi-GB pull/resume, real Apple Silicon MLX, Linux x86_64/ARM64 reruns on current source, public rendezvous quotas, correctness-evidence validator, physical `lucidd bench` baseline + `ShardWorker` ADR sign-off, and multi-site operations remain open.
 
 ---
 
@@ -246,9 +246,9 @@ The first "M8 complete" claim earlier in the day was premature — the user got 
 ## Blockers & Risks
 
 ### Current Blockers
-- Repeated backend startup: the full workspace passes, but stress repeats still intermittently fail while binding the fixture server. Resolve the race and repeat qualification; diagnostics and failed attempts are retained. Further investigation is at the AGENTS.md retry/time-budget gate.
-- Physical acceptance: install fingerprinted test actors/backends, arrange scoped native Phase ingress, verify the actual consumer-NAT topology and record the complete intended stream. The former M1 contributor is not currently reachable through its documented alias.
-- Correctness validation, whole-model control measurements, real MLX, Linux ARM64 and remaining operational qualification remain open as described by the authoritative release tracker.
+- Physical acceptance: run `scripts/setup-cloud-relay.sh` on Cloud Relay and update `bootstrap.phasebased.net` TXT record, then verify the actual consumer-NAT topology and record the complete intended stream across the active fleet.
+- Correctness validation, physical whole-model `lucidd bench` baseline + ShardWorker ADR approval, real MLX, Linux ARM64 and remaining operational qualification remain open as described by the authoritative release tracker.
+- *(Resolved 2026-11-25 at `b5bcee9`)*: Intermittent `fake_llama_server` `Address already in use` bind flake resolved via bounded bind retry; verified 5/5 consecutive `llama_worker` repeats pass.
 
 ### Risks
 - **First-token latency over WAN**: DHT-routed inference may have unacceptable TTFT. Mitigation: stream tokens, local-only fast path.
@@ -304,19 +304,18 @@ Substrate extraction. Seven publishable Phase library crates (Apache-2.0) + Plas
 
 ## Next Actions (Priority Order)
 
-1. Review and commit the current `feat/lucid-consumer-experience` working tree, then cut a prerelease candidate (e.g. `v0.2.0-rc1`) via `.github/workflows/release.yml` so every machine installs verified release archives with zero manual copying.
-2. Copy `.phase-fleet.env.example` to `.phase-fleet.local.env` (gitignored), run `scripts/fleet-install.sh --tag v0.2.0-rc1` (or `scripts/install-lucid.sh` per host), and collect **Stage 0** qualification evidence on **Mac M5 Max (128GB RAM)**, **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** (`PHASE_LINUX_X86_64_EVIDENCE`), and an **Ubuntu ARM64 VM** on Mac M5 Max (`PHASE_LINUX_AARCH64_EVIDENCE`).
-3. Run **Stages 1–3** of the [physical fleet soup-to-nuts plan](releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22): open scoped TCP `4001` and start `--mode infrastructure` on **Cloud Relay**, start CUDA `llama-cpp` contributor + invitation issuance on **Ubuntu Desktop (5060ti 16GB, 32GB RAM)** (behind NAT), and put **Mac M5 Max (128GB RAM)** on cellular hotspot to test `LUCID.app` enrollment, forced relay-only live streaming, verified receipt, and multi-GB `/api/pull` interrupt+resume (with **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** as Content Provider #2).
-4. Run **Stage 4** on **Mac M1 Max (32GB RAM)** (behind home NAT): execute real Apple Silicon MLX acceptance (`--worker mlx`) locally and remotely from Mac M5 Max via Cloud Relay, then run Ubuntu Desktop (CUDA) + Mac M1 Max (Metal) together for two-contributor failover and the whole-model independent-job baseline.
-5. Run **Stages 5–6**: complete failure/cancellation/policy/security injection drills, verify clean teardown and healthy standing `Cloud Relay (Caddy) → Tailscale → Ubuntu Desktop (Caddy)` web ingress, and archive sanitized evidence under `target/phase-validation/` plus a new task doc in `memory-bank/tasks/`.
-6. Provision a second independent static-IP cloud relay site for multi-site loss and DNS-rotation drills (`network-operations.md`), then specify/implement the bounded correctness-evidence validator seam before revisiting `ShardWorker`.
+1. Implement Tier-1 Trusted-Circle `ShardWorker` execution transport: workload-neutral `/phase/shard-stage/1.0.0` substream in `phase-net`, GGUF header layer-count reader, `ShardWorker` coordinator + stage executor with composite receipt verification & cancellation, `/api/lucid/cluster` + `lucidd cluster` CLI + Desktop Cluster Mode UI, and multi-peer libp2p integration tests.
+2. Cut `v0.2.0-rc4` via `.github/workflows/release.yml` once the `ShardWorker` transport & cluster UI pass CI so every machine installs verified `.dmg`/`.deb`/CLI release archives.
+3. Run `scripts/setup-cloud-relay.sh` on **Cloud Relay**, update the `bootstrap.phasebased.net` TXT record, and execute **Stages 1–3** of the [physical fleet soup-to-nuts plan](releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22) across **Ubuntu Desktop (5060ti 16GB, 32GB RAM)**, **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)**, **Mac M1 Max (32GB RAM)**, and **Mac M5 Max (128GB RAM)** (cellular hotspot).
+4. Run `lucidd bench` whole-model baseline on **Ubuntu Desktop (CUDA)** + **Mac M1 Max (Metal)**, review/approve [shardworker-adr.md](releases/lucid-v0.2/shardworker-adr.md), and execute real Apple Silicon MLX acceptance (`--worker mlx`).
+5. Complete failure/cancellation/policy/security drills, archive sanitized evidence under `target/phase-validation/`, and open a PR from `feat/lucid-consumer-experience` → `main`.
 
 ---
 
 ## Team Context
 
-**Role**: Solo developer (Rust + Swift + PHP).
+**Role**: Solo developer (Rust + TypeScript/Svelte + Swift + PHP).
 **Availability**: Part-time.
 **Timeline**: No hard deadlines; quality over speed.
 
-**This document is updated at milestone boundaries. Last review: 2026-11-22.**
+**This document is updated at milestone boundaries. Last review: 2026-11-25.**

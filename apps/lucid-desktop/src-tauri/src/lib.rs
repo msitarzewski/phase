@@ -253,6 +253,7 @@ struct SettingsPatch {
     manual_pause: Option<bool>,
     auto_pause_on_battery: Option<bool>,
     thermal_limit_c: Option<Option<f32>>,
+    cluster_enabled: Option<bool>,
     chat_app_url: Option<String>,
 }
 
@@ -435,6 +436,7 @@ async fn update_settings(
             "manual_pause": settings.manual_pause,
             "auto_pause_on_battery": settings.auto_pause_on_battery,
             "thermal_limit_c": settings.thermal_limit_c,
+            "cluster_enabled": settings.cluster_enabled,
         }),
         Duration::from_secs(10),
     )
@@ -503,6 +505,32 @@ async fn restart_daemon(
 ) -> Result<serde_json::Value, String> {
     ctrl.stop_daemon().await;
     build_overview(&app, &ctrl).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_cluster_status(
+    app: AppHandle,
+    ctrl: State<'_, Arc<AppController>>,
+) -> Result<serde_json::Value, String> {
+    ctrl.api_get(&app, "/api/lucid/cluster")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn preview_cluster_plan(
+    app: AppHandle,
+    ctrl: State<'_, Arc<AppController>>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    ctrl.api_post(
+        &app,
+        "/api/lucid/cluster/plan",
+        payload,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn resolve_state_dir() -> Result<PathBuf> {
@@ -778,6 +806,8 @@ pub fn run() {
             join_invite,
             open_chat,
             restart_daemon,
+            get_cluster_status,
+            preview_cluster_plan,
         ])
         .build(tauri::generate_context!())
         .expect("error while building LUCID desktop app");

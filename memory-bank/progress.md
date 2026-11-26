@@ -1,12 +1,25 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-11-22
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint + consumer macOS app & efficiency pass
-**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Local macOS ARM64 QA passes 492 Rust tests (2 ignored) and 11 Swift tests on `feat/lucid-consumer-experience`; soup-to-nuts physical qualification (Cloud Relay sole static-IP relay + behind-NAT Ubuntu Desktop, Ubuntu Laptop, Mac M1 Max + cellular Mac M5 Max consumer) is planned with installable release bundles and ready to run.
+**Last Updated**: 2026-11-25
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint + self-configuring `lucidd` & cross-platform Tauri v2 desktop app (`v0.2.0-rc3`) + `lucidd bench` & Tier-1 `ShardWorker` planner (`b5bcee9`)
+**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Local macOS ARM64 QA and all 6 GitHub Actions CI jobs (`rustfmt`, `clippy`, `cargo audit + cargo deny`, `test (workspace)`, `native macOS app`, `desktop app (Tauri v2)`) pass with 0 vulnerabilities on `feat/lucid-consumer-experience`; `v0.2.0-rc3` release bundles (`.dmg` + `.deb` + CLI tarballs) and `scripts/setup-cloud-relay.sh` are ready for physical fleet qualification.
 
 ---
 
 ## Major Deliverables
+
+### Self-configuring `lucidd`, Tauri v2 desktop app, `lucidd bench`, & Tier-1 `ShardWorker` foundation (2026-11-23 → 2026-11-25)
+
+- **Security dependency refresh (`v0.2.0-rc2`, `742b208`/`8521226`)**: Upgraded `libp2p 0.56 -> 0.57.1` & `libp2p-stream 0.4 -> 0.5.0-alpha` (eliminating `hickory-proto 0.25.2`), `wasmtime 36.0.20 -> 36.0.23`, `hickory-* -> 0.26.3`, `url -> 2.5.9`, and `rustix -> 1.1.6`. Cleared 17 newly published RustSec advisories; 0 vulnerabilities across root and Tauri `Cargo.lock`.
+- **Self-configuring `lucidd` + cross-platform Tauri v2 desktop app (`v0.2.0-rc3`, `640aa73`; [task record](tasks/2026-11/261123_apple-simple-lucid-desktop.md))**:
+  - Read-only machine capability probe (`node_config.rs`), SHA-256-pinned `ggml-org/llama.cpp b12651` runtime manager (`runtime_manager.rs`), permission-first `/api/lucid/*` control API (`confirm_permission: true`, loopback-only, bearer-token auth), zero-flag safe `NodeMode::Auto`, and CLI subcommands (`probe`, `models`, `peers`, `invite`, `join`).
+  - Sandboxed cross-platform **Tauri v2 + Svelte 5** desktop app (`apps/lucid-desktop/`, `#![deny(unsafe_code)]`, bearer token isolated from WebView, strict CSP, `lucid://` deep links, tray) shipping macOS `.dmg` (14.1 MiB) + Ubuntu x86_64/ARM64 `.deb` (15.0 / 14.5 MiB) on GitHub Releases.
+- **Cloud Relay bootstrap (`5950ced`/`ff20af3`)**: Added `scripts/setup-cloud-relay.sh` supporting invocation as `root` on fresh droplets by creating a locked-down unprivileged `lucid` user + hardened systemd unit (`User=lucid`), opening only `4001/tcp` in `ufw` without touching Caddy (`80/443`) or Tailscale.
+- **Ollama/multi-folder serving, P2P pull UI, HTTP boundary tests, `lucidd bench`, & `ShardWorker` foundation (`b5bcee9`; [task record](tasks/2026-11/261125_shardworker-foundation-and-bench.md))**:
+  - Added safe GGUF hot-import (`import_verified_gguf_file`) supporting Ollama blobs (`~/.ollama/models/blobs/sha256-*`), LM Studio nested directories, and custom approved folders (rejects symlinks, validates `GGUF` magic), plus 1-click `POST /api/lucid/pull` in `apps/lucid-desktop`.
+  - Added real-process `/api/lucid/*` sandbox/auth/consent tests (`crates/lucidd/tests/http_api.rs`) and resolved the intermittent `fake_llama_server` `AddrInUse` port-teardown flake (5/5 consecutive `llama_worker` repeats pass).
+  - Added `lucidd bench` (`crates/lucidd/src/bench.rs`) for the whole-model independent-job baseline and Tier-1 Trusted-Circle `ShardWorker` planner + coordinator-signed `ShardPartitionPlan` + chained `ShardStageReceipt` verifier (`crates/lucidd/src/shard_plan.rs`, `UntrustedSpotChecked` fail-closed) + full 7-question ADR draft ([shardworker-adr.md](releases/lucid-v0.2/shardworker-adr.md)).
+  - Verified 6/6 GitHub Actions CI green (`run 45735251912`), local `cargo test --workspace` green, and local `~/.local/bin/lucidd` + `~/Applications/LUCID.app` rebuilt and verified.
 
 ### Workspace/runtime efficiency & physical qualification plan (2026-11-22)
 

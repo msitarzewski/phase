@@ -69,6 +69,9 @@ pub struct NodeConfig {
     pub llama_server_sha256: Option<String>,
     /// Explicit opt-in to serve verified weight chunks over P2P content plane.
     pub serve_model_content: bool,
+    /// Explicit opt-in for Tier-1 Trusted-Circle pipeline sharding (`ShardWorker`).
+    /// Always `false` on a brand-new machine until the operator consents.
+    pub cluster_enabled: bool,
     /// Optional custom relay/bootstrap multiaddrs (empty = use default
     /// `bootstrap.phasebased.net` DNS TXT discovery).
     pub bootstrap_peers: Vec<String>,
@@ -87,6 +90,7 @@ impl Default for NodeConfig {
             llama_server_binary: None,
             llama_server_sha256: None,
             serve_model_content: false,
+            cluster_enabled: false,
             bootstrap_peers: Vec::new(),
         }
     }

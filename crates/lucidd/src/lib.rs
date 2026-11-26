@@ -29,6 +29,7 @@ pub mod reputation;
 pub mod router;
 pub mod runtime_manager;
 pub mod shard_plan;
+pub mod shard_worker;
 pub mod worker_llama;
 pub mod worker_mlx;
 

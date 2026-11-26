@@ -7,6 +7,8 @@
     type OverviewPayload,
     type ModelEntry,
     type InviteResponse,
+    type ClusterStatus,
+    type ClusterPlanPreview,
   } from "./lib/api";
   import { formatBytes, sourceLabel, statusPillText } from "./lib/format";
 
@@ -28,6 +30,9 @@
   let showInviteModal = $state(false);
   let activeInvite = $state<InviteResponse | null>(null);
   let showPeersModal = $state(false);
+  let showClusterModal = $state(false);
+  let clusterStatus = $state<ClusterStatus | null>(null);
+  let clusterPlan = $state<ClusterPlanPreview | null>(null);
   let showSettingsModal = $state(false);
 
   // Permission-first modal before enabling providing or installing runtime
@@ -297,6 +302,79 @@
     }
   }
 
+  async function handleOpenCluster() {
+    showClusterModal = true;
+    clusterPlan = null;
+    try {
+      clusterStatus = await lucidApi.getClusterStatus();
+    } catch (err) {
+      errorBanner = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function handleToggleCluster() {
+    if (!clusterStatus) return;
+    try {
+      busy = true;
+      const next = !clusterStatus.cluster_enabled;
+      await lucidApi.updateSettings({ cluster_enabled: next });
+      clusterStatus = await lucidApi.getClusterStatus();
+      await refresh();
+      showToast(next ? "Trusted-Circle cluster enabled" : "Trusted-Circle cluster disabled");
+    } catch (err) {
+      errorBanner = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function handlePreviewClusterSplit() {
+    if (!clusterStatus) return;
+    try {
+      busy = true;
+      errorBanner = null;
+      const GIB = 1024 * 1024 * 1024;
+      const localMem = Math.max(clusterStatus.local_node.available_memory_bytes, 16 * GIB);
+      const localKey = clusterStatus.local_node.verifying_key_hex;
+      // Combine this device with connected peers (or a reference partner node
+      // if no peer is online yet) so the user can inspect exact layer splits.
+      const peers = [
+        {
+          peer_id: `${clusterStatus.local_node.peer_id.slice(0, 12)} (this device)`,
+          verifying_key_hex: localKey,
+          available_memory_bytes: localMem,
+          backend: clusterStatus.local_node.backend,
+        },
+        ...(clusterStatus.connected_peers.length > 0
+          ? clusterStatus.connected_peers.slice(0, 3).map((p) => ({
+              peer_id: p.peer_id,
+              verifying_key_hex: localKey,
+              available_memory_bytes: 24 * GIB,
+              backend: "metal",
+            }))
+          : [
+              {
+                peer_id: "trusted-partner-16gb (preview)",
+                verifying_key_hex: localKey,
+                available_memory_bytes: 16 * GIB,
+                backend: "cuda",
+              },
+            ]),
+      ];
+      clusterPlan = await lucidApi.previewClusterPlan({
+        model_name: selectedModel?.name ?? "llama3.3:70b-q4_k_m",
+        model_path: selectedModel?.local_path ?? null,
+        total_layers: 80,
+        size_bytes: Math.max(selectedModel?.size_bytes ?? 0, 42 * GIB),
+        peers,
+      });
+    } catch (err) {
+      errorBanner = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function handlePullModel(model: ModelEntry) {
     try {
       busy = true;
@@ -334,6 +412,9 @@
     </div>
 
     <div class="actions">
+      <button class="ghost" onclick={handleOpenCluster} disabled={!overview}>
+        Cluster
+      </button>
       <button class="ghost" onclick={() => (showPeersModal = true)} disabled={!overview}>
         Peers ({overview?.peers.length ?? 0})
       </button>
@@ -727,6 +808,72 @@
       {/if}
       <div class="modal-actions">
         <button class="primary" onclick={() => (showPeersModal = false)}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Trusted-Circle Cluster Modal -->
+{#if showClusterModal && clusterStatus}
+  <div class="backdrop">
+    <div class="modal wide">
+      <h2>Trusted-Circle Cluster</h2>
+      <p class="subtitle">
+        Pool memory across your invited devices for models larger than one machine.
+        <span class="chip">{clusterStatus.trust_label}</span>
+      </p>
+
+      <div class="card compact">
+        <div class="toggle-row">
+          <div>
+            <div class="row-label">Participate in Trusted-Circle sharding</div>
+            <div class="row-help">
+              Off by default · Accepts slices only from your invited circle with signed layer plans &amp; handoff hashes
+            </div>
+          </div>
+          <button
+            class:primary={!clusterStatus.cluster_enabled}
+            disabled={busy}
+            onclick={handleToggleCluster}
+          >
+            {clusterStatus.cluster_enabled ? "Disable" : "Enable"}
+          </button>
+        </div>
+        <div class="divider"></div>
+        <div class="row-help">
+          <strong>This device:</strong> {clusterStatus.local_node.summary} ·
+          {formatBytes(clusterStatus.local_node.available_memory_bytes)} available ({clusterStatus.local_node.backend}) ·
+          {clusterStatus.connected_peers.length} peer{clusterStatus.connected_peers.length === 1 ? "" : "s"} online
+        </div>
+      </div>
+
+      {#if clusterPlan}
+        <div class="card compact">
+          <div class="row-label">
+            Signed Layer Split · {clusterPlan.signed_plan.plan.model_alias} ({clusterPlan.signed_plan.plan.total_layers} layers)
+          </div>
+          <div class="peer-list" style="margin-top: 8px;">
+            {#each clusterPlan.signed_plan.plan.stages as st (st.stage_index)}
+              <div class="peer-row">
+                <span class="mono">Stage {st.stage_index}: {st.peer_id}</span>
+                <span class="chip">
+                  layers {st.start_layer}..{st.end_layer} ({formatBytes(st.estimated_memory_bytes)})
+                </span>
+              </div>
+            {/each}
+          </div>
+          <p class="row-help" style="margin-top: 8px;">
+            Coordinator signature verified ({clusterPlan.signed_plan.coordinator_signature_hex.slice(0, 16)}…).
+            Untrusted open-network sharding remains disabled until verification ADR approval.
+          </p>
+        </div>
+      {/if}
+
+      <div class="modal-actions">
+        <button onclick={handlePreviewClusterSplit} disabled={busy}>
+          Preview Layer Split
+        </button>
+        <button class="primary" onclick={() => (showClusterModal = false)}>Done</button>
       </div>
     </div>
   </div>

@@ -1,6 +1,6 @@
 # ADR Draft: ShardWorker Architecture & Partial-Compute Verification
 
-**Status:** Proposed — Foundation types, planner, and composite stage-receipt verification implemented in `crates/lucidd/src/shard_plan.rs`; execution transport awaits whole-model baseline (`lucidd bench`) and human ADR sign-off
+**Status:** Proposed — Foundation planner, pure-Rust GGUF header scanner (`crates/lucidd/src/shard_plan.rs`), workload-neutral `/phase/shard-stage/1.0.0` libp2p transport (`crates/phase-net`), Tier-1 Trusted-Circle `ShardWorker` coordinator/handler (`crates/lucidd/src/shard_worker.rs`), 3-node libp2p integration tests, `/api/lucid/cluster` + `lucidd cluster` CLI + Desktop Cluster modal implemented; real `llama.cpp` RPC stage backend awaits physical `lucidd bench` baseline and human ADR sign-off
 **Date:** 2026-11-25
 **Milestone:** [ShardWorker](./shardworker.md)
 **Depends on:** [Reputation and Redundant Verification](./reputation-and-redundant-verification.md), whole-model baseline (`crates/lucidd/src/bench.rs`)

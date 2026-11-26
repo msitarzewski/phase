@@ -15,6 +15,9 @@
 //!   tolerance ADR pass acceptance.
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -558,6 +561,247 @@ fn parse_signature_hex(raw: &str) -> Result<Signature> {
     Ok(Signature::from_bytes(&arr))
 }
 
+// ---------------------------------------------------------------------------
+// Bounded pure-Rust GGUF header metadata reader for accurate layer partitioning
+// ---------------------------------------------------------------------------
+
+const MAX_GGUF_METADATA_KV: u64 = 4_096;
+const MAX_GGUF_KEY_BYTES: u64 = 512;
+const MAX_GGUF_STRING_BYTES: u64 = 64 * 1024;
+const MAX_GGUF_ARRAY_SKIP_ITEMS: u64 = 1_048_576;
+
+/// Summary extracted strictly from a verified local GGUF file header without
+/// spawning external processes or reading weight tensors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GgufShardMetadata {
+    pub architecture: String,
+    pub block_count: u32,
+    pub embedding_length: Option<u32>,
+    pub file_size_bytes: u64,
+}
+
+/// Inspect a real local GGUF file header (v2/v3) to extract its exact
+/// architecture and transformer layer count (`<arch>.block_count`), then
+/// derive a conservative [`ModelShardSpec`] for pipeline planning.
+pub fn inspect_gguf_shard_metadata(path: &Path) -> Result<GgufShardMetadata> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect GGUF file {}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        bail!("GGUF path must be a regular non-symlink file");
+    }
+    let file_size_bytes = meta.len();
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+
+    let mut magic = [0_u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .context("failed to read GGUF magic")?;
+    if &magic != b"GGUF" {
+        bail!("file is not a valid GGUF archive");
+    }
+    let version = read_u32_le(&mut reader)?;
+    if version != 2 && version != 3 {
+        bail!("unsupported GGUF version {version} (expected 2 or 3)");
+    }
+    let _tensor_count = read_u64_le(&mut reader)?;
+    let kv_count = read_u64_le(&mut reader)?;
+    if kv_count > MAX_GGUF_METADATA_KV {
+        bail!("GGUF metadata count {kv_count} exceeds safety cap {MAX_GGUF_METADATA_KV}");
+    }
+
+    let mut architecture: Option<String> = None;
+    let mut block_counts: Vec<(String, u32)> = Vec::new();
+    let mut embedding_lengths: Vec<(String, u32)> = Vec::new();
+
+    for _ in 0..kv_count {
+        let key = read_gguf_string(&mut reader, MAX_GGUF_KEY_BYTES)?;
+        let value_type = read_u32_le(&mut reader)?;
+        match value_type {
+            8 if key == "general.architecture" => {
+                architecture = Some(read_gguf_string(&mut reader, 128)?);
+            }
+            4 if key.ends_with(".block_count") => {
+                block_counts.push((key, read_u32_le(&mut reader)?));
+            }
+            5 if key.ends_with(".block_count") => {
+                let v = read_i32_le(&mut reader)?;
+                if v > 0 {
+                    block_counts.push((key, v as u32));
+                }
+            }
+            10 if key.ends_with(".block_count") => {
+                let v = read_u64_le(&mut reader)?;
+                if let Ok(v32) = u32::try_from(v) {
+                    block_counts.push((key, v32));
+                }
+            }
+            4 if key.ends_with(".embedding_length") => {
+                embedding_lengths.push((key, read_u32_le(&mut reader)?));
+            }
+            10 if key.ends_with(".embedding_length") => {
+                let v = read_u64_le(&mut reader)?;
+                if let Ok(v32) = u32::try_from(v) {
+                    embedding_lengths.push((key, v32));
+                }
+            }
+            _ => skip_gguf_value(&mut reader, value_type, 0)?,
+        }
+
+        // Stop scanning immediately once we have architecture + block_count +
+        // embedding_length so huge tokenizer token arrays (150k+ strings) are
+        // never traversed.
+        if let Some(arch) = architecture.as_deref() {
+            let have_blocks = block_counts
+                .iter()
+                .any(|(k, _)| k.strip_suffix(".block_count") == Some(arch));
+            let have_embed = embedding_lengths
+                .iter()
+                .any(|(k, _)| k.strip_suffix(".embedding_length") == Some(arch));
+            if have_blocks && have_embed {
+                break;
+            }
+        }
+    }
+
+    let arch = architecture.unwrap_or_else(|| "llama".to_string());
+    let expected_block_key = format!("{arch}.block_count");
+    let block_count = block_counts
+        .iter()
+        .find(|(k, _)| k == &expected_block_key)
+        .or_else(|| block_counts.first())
+        .map(|(_, v)| *v)
+        .ok_or_else(|| anyhow::anyhow!("GGUF header missing {expected_block_key}"))?;
+    if block_count < 2 {
+        bail!("GGUF reports {block_count} layers; at least 2 layers required for sharding");
+    }
+
+    let expected_embed_key = format!("{arch}.embedding_length");
+    let embedding_length = embedding_lengths
+        .iter()
+        .find(|(k, _)| k == &expected_embed_key)
+        .or_else(|| embedding_lengths.first())
+        .map(|(_, v)| *v);
+
+    Ok(GgufShardMetadata {
+        architecture: arch,
+        block_count,
+        embedding_length,
+        file_size_bytes,
+    })
+}
+
+/// Convert real GGUF header metadata into a conservative [`ModelShardSpec`]
+/// allocating ~6% each for token embeddings & LM head (plus 15% KV-cache /
+/// runtime headroom) and dividing the remainder evenly across transformer blocks.
+pub fn shard_spec_from_gguf(
+    model_cid_hex: String,
+    model_alias: String,
+    meta: &GgufShardMetadata,
+) -> ModelShardSpec {
+    // Add 15% KV-cache + scratchpad headroom over raw weight file size.
+    let working_bytes = meta
+        .file_size_bytes
+        .saturating_add(meta.file_size_bytes / 7);
+    let embedding_bytes = (working_bytes / 16).max(64 * 1024 * 1024);
+    let lm_head_bytes = (working_bytes / 16).max(64 * 1024 * 1024);
+    let layers_budget = working_bytes
+        .saturating_sub(embedding_bytes)
+        .saturating_sub(lm_head_bytes)
+        .max(u64::from(meta.block_count));
+    let per_layer_bytes = layers_budget.div_ceil(u64::from(meta.block_count)).max(1);
+
+    ModelShardSpec {
+        model_cid_hex,
+        model_alias,
+        total_layers: meta.block_count,
+        per_layer_bytes,
+        embedding_bytes,
+        lm_head_bytes,
+    }
+}
+
+fn read_u32_le<R: Read>(r: &mut R) -> Result<u32> {
+    let mut b = [0_u8; 4];
+    r.read_exact(&mut b).context("unexpected EOF reading u32")?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_i32_le<R: Read>(r: &mut R) -> Result<i32> {
+    let mut b = [0_u8; 4];
+    r.read_exact(&mut b).context("unexpected EOF reading i32")?;
+    Ok(i32::from_le_bytes(b))
+}
+
+fn read_u64_le<R: Read>(r: &mut R) -> Result<u64> {
+    let mut b = [0_u8; 8];
+    r.read_exact(&mut b).context("unexpected EOF reading u64")?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_gguf_string<R: Read>(r: &mut R, max_len: u64) -> Result<String> {
+    let len = read_u64_le(r)?;
+    if len > max_len {
+        bail!("GGUF string length {len} exceeds safety cap {max_len}");
+    }
+    let mut buf = vec![0_u8; len as usize];
+    r.read_exact(&mut buf)
+        .context("unexpected EOF reading GGUF string")?;
+    String::from_utf8(buf).context("GGUF string is not valid UTF-8")
+}
+
+fn gguf_scalar_byte_size(value_type: u32) -> Option<u64> {
+    match value_type {
+        0 | 1 | 7 => Some(1), // UINT8, INT8, BOOL
+        2 | 3 => Some(2),     // UINT16, INT16
+        4..=6 => Some(4),     // UINT32, INT32, FLOAT32
+        10..=12 => Some(8),   // UINT64, INT64, FLOAT64
+        _ => None,
+    }
+}
+
+fn skip_gguf_value<R: Read + Seek>(r: &mut BufReader<R>, value_type: u32, depth: u8) -> Result<()> {
+    if depth > 4 {
+        bail!("GGUF nested array depth exceeded safety limit");
+    }
+    if let Some(sz) = gguf_scalar_byte_size(value_type) {
+        r.seek_relative(sz as i64)
+            .context("failed skipping GGUF scalar")?;
+        return Ok(());
+    }
+    match value_type {
+        8 => {
+            let len = read_u64_le(r)?;
+            if len > MAX_GGUF_STRING_BYTES {
+                bail!("GGUF string skip length {len} exceeds safety cap");
+            }
+            r.seek_relative(len as i64)
+                .context("failed skipping GGUF string")?;
+            Ok(())
+        }
+        9 => {
+            let elem_type = read_u32_le(r)?;
+            let count = read_u64_le(r)?;
+            if count > MAX_GGUF_ARRAY_SKIP_ITEMS {
+                bail!("GGUF array count {count} exceeds safety cap");
+            }
+            if let Some(sz) = gguf_scalar_byte_size(elem_type) {
+                let total = count
+                    .checked_mul(sz)
+                    .ok_or_else(|| anyhow::anyhow!("GGUF array byte size overflow"))?;
+                r.seek_relative(i64::try_from(total).context("GGUF array skip overflow")?)
+                    .context("failed skipping GGUF scalar array")?;
+            } else {
+                for _ in 0..count {
+                    skip_gguf_value(r, elem_type, depth + 1)?;
+                }
+            }
+            Ok(())
+        }
+        other => bail!("unsupported GGUF metadata value type {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +938,72 @@ mod tests {
             60_000,
         )
         .is_err());
+    }
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn inspects_valid_gguf_v3_header_and_rejects_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qwen-72b.gguf");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes()); // version 3
+        bytes.extend_from_slice(&128_u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&4_u64.to_le_bytes()); // kv_count
+
+        // 1. general.architecture = "qwen2" (type 8 = string)
+        write_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        write_gguf_string(&mut bytes, "qwen2");
+
+        // 2. general.tags = ["a", "b"] (type 9 = array of string=8) -> exercises skip_gguf_value
+        write_gguf_string(&mut bytes, "general.tags");
+        bytes.extend_from_slice(&9_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        write_gguf_string(&mut bytes, "instruct");
+        write_gguf_string(&mut bytes, "chat");
+
+        // 3. qwen2.block_count = 80 (type 4 = u32)
+        write_gguf_string(&mut bytes, "qwen2.block_count");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&80_u32.to_le_bytes());
+
+        // 4. qwen2.embedding_length = 8192 (type 4 = u32)
+        write_gguf_string(&mut bytes, "qwen2.embedding_length");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&8192_u32.to_le_bytes());
+
+        std::fs::write(&path, &bytes).unwrap();
+
+        let meta = inspect_gguf_shard_metadata(&path).expect("valid GGUF header should parse");
+        assert_eq!(meta.architecture, "qwen2");
+        assert_eq!(meta.block_count, 80);
+        assert_eq!(meta.embedding_length, Some(8192));
+        assert_eq!(meta.file_size_bytes, bytes.len() as u64);
+
+        let spec = shard_spec_from_gguf("b".repeat(64), "qwen2.5:72b".to_string(), &meta);
+        assert_eq!(spec.total_layers, 80);
+        assert!(spec.per_layer_bytes > 0);
+
+        // Non-GGUF file fails closed.
+        let bad_path = dir.path().join("not-gguf.bin");
+        std::fs::write(&bad_path, b"NOT_GGUF_DATA").unwrap();
+        assert!(inspect_gguf_shard_metadata(&bad_path).is_err());
+
+        // Excessive KV count fails closed before allocating.
+        let evil_path = dir.path().join("evil.gguf");
+        let mut evil = Vec::new();
+        evil.extend_from_slice(b"GGUF");
+        evil.extend_from_slice(&3_u32.to_le_bytes());
+        evil.extend_from_slice(&0_u64.to_le_bytes());
+        evil.extend_from_slice(&(MAX_GGUF_METADATA_KV + 1).to_le_bytes());
+        std::fs::write(&evil_path, &evil).unwrap();
+        assert!(inspect_gguf_shard_metadata(&evil_path).is_err());
     }
 }

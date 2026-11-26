@@ -2,6 +2,11 @@
 
 ## Tasks Completed
 
+### 2026-11-25 (Part 2): Tier-1 `ShardWorker` libp2p Transport (`/phase/shard-stage/1.0.0`), GGUF Reader, & Cluster UI
+- Added workload-neutral `/phase/shard-stage/1.0.0` opaque substream transport in `phase-net`, bounded pure-Rust GGUF v2/v3 layer-count scanner (`inspect_gguf_shard_metadata`), and Tier-1 Trusted-Circle `ShardWorker` coordinator + default-deny inbound stage handler (`crates/lucidd/src/shard_worker.rs`).
+- Added `cluster_enabled` opt-in (`node.toml`), `/api/lucid/cluster` + `/api/lucid/cluster/plan`, `lucidd cluster {status,inspect,plan}`, Desktop **Trusted-Circle Cluster** modal, and real 3-node libp2p integration test (`crates/lucidd/tests/shard_worker.rs`).
+- See: [261125_shardworker-transport-and-cluster-ui.md](./261125_shardworker-transport-and-cluster-ui.md).
+
 ### 2026-11-25: Ollama/Multi-Folder Serving, Control API Tests, `lucidd bench`, & `ShardWorker` Foundation
 - Wired Ollama blob (`sha256-*`), LM Studio, and multi-folder GGUF verification/serving (`import_verified_gguf_file`, `approved_model_sources`, hot-import on `POST /api/lucid/provide`) plus 1-click `POST /api/lucid/pull` in `apps/lucid-desktop`.
 - Added real-process HTTP contract tests for `/api/lucid/*` (`401`/`428`/folder sandbox/hot-import/settings) and fixed the `fake_llama_server` `AddrInUse` teardown flake (5/5 repeats green).

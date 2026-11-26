@@ -426,6 +426,11 @@ pub fn router(state: AppState) -> Router {
             "/api/lucid/invitations",
             post(handle_create_invitation).layer(DefaultBodyLimit::max(1024)),
         )
+        .route("/api/lucid/cluster", get(handle_control_cluster))
+        .route(
+            "/api/lucid/cluster/plan",
+            post(handle_control_cluster_plan).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         // Health check for liveness probes.
         .route("/", get(|| async { "lucidd ready: see /api/version" }))
         // Log unsupported routes while preserving an honest 404 contract.
@@ -634,6 +639,7 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
             "enrollment": state.consumer.enrollment_status(),
             "onboarding_completed": node_cfg.onboarding_completed,
             "providing_enabled": node_cfg.providing_enabled,
+            "cluster_enabled": node_cfg.cluster_enabled,
             "providing_models": node_cfg.approved_provide_models,
             "paused_reason": paused_reason,
             "policy": {
@@ -1168,6 +1174,8 @@ struct SettingsUpdateRequest {
     thermal_limit_c: Option<Option<f32>>,
     #[serde(default)]
     serve_model_content: Option<bool>,
+    #[serde(default)]
+    cluster_enabled: Option<bool>,
 }
 
 async fn handle_control_settings(
@@ -1193,6 +1201,9 @@ async fn handle_control_settings(
         }
         if let Some(serve_content) = req.serve_model_content {
             cfg.serve_model_content = serve_content;
+        }
+        if let Some(cluster) = req.cluster_enabled {
+            cfg.cluster_enabled = cluster;
         }
         Ok(())
     }) {
@@ -1230,6 +1241,7 @@ async fn handle_control_settings(
         serde_json::json!({
             "onboarding_completed": node_cfg.onboarding_completed,
             "serve_model_content": node_cfg.serve_model_content,
+            "cluster_enabled": node_cfg.cluster_enabled,
             "policy": {
                 "manual_pause": pol_cfg.manual_pause,
                 "auto_pause_on_battery": pol_cfg.auto_pause_on_battery,
@@ -1249,6 +1261,207 @@ async fn handle_control_runtime(State(state): State<AppState>, headers: HeaderMa
         serde_json::json!({
             "hardware": probe.hardware,
             "runtime": probe.runtime,
+        }),
+    )
+}
+
+async fn handle_control_cluster(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let node_cfg = state.node_config.snapshot();
+    let probe = current_or_fresh_probe(&state).await;
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.discovery.reachability_snapshot(),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok());
+
+    let connected_peers: Vec<serde_json::Value> = snapshot
+        .map(|snap| {
+            snap.connections
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "peer_id": c.peer_id.to_string(),
+                        "path": format!("{:?}", c.path).to_ascii_lowercase(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let discovered_clone = probe.discovered_models.clone();
+    let inspectable_models: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        discovered_clone
+            .into_iter()
+            .map(|m| {
+                let gguf =
+                    crate::shard_plan::inspect_gguf_shard_metadata(std::path::Path::new(&m.path))
+                        .ok();
+                serde_json::json!({
+                    "name": m.name,
+                    "path": m.path,
+                    "size_bytes": m.size_bytes,
+                    "source": m.source,
+                    "fits_local": m.fits_hardware,
+                    "architecture": gguf.as_ref().map(|g| g.architecture.clone()),
+                    "total_layers": gguf.as_ref().map(|g| g.block_count),
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    let local_memory = probe
+        .hardware
+        .gpu_vram_bytes
+        .unwrap_or(probe.hardware.recommended_max_model_bytes);
+
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "cluster_enabled": node_cfg.cluster_enabled,
+            "trust_tier": "trusted-circle",
+            "trust_label": crate::shard_plan::ShardTrustTier::TrustedCircle.trust_label(),
+            "untrusted_sharding_allowed": false,
+            "local_node": {
+                "peer_id": state.discovery.local_peer_id().to_string(),
+                "verifying_key_hex": hex::encode(state.client_identity.peer_id_bytes()),
+                "available_memory_bytes": local_memory,
+                "backend": probe.hardware.gpu_backend,
+                "summary": probe.hardware.summary,
+            },
+            "connected_peers": connected_peers,
+            "models": inspectable_models,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterPlanRequest {
+    model_name: String,
+    #[serde(default)]
+    model_path: Option<String>,
+    #[serde(default)]
+    model_cid_hex: Option<String>,
+    #[serde(default)]
+    total_layers: Option<u32>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    trust_tier: Option<crate::shard_plan::ShardTrustTier>,
+    peers: Vec<crate::shard_plan::PeerShardCapacity>,
+}
+
+async fn handle_control_cluster_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ClusterPlanRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let tier = req
+        .trust_tier
+        .unwrap_or(crate::shard_plan::ShardTrustTier::TrustedCircle);
+    if tier != crate::shard_plan::ShardTrustTier::TrustedCircle {
+        return control_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "Untrusted sharded execution is disabled pending partial-compute verification ADR approval."
+            }),
+        );
+    }
+
+    let alias = req.model_name.trim();
+    if alias.is_empty() || alias.len() > 160 {
+        return control_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "Invalid model_name."}),
+        );
+    }
+
+    let cid_hex = req
+        .model_cid_hex
+        .clone()
+        .unwrap_or_else(|| crate::registry::ModelCid::development_name_hash(alias).to_hex());
+
+    // Prefer exact GGUF header metadata when an approved local model path is provided.
+    let spec = if let Some(path_raw) = req.model_path.as_deref() {
+        let probe = current_or_fresh_probe(&state).await;
+        let allowed = probe
+            .discovered_models
+            .iter()
+            .any(|m| m.path == path_raw.trim());
+        if !allowed {
+            return control_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"error": "model_path must match a read-only discovered local model."}),
+            );
+        }
+        match crate::shard_plan::inspect_gguf_shard_metadata(std::path::Path::new(path_raw.trim()))
+        {
+            Ok(meta) => crate::shard_plan::shard_spec_from_gguf(cid_hex, alias.to_string(), &meta),
+            Err(err) => {
+                return control_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": format!("Could not read GGUF header: {err}")}),
+                );
+            }
+        }
+    } else {
+        let total_layers = req.total_layers.unwrap_or(80);
+        let size_bytes = req.size_bytes.unwrap_or(42 * 1024 * 1024 * 1024);
+        let synthetic_meta = crate::shard_plan::GgufShardMetadata {
+            architecture: "llama".to_string(),
+            block_count: total_layers,
+            embedding_length: None,
+            file_size_bytes: size_bytes,
+        };
+        crate::shard_plan::shard_spec_from_gguf(cid_hex, alias.to_string(), &synthetic_meta)
+    };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+
+    let signed = match crate::shard_plan::plan_pipeline_shards(
+        &state.client_identity,
+        &spec,
+        &req.peers,
+        tier,
+        now_ms,
+        30 * 60 * 1000,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return control_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": err.to_string()}),
+            );
+        }
+    };
+    if let Err(err) = crate::shard_plan::verify_shard_plan(&signed, now_ms) {
+        return control_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": format!("Plan self-verification failed: {err}")}),
+        );
+    }
+
+    control_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "verified": true,
+            "required_memory_bytes": spec.total_required_bytes(),
+            "signed_plan": signed,
         }),
     )
 }

@@ -119,6 +119,60 @@ export interface InviteResponse {
   grant_expires_at: number;
 }
 
+export interface ClusterNodeInfo {
+  peer_id: string;
+  verifying_key_hex: string;
+  available_memory_bytes: number;
+  backend: string;
+  summary: string;
+}
+
+export interface ClusterModelInfo {
+  name: string;
+  path: string;
+  size_bytes: number;
+  source: string;
+  fits_local: boolean;
+  architecture: string | null;
+  total_layers: number | null;
+}
+
+export interface ClusterStatus {
+  cluster_enabled: boolean;
+  trust_tier: string;
+  trust_label: string;
+  untrusted_sharding_allowed: boolean;
+  local_node: ClusterNodeInfo;
+  connected_peers: PeerEntry[];
+  models: ClusterModelInfo[];
+}
+
+export interface ShardStageAssignment {
+  stage_index: number;
+  peer_id: string;
+  verifying_key_hex: string;
+  start_layer: number;
+  end_layer: number;
+  includes_embedding: boolean;
+  includes_lm_head: boolean;
+  estimated_memory_bytes: number;
+}
+
+export interface ClusterPlanPreview {
+  verified: boolean;
+  required_memory_bytes: number;
+  signed_plan: {
+    plan: {
+      plan_id: string;
+      model_alias: string;
+      total_layers: number;
+      trust_label: string;
+      stages: ShardStageAssignment[];
+    };
+    coordinator_signature_hex: string;
+  };
+}
+
 export const lucidApi = {
   getOverview: () => invoke<OverviewPayload>("get_overview"),
   refreshProbe: () => invoke<SystemProbe>("refresh_probe"),
@@ -153,10 +207,24 @@ export const lucidApi = {
     manual_pause?: boolean;
     auto_pause_on_battery?: boolean;
     thermal_limit_c?: number | null;
+    cluster_enabled?: boolean;
     chat_app_url?: string;
   }) => invoke<DaemonStatus>("update_settings", { settings }),
   createInvite: (ttlSeconds = 1800) => invoke<InviteResponse>("create_invite", { ttlSeconds }),
   joinInvite: (invitation: string) => invoke<EnrollmentStatus>("join_invite", { invitation }),
   openChat: (modelId: string) => invoke<void>("open_chat", { modelId }),
   restartDaemon: () => invoke<OverviewPayload>("restart_daemon"),
+  getClusterStatus: () => invoke<ClusterStatus>("get_cluster_status"),
+  previewClusterPlan: (payload: {
+    model_name: string;
+    model_path?: string | null;
+    total_layers?: number;
+    size_bytes?: number;
+    peers: Array<{
+      peer_id: string;
+      verifying_key_hex: string;
+      available_memory_bytes: number;
+      backend: string;
+    }>;
+  }) => invoke<ClusterPlanPreview>("preview_cluster_plan", { payload }),
 };

@@ -52,10 +52,12 @@ use crate::protocol::{
     BlobStreamFrame, BlobStreamFrameKind, BlobStreamRequest, BlobStreamValidator, JobOffer,
     JobRelayRequest, JobRelayResponse, JobRelayStreamControl, JobRelayStreamControlKind,
     JobRelayStreamFrame, JobRelayStreamFrameKind, JobRelayStreamOpen, JobRelayStreamValidator,
-    JobResponse, RejectionReason, BLOB_STREAM_MAX_CHUNK_BYTES, BLOB_STREAM_MAX_METADATA_BYTES,
-    BLOB_STREAM_PROTOCOL, JOB_RELAY_STREAM_DEFAULT_IDLE_TIMEOUT_MS,
-    JOB_RELAY_STREAM_MAX_EVENT_BYTES, JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_PROTOCOL,
-    JOB_RELAY_STREAM_SCHEMA_VERSION,
+    JobResponse, RejectionReason, ShardStageRequest, ShardStageResponse, ShardStageResponseKind,
+    BLOB_STREAM_MAX_CHUNK_BYTES, BLOB_STREAM_MAX_METADATA_BYTES, BLOB_STREAM_PROTOCOL,
+    JOB_RELAY_STREAM_DEFAULT_IDLE_TIMEOUT_MS, JOB_RELAY_STREAM_MAX_EVENT_BYTES,
+    JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_PROTOCOL, JOB_RELAY_STREAM_SCHEMA_VERSION,
+    SHARD_STAGE_MAX_PAYLOAD_BYTES, SHARD_STAGE_MAX_PLAN_BYTES, SHARD_STAGE_MAX_RECEIPT_BYTES,
+    SHARD_STAGE_PROTOCOL, SHARD_STAGE_SCHEMA_VERSION,
 };
 
 /// Wire protocol identifier for the JobOffer request/response exchange.
@@ -136,6 +138,17 @@ pub type BlobStreamHandler = Arc<
             BlobStreamRequest,
             mpsc::Sender<BlobStreamFrame>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Workload-neutral pipeline-stage execution callback. `phase-net` validates
+/// frame bounds and delivers the authenticated libp2p `PeerId` alongside the
+/// opaque `ShardStageRequest`; the workload layer enforces authorization,
+/// partition-plan verification, execution, and stage-receipt signing.
+pub type ShardStageHandler = Arc<
+    dyn Fn(PeerId, ShardStageRequest) -> Pin<Box<dyn Future<Output = ShardStageResponse> + Send>>
         + Send
         + Sync
         + 'static,
@@ -819,6 +832,7 @@ pub struct Discovery {
     job_relay_stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
     job_relay_stream_handler: Arc<RwLock<Option<JobRelayStreamHandler>>>,
     blob_stream_handler: Arc<RwLock<Option<BlobStreamHandler>>>,
+    shard_stage_handler: Arc<RwLock<Option<ShardStageHandler>>>,
     /// Background driver task. `run()` takes this to await shutdown; if the
     /// daemon never calls `run()`, the task is torn down when Discovery
     /// drops (the cmd_rx side sees its last Sender go and exits).
@@ -1012,9 +1026,14 @@ impl Discovery {
         let incoming_blob_streams = job_relay_stream_control
             .accept(StreamProtocol::new(BLOB_STREAM_PROTOCOL))
             .context("register blob stream protocol")?;
+        let incoming_shard_stage_streams = job_relay_stream_control
+            .accept(StreamProtocol::new(SHARD_STAGE_PROTOCOL))
+            .context("register shard stage protocol")?;
         let job_relay_stream_handler: Arc<RwLock<Option<JobRelayStreamHandler>>> =
             Arc::new(RwLock::new(None));
         let blob_stream_handler: Arc<RwLock<Option<BlobStreamHandler>>> =
+            Arc::new(RwLock::new(None));
+        let shard_stage_handler: Arc<RwLock<Option<ShardStageHandler>>> =
             Arc::new(RwLock::new(None));
         let inbound_stream_admission =
             InboundStreamAdmission::new(MAX_INBOUND_STREAM_TASKS, MAX_INBOUND_STREAMS_PER_PEER);
@@ -1026,6 +1045,11 @@ impl Discovery {
         tokio::spawn(run_incoming_blob_streams(
             incoming_blob_streams,
             blob_stream_handler.clone(),
+            inbound_stream_admission.clone(),
+        ));
+        tokio::spawn(run_incoming_shard_stage_streams(
+            incoming_shard_stage_streams,
+            shard_stage_handler.clone(),
             inbound_stream_admission,
         ));
         let job_relay_stream_control = Arc::new(tokio::sync::Mutex::new(job_relay_stream_control));
@@ -1089,6 +1113,7 @@ impl Discovery {
             job_relay_stream_control,
             job_relay_stream_handler,
             blob_stream_handler,
+            shard_stage_handler,
             driver: Some(driver),
         })
     }
@@ -1566,6 +1591,65 @@ impl Discovery {
         Ok(())
     }
 
+    /// Execute one bounded pipeline stage on `peer` over [`SHARD_STAGE_PROTOCOL`].
+    pub async fn execute_shard_stage(
+        &self,
+        peer: PeerId,
+        request: ShardStageRequest,
+    ) -> Result<ShardStageResponse> {
+        let now = unix_time_ms();
+        request.validate(now).map_err(anyhow::Error::new)?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(request.deadline_unix_ms.saturating_sub(now));
+        let idle_timeout = Duration::from_millis(request.idle_timeout_ms);
+        let negotiation_deadline = outbound_stream_negotiation_deadline(deadline);
+
+        let mut control =
+            tokio::time::timeout_at(negotiation_deadline, self.job_relay_stream_control.lock())
+                .await
+                .map_err(|_| anyhow!("shard stage negotiation timed out"))?;
+        let mut stream = tokio::time::timeout_at(
+            negotiation_deadline,
+            control.open_stream(peer, StreamProtocol::new(SHARD_STAGE_PROTOCOL)),
+        )
+        .await
+        .map_err(|_| anyhow!("shard stage negotiation timed out"))?
+        .map_err(|error| anyhow!("open shard stage stream to {peer}: {error}"))?;
+        drop(control);
+
+        tokio::time::timeout_at(
+            negotiation_deadline,
+            write_postcard_frame(&mut stream, &request, SHARD_STAGE_REQUEST_WIRE_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| anyhow!("shard stage request write timed out"))??;
+
+        let read_deadline = deadline.min(tokio::time::Instant::now() + idle_timeout);
+        let response: ShardStageResponse = tokio::time::timeout_at(
+            read_deadline,
+            read_postcard_frame(&mut stream, SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| anyhow!("shard stage response timed out"))??;
+        let _ = stream.close().await;
+
+        response
+            .validate_for(request.session_id, request.stage_index)
+            .map_err(anyhow::Error::new)?;
+        Ok(response)
+    }
+
+    /// Install or clear the inbound pipeline-stage callback. With no handler,
+    /// phase-net drops inbound stage streams fail-closed.
+    pub fn set_shard_stage_handler(&self, handler: Option<ShardStageHandler>) -> Result<()> {
+        let mut slot = self
+            .shard_stage_handler
+            .write()
+            .map_err(|_| anyhow!("shard stage handler lock poisoned"))?;
+        *slot = handler;
+        Ok(())
+    }
+
     /// Run until the background driver task exits. The November 2025 MVP's
     /// `plasmd start` calls this to keep the daemon alive after dispatching
     /// configuration. After M2 the actual swarm polling lives inside the
@@ -1620,6 +1704,10 @@ impl Discovery {
 const JOB_RELAY_STREAM_WIRE_MAX_BYTES: usize = JOB_RELAY_STREAM_MAX_EVENT_BYTES + 4096;
 const BLOB_STREAM_REQUEST_WIRE_MAX_BYTES: usize = BLOB_STREAM_MAX_METADATA_BYTES + 1024;
 const BLOB_STREAM_WIRE_MAX_BYTES: usize = BLOB_STREAM_MAX_CHUNK_BYTES + 1024;
+const SHARD_STAGE_REQUEST_WIRE_MAX_BYTES: usize =
+    SHARD_STAGE_MAX_PLAN_BYTES + SHARD_STAGE_MAX_PAYLOAD_BYTES + 4096;
+const SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES: usize =
+    SHARD_STAGE_MAX_PAYLOAD_BYTES + SHARD_STAGE_MAX_RECEIPT_BYTES + 4096;
 /// Transport control-lock, multistream-select, and initial-open-envelope
 /// budget. Caller-provided idle timeouts govern silence only after a substream
 /// is established; coupling them to scheduler/negotiation time made the
@@ -2118,6 +2206,113 @@ async fn run_incoming_blob_streams(
             }
         });
     }
+}
+
+async fn run_incoming_shard_stage_streams(
+    mut incoming: libp2p_stream::IncomingStreams,
+    handler_slot: Arc<RwLock<Option<ShardStageHandler>>>,
+    admission: Arc<InboundStreamAdmission>,
+) {
+    while let Some((peer, stream)) = incoming.next().await {
+        let serving_enabled = handler_slot
+            .read()
+            .map(|handler| handler.is_some())
+            .unwrap_or(false);
+        if !serving_enabled {
+            debug!(peer = %peer, "dropping inbound shard stage stream while cluster serving is disabled");
+            drop(stream);
+            continue;
+        }
+        let Some(permit) = admission.try_acquire(peer) else {
+            warn!(peer = %peer, "dropping inbound shard stage stream at admission limit");
+            drop(stream);
+            continue;
+        };
+        let handler_slot = handler_slot.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = serve_incoming_shard_stage_stream(peer, stream, handler_slot).await
+            {
+                warn!(peer = %peer, error = %error, "shard stage inbound stream failed");
+            }
+        });
+    }
+}
+
+async fn serve_incoming_shard_stage_stream(
+    peer: PeerId,
+    mut stream: libp2p::swarm::Stream,
+    handler_slot: Arc<RwLock<Option<ShardStageHandler>>>,
+) -> Result<()> {
+    let request: ShardStageRequest = tokio::time::timeout(
+        BLOB_STREAM_OPEN_TIMEOUT,
+        read_postcard_frame(&mut stream, SHARD_STAGE_REQUEST_WIRE_MAX_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow!("shard stage request open timed out"))?
+    .context("read shard stage request")?;
+
+    if let Err(error) = request.validate(unix_time_ms()) {
+        let rejection = ShardStageResponse {
+            schema_version: SHARD_STAGE_SCHEMA_VERSION,
+            session_id: request.session_id,
+            stage_index: request.stage_index,
+            kind: ShardStageResponseKind::Rejected {
+                reason: format!("invalid shard stage request: {error}"),
+            },
+        };
+        write_postcard_frame(&mut stream, &rejection, SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES).await?;
+        stream
+            .close()
+            .await
+            .context("close rejected shard stream")?;
+        return Ok(());
+    }
+
+    let handler = handler_slot
+        .read()
+        .map_err(|_| anyhow!("shard stage handler lock poisoned"))?
+        .clone();
+    let Some(handler) = handler else {
+        let rejection = ShardStageResponse {
+            schema_version: SHARD_STAGE_SCHEMA_VERSION,
+            session_id: request.session_id,
+            stage_index: request.stage_index,
+            kind: ShardStageResponseKind::Rejected {
+                reason: "no shard stage handler installed".to_string(),
+            },
+        };
+        write_postcard_frame(&mut stream, &rejection, SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES).await?;
+        stream
+            .close()
+            .await
+            .context("close rejected shard stream")?;
+        return Ok(());
+    };
+
+    let session_id = request.session_id;
+    let stage_index = request.stage_index;
+    let deadline_after =
+        Duration::from_millis(request.deadline_unix_ms.saturating_sub(unix_time_ms()));
+    let exec_timeout = deadline_after.min(Duration::from_millis(request.idle_timeout_ms));
+
+    let response = match tokio::time::timeout(exec_timeout, handler(peer, request)).await {
+        Ok(resp) => resp,
+        Err(_) => ShardStageResponse {
+            schema_version: SHARD_STAGE_SCHEMA_VERSION,
+            session_id,
+            stage_index,
+            kind: ShardStageResponseKind::Failed {
+                reason: "shard stage execution timed out".to_string(),
+            },
+        },
+    };
+    response
+        .validate_for(session_id, stage_index)
+        .map_err(anyhow::Error::new)?;
+    write_postcard_frame(&mut stream, &response, SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES).await?;
+    stream.close().await.context("close shard stage stream")?;
+    Ok(())
 }
 
 async fn serve_incoming_blob_stream(

@@ -1,7 +1,7 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-11-22
-**Version**: 0.6
+**Last Updated**: 2026-11-25
+**Version**: 0.7
 
 ---
 
@@ -21,9 +21,9 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 |------|---------|------------------|--------------|
 | [projectbrief.md](./projectbrief.md) | Vision, goals, MVP scope | Rarely (major pivots) | 2025-11-08 |
 | [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2026-08-09 |
-| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-11-22 |
-| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-22 |
-| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-22 |
+| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-11-25 |
+| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-25 |
+| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-25 |
 | [projectRules.md](./projectRules.md) | Coding standards | New patterns | 2025-11-08 |
 | [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2026-08-10 |
 | [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2026-11-22 |
@@ -229,10 +229,13 @@ What was accomplished
 
 ## Current Task Documentation (2026-11)
 
-**Status**: Workspace, build/CI, and runtime efficiency pass completed on `feat/lucid-consumer-experience`
+**Status**: Self-configuring `lucidd`, Tauri v2 desktop app (`v0.2.0-rc3`), Ollama/multi-folder serving, P2P pull UI, `lucidd bench`, and Tier-1 `ShardWorker` planner + ADR completed on `feat/lucid-consumer-experience`
 
 | Task | Status | File |
 |---|---|---|
+| Tier-1 `ShardWorker` libp2p transport (`/phase/shard-stage/1.0.0`), GGUF reader, & Cluster UI | ✅ Verified | [261125_shardworker-transport-and-cluster-ui.md](./tasks/2026-11/261125_shardworker-transport-and-cluster-ui.md) |
+| Ollama/multi-folder serving, HTTP tests, `lucidd bench`, & `ShardWorker` foundation | ✅ Verified (`b5bcee9`) | [261125_shardworker-foundation-and-bench.md](./tasks/2026-11/261125_shardworker-foundation-and-bench.md) |
+| Apple-simple self-configuring `lucidd` & cross-platform Tauri v2 desktop app | ✅ Verified (`v0.2.0-rc3`) | [261123_apple-simple-lucid-desktop.md](./tasks/2026-11/261123_apple-simple-lucid-desktop.md) |
 | Workspace, build/CI, and runtime efficiency | ✅ Verified | [261122_workspace-and-runtime-efficiency.md](./tasks/2026-11/261122_workspace-and-runtime-efficiency.md) |
 
 **Monthly Summary**: [tasks/2026-11/README.md](./tasks/2026-11/README.md)
@@ -269,6 +272,7 @@ What was accomplished
 - [Intended-Stream Vertical Slice](./releases/lucid-v0.2/intended-stream-vertical-slice.md)
 - [Reputation and Redundant Verification](./releases/lucid-v0.2/reputation-and-redundant-verification.md)
 - [ShardWorker](./releases/lucid-v0.2/shardworker.md)
+- [ShardWorker ADR Draft](./releases/lucid-v0.2/shardworker-adr.md)
 - [MLX Backend](./releases/lucid-v0.2/mlx-backend.md)
 - [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
 - [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
@@ -355,7 +359,7 @@ What was accomplished
 ## Memory Bank Statistics
 
 **Total Files**: Living Memory Bank; use this TOC and `rg --files memory-bank` rather than a stale manual count
-**Last Updated**: 2026-11-22
+**Last Updated**: 2026-11-25
 **Coverage**:
 - ✅ Project vision and goals (projectbrief.md)
 - ✅ Architecture patterns (systemPatterns.md) - updated with Phase Boot patterns

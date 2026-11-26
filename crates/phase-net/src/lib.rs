@@ -20,7 +20,7 @@ pub use discovery::{
     BlobStream, BlobStreamHandler, Discovery, DiscoveryConfig, JobRelayHandler, JobRelayLiveStream,
     JobRelayStreamHandler, NatReachability, ReachabilityConfig, ReachabilityConnection,
     ReachabilityPath, ReachabilityRole, ReachabilitySnapshot, RelayServerLimits, RendezvousPeer,
-    RendezvousServerLimits,
+    RendezvousServerLimits, ShardStageHandler,
 };
 pub use peer::{BandwidthBucket, LatencyBucket, PeerCapabilities, PeerInfo};
 pub use protocol::{
@@ -28,12 +28,17 @@ pub use protocol::{
     JobOffer, JobRelayRequest, JobRelayResponse, JobRelayStreamControl, JobRelayStreamControlKind,
     JobRelayStreamError, JobRelayStreamFrame, JobRelayStreamFrameKind, JobRelayStreamOpen,
     JobRelayStreamValidator, JobRequest, JobRequirements, JobResponse, JobResult, RejectionReason,
+    ShardStageError, ShardStageRequest, ShardStageResponse, ShardStageResponseKind,
     BLOB_STREAM_DEFAULT_IDLE_TIMEOUT_MS, BLOB_STREAM_MAX_CHUNK_BYTES,
     BLOB_STREAM_MAX_DEADLINE_AHEAD_MS, BLOB_STREAM_MAX_IDLE_TIMEOUT_MS,
     BLOB_STREAM_MAX_METADATA_BYTES, BLOB_STREAM_MAX_REASON_BYTES, BLOB_STREAM_MIN_IDLE_TIMEOUT_MS,
     BLOB_STREAM_PROTOCOL, BLOB_STREAM_SCHEMA_VERSION, JOB_RELAY_STREAM_MAX_EVENT_BYTES,
     JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_MAX_REASON_BYTES,
     JOB_RELAY_STREAM_MAX_RECEIPT_BYTES, JOB_RELAY_STREAM_PROTOCOL, JOB_RELAY_STREAM_SCHEMA_VERSION,
+    SHARD_STAGE_DEFAULT_IDLE_TIMEOUT_MS, SHARD_STAGE_MAX_DEADLINE_AHEAD_MS,
+    SHARD_STAGE_MAX_IDLE_TIMEOUT_MS, SHARD_STAGE_MAX_PAYLOAD_BYTES, SHARD_STAGE_MAX_PLAN_BYTES,
+    SHARD_STAGE_MAX_REASON_BYTES, SHARD_STAGE_MAX_RECEIPT_BYTES, SHARD_STAGE_MIN_IDLE_TIMEOUT_MS,
+    SHARD_STAGE_PROTOCOL, SHARD_STAGE_SCHEMA_VERSION,
 };
 
 // Re-export libp2p's `PeerId` so downstream Phase crates (lucidd, future

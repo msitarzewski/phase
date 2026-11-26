@@ -892,6 +892,79 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
         .unwrap();
     assert_eq!(ok_settings.status(), StatusCode::OK);
 
+    // 9. Trusted-Circle cluster endpoint enforces auth, fail-closed untrusted
+    // sharding, and returns coordinator-signed Tier-1 partition plans.
+    let unauth_cluster = client
+        .get(format!("{base_url}/api/lucid/cluster"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_cluster.status(), StatusCode::UNAUTHORIZED);
+
+    let cluster_status: Value = client
+        .get(format!("{base_url}/api/lucid/cluster"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cluster_status["cluster_enabled"], json!(false));
+    assert_eq!(cluster_status["untrusted_sharding_allowed"], json!(false));
+    assert_eq!(
+        cluster_status["trust_label"],
+        json!("trusted-circle-sharded")
+    );
+    let local_vk = cluster_status["local_node"]["verifying_key_hex"]
+        .as_str()
+        .expect("local verifying_key_hex");
+    let gib: u64 = 1024 * 1024 * 1024;
+
+    let forbidden_untrusted = client
+        .post(format!("{base_url}/api/lucid/cluster/plan"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "model_name": "llama3.3:70b-q4_k_m",
+            "total_layers": 80,
+            "size_bytes": 42 * gib,
+            "trust_tier": "untrusted-spot-checked",
+            "peers": [
+                { "peer_id": "peer-a", "verifying_key_hex": local_vk, "available_memory_bytes": 64 * gib, "backend": "metal" },
+                { "peer_id": "peer-b", "verifying_key_hex": local_vk, "available_memory_bytes": 24 * gib, "backend": "cuda" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden_untrusted.status(), StatusCode::FORBIDDEN);
+
+    let trusted_plan_resp = client
+        .post(format!("{base_url}/api/lucid/cluster/plan"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "model_name": "llama3.3:70b-q4_k_m",
+            "total_layers": 80,
+            "size_bytes": 42 * gib,
+            "peers": [
+                { "peer_id": "peer-a", "verifying_key_hex": local_vk, "available_memory_bytes": 64 * gib, "backend": "metal" },
+                { "peer_id": "peer-b", "verifying_key_hex": local_vk, "available_memory_bytes": 24 * gib, "backend": "cuda" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(trusted_plan_resp.status(), StatusCode::OK);
+    let trusted_plan: Value = trusted_plan_resp.json().await.unwrap();
+    assert_eq!(trusted_plan["verified"], json!(true));
+    assert_eq!(
+        trusted_plan["signed_plan"]["plan"]["stages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
     let _ = child.kill();
     let _ = child.wait();
 }
