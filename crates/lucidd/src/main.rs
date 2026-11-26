@@ -177,6 +177,7 @@ enum ClusterCommand {
 #[derive(Debug, Parser)]
 #[command(
     name = "lucidd",
+    version,
     about = "LUCID inference daemon — verified local/peer inference behind an Ollama-compatible API."
 )]
 struct Cli {
@@ -825,13 +826,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve Auto mode safely: explicit flags always win; zero-flag startup
     // stays consume-only until the user has explicitly granted permission to
     // provide models and pinned a verified llama-server runtime.
+    let node_llama_binary_ready = node_cfg.llama_server_binary.as_ref().is_some_and(|path| {
+        if path.is_file() {
+            true
+        } else {
+            tracing::warn!(
+                path = %path.display(),
+                "persisted llama_server_binary in node.toml is missing; falling back to consume-only until runtime is re-installed"
+            );
+            false
+        }
+    });
     let effective_mode = match cli.mode {
         NodeMode::Auto => {
             if cli.no_local_worker {
                 NodeMode::ConsumeOnly
             } else if cli.worker.is_some()
                 || (node_cfg.providing_enabled
-                    && node_cfg.llama_server_binary.is_some()
+                    && node_llama_binary_ready
                     && (!node_cfg.model_dirs.is_empty()
                         || !node_cfg.approved_model_sources.is_empty()))
             {
@@ -1356,11 +1368,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                #[cfg(target_os = "linux")]
+                let extra_env = {
+                    let mut env = Vec::new();
+                    if let Some(bin_dir) = server_binary_path.parent() {
+                        if bin_dir.join("libggml-cuda.so").exists() {
+                            if let Some(cuda_dir) =
+                                lucidd::runtime_manager::find_linux_cuda12_lib_dir()
+                            {
+                                if let Ok(canon_cuda) = cuda_dir.canonicalize() {
+                                    env.push((
+                                        "LD_LIBRARY_PATH".to_string(),
+                                        format!("{}:{}", bin_dir.display(), canon_cuda.display()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    env
+                };
+                #[cfg(not(target_os = "linux"))]
+                let extra_env = Vec::new();
                 let config = LlamaCppConfig {
                     server_binary_path,
                     model_dir: verified_model_dir,
                     default_n_gpu_layers: n_gpu_layers,
                     default_context_size: cli.llama_ctx_size,
+                    extra_env,
                     ..Default::default()
                 };
                 tracing::info!(?config, "worker: llama-cpp");
@@ -1546,6 +1580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // authenticates this libp2p peer. Inbound peers bind the manifest signer
     // to the delivering PeerId; an ephemeral client key makes normal
     // peer-to-peer requests fail the default authorization policy.
+    let serve_model_content = cli.serve_model_content || node_cfg.serve_model_content;
     let client_identity = node_identity.clone();
     let content_plane = match content_storage.as_ref() {
         Some((verified_model_dir, artifact_store)) => Some(Arc::new(ContentPlane::new(
@@ -1554,7 +1589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             artifact_store.clone(),
             verified_model_dir.clone(),
             ContentPlaneConfig {
-                publish_provider: cli.serve_model_content,
+                publish_provider: serve_model_content,
                 local_gguf_activation: (worker_choice == Some(WorkerChoice::LlamaCpp)).then(|| {
                     LocalGgufActivation {
                         context_length: cli.llama_ctx_size as u32,
@@ -1577,7 +1612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    if cli.serve_model_content {
+    if serve_model_content {
         let plane = content_plane
             .as_ref()
             .ok_or("--serve-model-content requires a configured content store")?;

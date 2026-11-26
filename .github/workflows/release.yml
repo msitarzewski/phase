@@ -52,6 +52,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build and verify release bundle
+        env:
+          # Pin baseline x86-64 codegen on Linux x86_64 so C/assembly crypto
+          # dependencies (such as aws-lc-sys) never emit BMI1/AVX2 instructions
+          # that SIGILL on pre-Haswell Intel/AMD CPUs (e.g. Ivy Bridge).
+          CFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64 -mno-bmi -mno-bmi2 -mno-avx2' || '' }}
+          CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64 -mno-bmi -mno-bmi2 -mno-avx2' || '' }}
+          CMAKE_C_FLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64 -mno-bmi -mno-bmi2 -mno-avx2' || '' }}
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C target-cpu=x86-64' || '' }}
         run: |
           cargo fetch --locked
           scripts/phase-validate.sh --evidence-dir "$RUNNER_TEMP/release-out" release

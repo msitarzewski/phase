@@ -787,23 +787,37 @@ impl ContentPlane {
     /// serving.
     pub async fn restore_installed_catalog(&self) -> Result<Vec<InstalledModel>, ContentError> {
         let _catalog = self.catalog_lock.lock().await;
+        let existing = self.registry.local_installed_async().await;
+        let loaded = self.registry.local_models_async().await;
+        let already_verified: HashMap<ModelCid, u64> = existing
+            .iter()
+            .map(|record| (record.model_cid, record.size_bytes))
+            .collect();
         let verified_dir = self.verified_model_dir.clone();
         let store = self.store.clone();
         let max_model_bytes = self.config.max_model_bytes;
         let entries = tokio::task::spawn_blocking(move || {
-            load_and_verify_catalog(&verified_dir, &store, max_model_bytes)
+            load_and_verify_catalog(&verified_dir, &store, max_model_bytes, &already_verified)
         })
         .await
         .map_err(|error| ContentError::Registration(bounded_diagnostic(error)))?
         .map_err(|error| ContentError::Registration(bounded_diagnostic(error)))?;
 
-        let existing = self.registry.local_installed_async().await;
-        let loaded = self.registry.local_models_async().await;
         preflight_catalog_registration(&entries, &existing, &loaded)
             .map_err(|error| ContentError::Registration(bounded_diagnostic(error)))?;
 
+        let existing_by_alias: HashMap<String, InstalledModel> = existing
+            .into_iter()
+            .map(|record| (record.model_id.clone(), record))
+            .collect();
         let mut restored = Vec::with_capacity(entries.len());
         for entry in entries {
+            if let Some(already) = existing_by_alias.get(&entry.alias) {
+                if already.model_cid == entry.cid && already.size_bytes == entry.size {
+                    restored.push(already.clone());
+                    continue;
+                }
+            }
             let installed = self
                 .registry
                 .register_verified_gguf_blob(
@@ -1067,6 +1081,7 @@ fn load_and_verify_catalog(
     directory: &std::path::Path,
     store: &ArtifactStore,
     max_model_bytes: u64,
+    already_verified: &HashMap<ModelCid, u64>,
 ) -> anyhow::Result<Vec<VerifiedCatalogEntry>> {
     let path = directory.join(CONTENT_CATALOG_FILE);
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -1142,9 +1157,14 @@ fn load_and_verify_catalog(
         if !blob_metadata.file_type().is_file() || blob_metadata.len() != entry.size {
             bail!("catalog blob is not an exact regular artifact-store file");
         }
-        let (actual_id, actual_size) = ArtifactStore::compute_blob_id(&blob.path)?;
-        if actual_id != blob_id || actual_size != entry.size {
-            bail!("catalog blob failed independent CID/size verification");
+        // Skip redundant multi-GB re-hashing when this exact daemon startup
+        // already independently hashed and verified the same CID/size during
+        // local model import.
+        if already_verified.get(&cid) != Some(&entry.size) {
+            let (actual_id, actual_size) = ArtifactStore::compute_blob_id(&blob.path)?;
+            if actual_id != blob_id || actual_size != entry.size {
+                bail!("catalog blob failed independent CID/size verification");
+            }
         }
         verified.push(VerifiedCatalogEntry {
             alias: normalized,

@@ -821,22 +821,36 @@ fn detect_gpu_blocking(os: &str, arch: &str) -> (String, Option<String>, Option<
     ("cpu".to_string(), None, None)
 }
 
-fn has_linux_cuda12_runtime() -> bool {
-    let lib_dirs = [
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/usr/local/cuda/lib64",
-        "/usr/local/cuda-12/lib64",
-        "/usr/local/cuda-12.8/lib64",
-        "/usr/local/cuda-12.6/lib64",
+/// Locate a directory on Linux containing the CUDA 12 shared runtime libraries
+/// (`libcudart.so.12`, `libcublas.so.12`, and `libcublasLt.so.12`), checking
+/// both standard system paths and existing Ollama CUDA-12 runtime bundles so
+/// NVIDIA hosts with Ollama installed can run pinned CUDA without requiring a
+/// system-wide CUDA toolkit install.
+pub fn find_linux_cuda12_lib_dir() -> Option<PathBuf> {
+    let mut lib_dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/lib/x86_64-linux-gnu"),
+        PathBuf::from("/usr/local/cuda/lib64"),
+        PathBuf::from("/usr/local/cuda-12/lib64"),
+        PathBuf::from("/usr/local/cuda-12.8/lib64"),
+        PathBuf::from("/usr/local/cuda-12.6/lib64"),
+        PathBuf::from("/usr/local/lib/ollama/cuda_v12"),
+        PathBuf::from("/usr/lib/ollama/cuda_v12"),
+        PathBuf::from("/opt/ollama/lib/ollama/cuda_v12"),
     ];
-    let has_cudart = lib_dirs
-        .iter()
-        .any(|d| Path::new(d).join("libcudart.so.12").exists());
-    let has_cublas = lib_dirs
-        .iter()
-        .any(|d| Path::new(d).join("libcublas.so.12").exists());
-    has_cudart && has_cublas
+    if let Some(home) = dirs::home_dir() {
+        lib_dirs.push(home.join(".local/ollama/lib/ollama/cuda_v12"));
+        lib_dirs.push(home.join(".local/lib/ollama/cuda_v12"));
+    }
+    lib_dirs.into_iter().find(|dir| {
+        dir.join("libcudart.so.12").exists()
+            && dir.join("libcublas.so.12").exists()
+            && dir.join("libcublasLt.so.12").exists()
+    })
+}
+
+fn has_linux_cuda12_runtime() -> bool {
+    find_linux_cuda12_lib_dir().is_some()
 }
 
 fn has_linux_vulkan_runtime() -> bool {

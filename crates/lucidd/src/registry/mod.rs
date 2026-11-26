@@ -1722,7 +1722,25 @@ impl ModelRegistry {
             return Ok(Some(cid));
         }
         let normalized = normalize_model_alias(model)?;
-        if let Some(installed) = self.installed.read().await.get(&normalized) {
+        if let Some(cid) = self.resolve_normalized_alias_cid(&normalized).await? {
+            return Ok(Some(cid));
+        }
+        // Ollama-imported models often carry an explicit `:latest` tag while
+        // Ollama HTTP routing normalizes `:latest` away. Try `<model>:latest`
+        // through the exact same verified local/signed-alias path so human
+        // model names route identically to raw CIDs without weakening alias
+        // conflict rejection.
+        if !normalized.contains(':') {
+            let with_latest = format!("{normalized}:latest");
+            if let Some(cid) = self.resolve_normalized_alias_cid(&with_latest).await? {
+                return Ok(Some(cid));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn resolve_normalized_alias_cid(&self, normalized: &str) -> Result<Option<ModelCid>> {
+        if let Some(installed) = self.installed.read().await.get(normalized) {
             return Ok(Some(installed.model_cid));
         }
         if let Some(caps) = self
@@ -1734,7 +1752,7 @@ impl ModelRegistry {
         {
             return Ok(Some(caps.model_cid));
         }
-        self.resolve_alias_cid(&normalized).await
+        self.resolve_alias_cid(normalized).await
     }
 
     /// Import one GGUF into the verified content store and make it eligible
