@@ -361,19 +361,46 @@ fn refused_response(reason: &str) -> Response {
 
 async fn resolve_job_model_cid(state: &AppState, model: &str) -> Result<String, Box<Response>> {
     match state.registry.resolve_model_cid(model).await {
-        Ok(Some(cid)) => Ok(cid.to_hex()),
-        Ok(None) => Err(Box::new(refused_response(&format!(
-            "model '{model}' has no verified local or signed network CID mapping"
-        )))),
+        Ok(Some(cid)) => return Ok(cid.to_hex()),
+        Ok(None) => {}
         Err(error) => {
             tracing::warn!(
                 model = %sanitize_for_log(model),
                 error = %error,
                 "verified model CID resolution failed"
             );
-            Err(Box::new(refused_response("model CID resolution failed")))
+            return Err(Box::new(refused_response("model CID resolution failed")));
         }
     }
+    // Ollama-imported models often carry an explicit `:latest` tag in their
+    // manifest alias while Ollama routing normalizes `:latest` away. Check
+    // both `<model>:latest` and the verified network model cache before refusing.
+    if !model.contains(':') {
+        let with_latest = format!("{model}:latest");
+        if let Ok(Some(cid)) = state.registry.resolve_model_cid(&with_latest).await {
+            return Ok(cid.to_hex());
+        }
+        if let Some(net) = state
+            .registry
+            .cached_network_models()
+            .await
+            .into_iter()
+            .find(|m| m.caps.model_id == model || m.caps.model_id == with_latest)
+        {
+            return Ok(net.caps.model_cid.to_hex());
+        }
+    } else if let Some(net) = state
+        .registry
+        .cached_network_models()
+        .await
+        .into_iter()
+        .find(|m| m.caps.model_id == model)
+    {
+        return Ok(net.caps.model_cid.to_hex());
+    }
+    Err(Box::new(refused_response(&format!(
+        "model '{model}' has no verified local or signed network CID mapping"
+    ))))
 }
 
 pub fn router(state: AppState) -> Router {

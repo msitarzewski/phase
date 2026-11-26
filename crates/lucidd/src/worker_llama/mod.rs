@@ -751,6 +751,7 @@ fn spawn_llama_server(
     // plus any explicitly-configured `extra_env`.
     cmd.env_clear();
     cmd.env("PATH", "/usr/bin:/bin:/usr/local/bin");
+    cmd.env("XDG_CACHE_HOME", std::env::temp_dir());
     cmd.stdin(Stdio::null());
 
     cmd.arg("--model").arg(model);

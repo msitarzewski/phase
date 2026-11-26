@@ -285,4 +285,5 @@ The tracker must never mark a milestone complete based only on code existence.
 - [mlx-backend.md](./mlx-backend.md)
 - [core-ai-feasibility-gate.md](./core-ai-feasibility-gate.md)
 - [release-qualification.md](./release-qualification.md)
+- [fleet-progress-report.md](./fleet-progress-report.md) — standardized physical fleet qualification & `lucidd bench` trend log
 - [LUMEN release tracker](../lumen/README.md) — separate diffusion flagship; not part of LUCID

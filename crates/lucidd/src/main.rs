@@ -1779,12 +1779,13 @@ async fn run_cli_subcommand(
             })
             .await?;
             println!(
-                "Model: {} | Requests: {}/{} ok | Verified receipts: {} | Throughput: {:.2} jobs/s ({:.1} chunks/s)",
+                "Model: {} | Requests: {}/{} ok | Verified receipts: {} | Throughput: {:.2} jobs/s ({:.1} tok/s, {:.1} chunks/s)",
                 report.model,
                 report.succeeded,
                 report.total_requests,
                 report.receipt_verified_count,
                 report.jobs_per_second,
+                report.tokens_per_second,
                 report.chunks_per_second
             );
             println!(

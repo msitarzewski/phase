@@ -43,6 +43,7 @@ pub struct BenchSample {
     pub ttft_ms: Option<f64>,
     pub total_ms: f64,
     pub chunks: usize,
+    pub eval_tokens: u64,
     pub error: Option<String>,
 }
 
@@ -59,6 +60,8 @@ pub struct BenchReport {
     pub jobs_per_second: f64,
     pub total_chunks: usize,
     pub chunks_per_second: f64,
+    pub total_eval_tokens: u64,
+    pub tokens_per_second: f64,
     pub ttft_p50_ms: Option<f64>,
     pub ttft_p95_ms: Option<f64>,
     pub duration_p50_ms: Option<f64>,
@@ -147,6 +150,7 @@ async fn execute_single_sample(
                 ttft_ms: None,
                 total_ms: started.elapsed().as_secs_f64() * 1000.0,
                 chunks: 0,
+                eval_tokens: 0,
                 error: Some(err.to_string()),
             };
         }
@@ -176,6 +180,7 @@ async fn execute_single_sample(
             ttft_ms: None,
             total_ms: started.elapsed().as_secs_f64() * 1000.0,
             chunks: 0,
+            eval_tokens: 0,
             error: Some(body.chars().take(160).collect()),
         };
     }
@@ -184,6 +189,7 @@ async fn execute_single_sample(
     let mut buf = Vec::new();
     let mut ttft_ms: Option<f64> = None;
     let mut chunks = 0usize;
+    let mut eval_tokens = 0u64;
     let mut done_seen = false;
     let mut terminal_verified = false;
     let mut stream_err: Option<String> = None;
@@ -221,12 +227,13 @@ async fn execute_single_sample(
                 }
                 if frame.get("done").and_then(|v| v.as_bool()) == Some(true) {
                     done_seen = true;
-                    if frame
-                        .get("x_lucid_receipt_verified")
-                        .and_then(|v| v.as_bool())
-                        == Some(true)
-                    {
-                        terminal_verified = true;
+                    if let Some(count) = frame.get("eval_count").and_then(|v| v.as_u64()) {
+                        eval_tokens = count;
+                    }
+                    if let Some(rv) = frame.get("x_lucid_receipt_verified") {
+                        if rv.as_bool() == Some(true) || rv.as_str() == Some("true") {
+                            terminal_verified = true;
+                        }
                     }
                 }
             }
@@ -247,6 +254,7 @@ async fn execute_single_sample(
         ttft_ms,
         total_ms: started.elapsed().as_secs_f64() * 1000.0,
         chunks,
+        eval_tokens,
         error: stream_err,
     }
 }
@@ -260,6 +268,7 @@ pub fn summarize_samples(
     let mut failed = 0usize;
     let mut receipt_verified_count = 0usize;
     let mut total_chunks = 0usize;
+    let mut total_eval_tokens = 0u64;
     let mut ttfts = Vec::new();
     let mut durations = Vec::new();
     let mut route_distribution: BTreeMap<String, usize> = BTreeMap::new();
@@ -272,6 +281,7 @@ pub fn summarize_samples(
                 ttfts.push(t);
             }
             total_chunks += s.chunks;
+            total_eval_tokens = total_eval_tokens.saturating_add(s.eval_tokens);
             if s.receipt_verified {
                 receipt_verified_count += 1;
             }
@@ -293,6 +303,8 @@ pub fn summarize_samples(
         jobs_per_second: (succeeded as f64) / wall_seconds,
         total_chunks,
         chunks_per_second: (total_chunks as f64) / wall_seconds,
+        total_eval_tokens,
+        tokens_per_second: (total_eval_tokens as f64) / wall_seconds,
         ttft_p50_ms: percentile(&mut ttfts, 0.50),
         ttft_p95_ms: percentile(&mut ttfts, 0.95),
         duration_p50_ms: percentile(&mut durations, 0.50),
@@ -335,6 +347,7 @@ mod tests {
                 ttft_ms: Some(120.0),
                 total_ms: 800.0,
                 chunks: 30,
+                eval_tokens: 30,
                 error: None,
             },
             BenchSample {
@@ -346,6 +359,7 @@ mod tests {
                 ttft_ms: Some(180.0),
                 total_ms: 1000.0,
                 chunks: 32,
+                eval_tokens: 32,
                 error: None,
             },
             BenchSample {
@@ -357,6 +371,7 @@ mod tests {
                 ttft_ms: Some(150.0),
                 total_ms: 900.0,
                 chunks: 28,
+                eval_tokens: 28,
                 error: None,
             },
             BenchSample {
@@ -368,6 +383,7 @@ mod tests {
                 ttft_ms: None,
                 total_ms: 50.0,
                 chunks: 0,
+                eval_tokens: 0,
                 error: Some("capacity".to_string()),
             },
         ];
@@ -377,6 +393,8 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert_eq!(report.receipt_verified_count, 3);
         assert_eq!(report.total_chunks, 90);
+        assert_eq!(report.total_eval_tokens, 90);
+        assert!((report.tokens_per_second - 45.0).abs() < 1e-6);
         assert_eq!(report.ttft_p50_ms, Some(150.0));
         assert_eq!(report.duration_p50_ms, Some(900.0));
         assert_eq!(report.route_distribution.get("peer:peerA"), Some(&2));

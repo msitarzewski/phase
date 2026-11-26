@@ -276,6 +276,7 @@ What was accomplished
 - [MLX Backend](./releases/lucid-v0.2/mlx-backend.md)
 - [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
 - [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
+- [Physical Fleet Progress Report](./releases/lucid-v0.2/fleet-progress-report.md)
 
 ### Competitive research and next experiments
 

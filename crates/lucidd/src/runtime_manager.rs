@@ -708,7 +708,7 @@ fn probe_hardware_blocking() -> HardwareCapability {
 
     let recommended_max_model_bytes = match gpu_backend.as_str() {
         "metal" => (total_memory_bytes as f64 * 0.65) as u64,
-        "cuda" => gpu_vram_bytes
+        "cuda" | "vulkan" => gpu_vram_bytes
             .map(|v| (v as f64 * 0.80) as u64)
             .unwrap_or_else(|| (total_memory_bytes as f64 * 0.50) as u64),
         _ => (total_memory_bytes as f64 * 0.50) as u64,
@@ -723,6 +723,11 @@ fn probe_hardware_blocking() -> HardwareCapability {
             format!("{name} ({vram_gb} GB VRAM) · {ram_gb} GB RAM (CUDA)")
         }
         ("cuda", Some(name), None) => format!("{name} · {ram_gb} GB RAM (CUDA)"),
+        ("vulkan", Some(name), Some(vram)) => {
+            let vram_gb = vram / (1024 * 1024 * 1024);
+            format!("{name} ({vram_gb} GB VRAM) · {ram_gb} GB RAM (Vulkan)")
+        }
+        ("vulkan", Some(name), None) => format!("{name} · {ram_gb} GB RAM (Vulkan)"),
         _ => format!("{cpu_cores}-core CPU · {ram_gb} GB RAM"),
     };
 
@@ -793,7 +798,19 @@ fn detect_gpu_blocking(os: &str, arch: &str) -> (String, Option<String>, Option<
                             .and_then(|s| s.parse::<u64>().ok())
                             .map(|mib| mib.saturating_mul(1024 * 1024));
                         if name.is_some() {
-                            return ("cuda".to_string(), name, vram);
+                            // Prefer CUDA only when the host actually has the
+                            // CUDA 12 runtime libraries (`libcudart.so.12` +
+                            // `libcublas.so.12`); otherwise use Vulkan GPU
+                            // acceleration (zero CUDA toolkit required) so
+                            // `llama-server` never silently falls back to CPU.
+                            let backend = if has_linux_cuda12_runtime() {
+                                "cuda"
+                            } else if has_linux_vulkan_runtime() {
+                                "vulkan"
+                            } else {
+                                "cpu"
+                            };
+                            return (backend.to_string(), name, vram);
                         }
                     }
                 }
@@ -802,6 +819,34 @@ fn detect_gpu_blocking(os: &str, arch: &str) -> (String, Option<String>, Option<
     }
 
     ("cpu".to_string(), None, None)
+}
+
+fn has_linux_cuda12_runtime() -> bool {
+    let lib_dirs = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12/lib64",
+        "/usr/local/cuda-12.8/lib64",
+        "/usr/local/cuda-12.6/lib64",
+    ];
+    let has_cudart = lib_dirs
+        .iter()
+        .any(|d| Path::new(d).join("libcudart.so.12").exists());
+    let has_cublas = lib_dirs
+        .iter()
+        .any(|d| Path::new(d).join("libcublas.so.12").exists());
+    has_cudart && has_cublas
+}
+
+fn has_linux_vulkan_runtime() -> bool {
+    [
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
 }
 
 /// Read-only scan of Ollama's local manifests/blobs directory. Never modifies
