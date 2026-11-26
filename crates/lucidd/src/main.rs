@@ -233,6 +233,13 @@ struct Cli {
     #[arg(long, default_value_t = 8192)]
     llama_ctx_size: usize,
 
+    /// Optional loopback port (`127.0.0.1:<PORT>`) of a local Tier-1
+    /// Trusted-Circle stage runner. When set, inbound `/phase/shard-stage/1.0.0`
+    /// requests are forwarded to this loopback bridge ONLY while `cluster_enabled`
+    /// is opted in and caller authz + signed partition-plan verification pass.
+    #[arg(long)]
+    shard_stage_bridge_port: Option<u16>,
+
     /// Absolute path to the pinned `mlx_lm.server` entry point. Required with
     /// `--worker mlx`; PATH lookup is intentionally not performed.
     #[arg(long)]
@@ -1430,6 +1437,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = discovery.set_job_relay_stream_handler(Some(handlers.stream)) {
             tracing::warn!(error = %e, "set_job_relay_stream_handler failed");
         }
+    }
+
+    // Install the opt-in Tier-1 Trusted-Circle shard stage handler only when
+    // an operator explicitly configures a local loopback stage bridge port.
+    // Even then, inbound requests remain rejected unless `cluster_enabled = true`
+    // in `node.toml` AND the caller is explicitly authorized.
+    if let Some(bridge_port) = cli.shard_stage_bridge_port {
+        let executor = lucidd::shard_worker::LoopbackStageBridgeExecutor::new(
+            bridge_port,
+            std::time::Duration::from_secs(60),
+        )?;
+        let shard_handler = lucidd::shard_worker::make_opt_in_inbound_shard_stage_handler(
+            Arc::new(node_identity.clone()),
+            *discovery.local_peer_id(),
+            policy.clone(),
+            node_config_store.clone(),
+            Arc::new(executor),
+        );
+        discovery.set_shard_stage_handler(Some(shard_handler))?;
+        tracing::info!(
+            loopback_port = bridge_port,
+            cluster_enabled = node_config_store.snapshot().cluster_enabled,
+            "registered opt-in Tier-1 Trusted-Circle shard stage handler"
+        );
     }
 
     // The router itself. Evidence is local, privacy-minimal, and bound to the

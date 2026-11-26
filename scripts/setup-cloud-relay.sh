@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO="${PHASE_RELEASE_REPO:-msitarzewski/phase}"
-TAG="${PHASE_RELEASE_TAG:-v0.2.0-rc3}"
+TAG="${PHASE_RELEASE_TAG:-v0.2.0-rc4}"
 PUBLIC_IP=""
 SKIP_FIREWALL=0
 PREFIX="${HOME}/.local"
@@ -33,7 +33,7 @@ Usage:
 
 Options:
   --ip IPV4             Static public IPv4 address (auto-detected if omitted)
-  --tag TAG             GitHub Release tag to install (default: v0.2.0-rc3)
+  --tag TAG             GitHub Release tag to install (default: v0.2.0-rc4)
   --repo OWNER/REPO     GitHub repository (default: msitarzewski/phase)
   --prefix DIR          Install prefix for bin/lucidd (non-root mode, default: ~/.local)
   --no-firewall         Skip adding the `ufw allow 4001/tcp` rule

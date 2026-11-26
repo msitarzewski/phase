@@ -18,6 +18,8 @@
 //! - Never claims third-party cryptographic proof of intermediate tensor math;
 //!   every verification result carries `trust_label = "trusted-circle-sharded"`.
 
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +32,9 @@ use phase_net::{
     SHARD_STAGE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
+use tokio::process::{Child, Command};
 
+use crate::node_config::NodeConfigStore;
 use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::shard_plan::{
     sign_stage_receipt, verify_composite_shard_chain, verify_shard_plan,
@@ -155,12 +159,137 @@ impl ShardStageExecutor for LoopbackStageBridgeExecutor {
     }
 }
 
+/// Configuration for spawning a sandboxed loopback stage-runner binary
+/// (e.g. a SHA-256-pinned `llama.cpp` `rpc-server` or pipeline stage runner).
+///
+/// Security boundary:
+/// - Binary path MUST be absolute and verified by SHA-256 before spawn (no
+///   `PATH` lookup).
+/// - Child environment is cleared via `env_clear()`.
+/// - Listener is strictly bound to `127.0.0.1` so remote peers can NEVER
+///   bypass libp2p Noise+TLS, `PolicyEngine` authz, or signed partition plans.
+#[derive(Debug, Clone)]
+pub struct SandboxedStageProcessConfig {
+    pub binary_path: PathBuf,
+    pub expected_sha256: String,
+    pub loopback_port: u16,
+    pub extra_args: Vec<String>,
+}
+
+/// Owned sandboxed loopback stage subprocess. Killed automatically on drop.
+pub struct SandboxedStageProcess {
+    child: Child,
+    port: u16,
+}
+
+impl SandboxedStageProcess {
+    /// Verify the binary's SHA-256 digest and spawn it inside an `env_clear()`
+    /// loopback-only sandbox (`127.0.0.1:<port>`).
+    pub async fn spawn_verified(cfg: &SandboxedStageProcessConfig) -> Result<Self> {
+        if !cfg.binary_path.is_absolute() {
+            bail!("stage runner binary path must be absolute");
+        }
+        if cfg.loopback_port == 0 {
+            bail!("stage runner loopback_port must be non-zero");
+        }
+        let meta = std::fs::symlink_metadata(&cfg.binary_path).with_context(|| {
+            format!("cannot inspect stage runner {}", cfg.binary_path.display())
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            bail!("stage runner binary must be a regular non-symlink file");
+        }
+        let path_for_hash = cfg.binary_path.clone();
+        let actual_sha = tokio::task::spawn_blocking(move || {
+            crate::runtime_manager::sha256_file_hex(&path_for_hash)
+        })
+        .await
+        .context("stage runner SHA-256 task panicked")??;
+        if !actual_sha.eq_ignore_ascii_case(cfg.expected_sha256.trim()) {
+            bail!(
+                "stage runner binary SHA-256 mismatch (expected {}, got {actual_sha})",
+                cfg.expected_sha256
+            );
+        }
+
+        let mut cmd = Command::new(&cfg.binary_path);
+        cmd.env_clear();
+        cmd.env("NO_COLOR", "1");
+        cmd.arg("--host").arg("127.0.0.1");
+        cmd.arg("--port").arg(cfg.loopback_port.to_string());
+        for arg in &cfg.extra_args {
+            cmd.arg(arg);
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn sandboxed stage runner {}",
+                cfg.binary_path.display()
+            )
+        })?;
+        Ok(Self {
+            child,
+            port: cfg.loopback_port,
+        })
+    }
+
+    pub fn loopback_port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn bridge_executor(&self, timeout: Duration) -> Result<LoopbackStageBridgeExecutor> {
+        LoopbackStageBridgeExecutor::new(self.port, timeout)
+    }
+
+    pub async fn shutdown(mut self) {
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+    }
+}
+
 /// Completed output of an end-to-end Tier-1 multi-peer sharded pipeline run.
 #[derive(Debug, Clone)]
 pub struct ShardPipelineOutput {
     pub output_payload: Vec<u8>,
     pub receipts: Vec<SignedShardStageReceipt>,
     pub verification: CompositeShardVerification,
+}
+
+/// Build the inbound `/phase/shard-stage/1.0.0` libp2p handler gated by live
+/// `NodeConfigStore::cluster_enabled` opt-in plus `PolicyEngine` authz/pause.
+///
+/// Turning `cluster_enabled` off in `node.toml` (via the Desktop app or
+/// `/api/lucid/settings`) immediately rejects inbound stage requests with zero
+/// daemon restart.
+pub fn make_opt_in_inbound_shard_stage_handler(
+    identity: Arc<NodeIdentity>,
+    local_peer_id: PeerId,
+    policy: Arc<PolicyEngine>,
+    node_config: Arc<NodeConfigStore>,
+    executor: Arc<dyn ShardStageExecutor>,
+) -> ShardStageHandler {
+    let inner = make_inbound_shard_stage_handler(identity, local_peer_id, policy, executor);
+    Arc::new(move |caller_peer: PeerId, request: ShardStageRequest| {
+        let inner = inner.clone();
+        let node_config = node_config.clone();
+        Box::pin(async move {
+            if !node_config.snapshot().cluster_enabled {
+                return ShardStageResponse {
+                    schema_version: SHARD_STAGE_SCHEMA_VERSION,
+                    session_id: request.session_id,
+                    stage_index: request.stage_index,
+                    kind: ShardStageResponseKind::Rejected {
+                        reason: "trusted-circle cluster mode is disabled by operator preference"
+                            .to_string(),
+                    },
+                };
+            }
+            inner(caller_peer, request).await
+        })
+    })
 }
 
 /// Build the inbound `/phase/shard-stage/1.0.0` libp2p handler for a serving
@@ -517,4 +646,91 @@ fn unix_time_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node_config::NodeConfig;
+
+    #[tokio::test]
+    async fn sandboxed_stage_process_rejects_relative_and_sha_mismatch_fail_closed() {
+        // Relative path rejected before touching filesystem.
+        let rel = SandboxedStageProcess::spawn_verified(&SandboxedStageProcessConfig {
+            binary_path: PathBuf::from("rpc-server"),
+            expected_sha256: "0".repeat(64),
+            loopback_port: 19991,
+            extra_args: Vec::new(),
+        })
+        .await;
+        assert!(rel.is_err());
+
+        // Real file with wrong SHA-256 rejected before spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_bin = dir.path().join("fake-rpc");
+        std::fs::write(&fake_bin, b"#!/bin/sh\necho nope\n").unwrap();
+        let bad_sha = SandboxedStageProcess::spawn_verified(&SandboxedStageProcessConfig {
+            binary_path: fake_bin,
+            expected_sha256: "f".repeat(64),
+            loopback_port: 19992,
+            extra_args: Vec::new(),
+        })
+        .await;
+        assert!(bad_sha
+            .err()
+            .map(|e| e.to_string().contains("SHA-256 mismatch"))
+            .unwrap_or(false));
+    }
+
+    struct NoopExec;
+
+    #[async_trait]
+    impl ShardStageExecutor for NoopExec {
+        async fn execute_stage(
+            &self,
+            _ctx: &ShardStageContext,
+            input_payload: &[u8],
+        ) -> Result<Vec<u8>> {
+            Ok(input_payload.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn opt_in_gate_rejects_immediately_while_cluster_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Arc::new(NodeIdentity::generate());
+        let peer_id = PeerId::random();
+        let policy = Arc::new(
+            PolicyEngine::load_or_default(Some(dir.path().join("policy.toml")))
+                .await
+                .unwrap(),
+        );
+        let node_cfg = NodeConfigStore::in_memory(NodeConfig::default()); // cluster_enabled = false
+        let handler = make_opt_in_inbound_shard_stage_handler(
+            id,
+            peer_id,
+            policy,
+            node_cfg,
+            Arc::new(NoopExec),
+        );
+        let resp = handler(
+            PeerId::random(),
+            ShardStageRequest {
+                schema_version: SHARD_STAGE_SCHEMA_VERSION,
+                session_id: [1_u8; 32],
+                stage_index: 0,
+                plan_bytes: b"{}".to_vec(),
+                input_payload: b"hi".to_vec(),
+                deadline_unix_ms: unix_time_ms() + 10_000,
+                idle_timeout_ms: 5_000,
+            },
+        )
+        .await;
+        match resp.kind {
+            ShardStageResponseKind::Rejected { reason } => {
+                assert!(reason.contains("cluster mode is disabled"));
+            }
+            other => panic!("expected Rejected when cluster_enabled=false, got {other:?}"),
+        }
+    }
 }
