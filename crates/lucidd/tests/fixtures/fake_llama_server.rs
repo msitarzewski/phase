@@ -130,10 +130,35 @@ async fn run_server() -> ! {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("valid host:port from args");
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("fake-llama-server bind {addr} failed: {e}");
+    // When a worker evicts a previous fixture on the same port and immediately
+    // spawns a replacement, the OS may need a few milliseconds to finish
+    // reaping the killed child's listening FD. Retry AddrInUse briefly so
+    // parallel/repeated test runs do not flake on transient teardown races.
+    let mut listener = None;
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 9 => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    let listener = match listener {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "fake-llama-server bind {addr} failed: {}",
+                last_err.unwrap_or_else(|| std::io::Error::other("unknown bind failure"))
+            );
             std::process::exit(1);
         }
     };

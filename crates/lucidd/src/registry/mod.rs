@@ -1781,6 +1781,45 @@ impl ModelRegistry {
         .await
     }
 
+    /// Import a verified local GGUF file (including nested LM Studio folders
+    /// and Ollama content-addressed `sha256-*` blobs whose header starts with
+    /// `GGUF`), verifying non-symlink containment inside `source_root`,
+    /// hashing into `artifact_store`, and publishing the signed alias.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_verified_gguf_file(
+        &self,
+        artifact_store: Arc<ArtifactStore>,
+        source_root: PathBuf,
+        source_path: PathBuf,
+        verified_model_dir: PathBuf,
+        alias: &str,
+        context_length: u32,
+        max_concurrent: u32,
+        backend: &str,
+    ) -> Result<ModelCapabilities> {
+        let normalized_alias = normalize_model_alias(alias)?;
+        let (model_cid, size_bytes) = tokio::task::spawn_blocking(move || {
+            import_gguf_file_bytes(
+                &artifact_store,
+                &source_root,
+                &source_path,
+                &verified_model_dir,
+            )
+        })
+        .await
+        .context("join verified GGUF file import task")??;
+
+        self.register_verified_alias(
+            &normalized_alias,
+            model_cid,
+            size_bytes,
+            context_length,
+            max_concurrent,
+            backend,
+        )
+        .await
+    }
+
     /// Register a blob that a pull coordinator has already downloaded and
     /// committed through [`ArtifactStore::commit_staged_blob`]. The stored
     /// bytes are independently re-hashed before the worker-visible hard link,
@@ -2661,6 +2700,58 @@ fn import_gguf_bytes(
     }
     if metadata.len() > MAX_MODEL_SIZE_BYTES {
         bail!("source GGUF exceeds the supported model size");
+    }
+
+    let (blob_id, size_bytes) = ArtifactStore::compute_blob_id(&canonical_source)?;
+    let installed =
+        artifact_store.install_blob_from_path(&canonical_source, &blob_id, size_bytes)?;
+    let model_cid = ModelCid::from_hex(blob_id.as_str())?;
+
+    publish_worker_model_link(
+        &installed.path,
+        verified_model_dir,
+        model_cid,
+        &blob_id,
+        size_bytes,
+    )?;
+    Ok((model_cid, size_bytes))
+}
+
+fn import_gguf_file_bytes(
+    artifact_store: &ArtifactStore,
+    source_root: &Path,
+    source_path: &Path,
+    verified_model_dir: &Path,
+) -> Result<(ModelCid, u64)> {
+    let canonical_root = source_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize source root {source_root:?}"))?;
+    let link_meta = std::fs::symlink_metadata(source_path)
+        .with_context(|| format!("inspect source GGUF {source_path:?}"))?;
+    if link_meta.file_type().is_symlink() {
+        bail!("source GGUF must not be a symlink");
+    }
+    let canonical_source = source_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize source GGUF {source_path:?}"))?;
+    if !canonical_source.starts_with(&canonical_root) {
+        bail!("source GGUF escapes its approved model root");
+    }
+    let metadata = canonical_source
+        .metadata()
+        .with_context(|| format!("inspect source GGUF {canonical_source:?}"))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        bail!("source GGUF must be a non-empty regular file");
+    }
+    if metadata.len() > MAX_MODEL_SIZE_BYTES {
+        bail!("source GGUF exceeds the supported model size");
+    }
+    let has_gguf_ext = canonical_source
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("gguf");
+    if !has_gguf_ext && !crate::runtime_manager::has_gguf_magic(&canonical_source) {
+        bail!("source model must have .gguf extension or valid GGUF header");
     }
 
     let (blob_id, size_bytes) = ArtifactStore::compute_blob_id(&canonical_source)?;

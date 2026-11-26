@@ -402,6 +402,10 @@ pub fn router(state: AppState) -> Router {
             post(handle_control_provide).layer(DefaultBodyLimit::max(4 * 1024)),
         )
         .route(
+            "/api/lucid/pull",
+            post(handle_control_pull).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
             "/api/lucid/folders",
             post(handle_control_folders).layer(DefaultBodyLimit::max(4 * 1024)),
         )
@@ -876,6 +880,8 @@ struct ProvideToggleRequest {
     confirm_permission: bool,
     #[serde(default)]
     make_available_locally: Option<bool>,
+    #[serde(default)]
+    local_path: Option<String>,
 }
 
 async fn handle_control_provide(
@@ -900,6 +906,17 @@ async fn handle_control_provide(
         );
     }
 
+    let probe = current_or_fresh_probe(&state).await;
+    // Match the approved model to a real read-only discovered file when present
+    // (covers Ollama blobs, LM Studio nested dirs, and user-added folders).
+    let discovered_match = probe.discovered_models.iter().find(|m| {
+        m.name == model_name
+            || req
+                .local_path
+                .as_deref()
+                .is_some_and(|p| p.trim() == m.path)
+    });
+
     let updated = match state.node_config.update(|cfg| {
         cfg.onboarding_completed = true;
         if req.enable {
@@ -910,8 +927,25 @@ async fn handle_control_provide(
             if !cfg.approved_local_models.iter().any(|m| m == &model_name) {
                 cfg.approved_local_models.push(model_name.clone());
             }
+            if let Some(found) = discovered_match {
+                let path = std::path::PathBuf::from(&found.path);
+                if path.is_absolute()
+                    && !cfg
+                        .approved_model_sources
+                        .iter()
+                        .any(|s| s.name == model_name)
+                {
+                    cfg.approved_model_sources
+                        .push(crate::node_config::ApprovedModelSource {
+                            name: model_name.clone(),
+                            path,
+                            source: found.source.clone(),
+                        });
+                }
+            }
         } else {
             cfg.approved_provide_models.retain(|m| m != &model_name);
+            cfg.approved_model_sources.retain(|s| s.name != model_name);
             if cfg.approved_provide_models.is_empty() {
                 cfg.providing_enabled = false;
             }
@@ -948,16 +982,110 @@ async fn handle_control_provide(
         tracing::warn!(error = %err, "failed to sync policy after provide toggle");
     }
 
-    let probe = current_or_fresh_probe(&state).await;
+    // Hot-import into the content-addressed store when this daemon already has
+    // an active store/worker so newly approved Ollama/LM-Studio/local models
+    // become verifiable immediately.
+    let mut imported_cid: Option<String> = None;
+    if req.enable {
+        if let (Some(found), Some(store), Some(verified_dir)) = (
+            discovered_match,
+            state.artifact_store.clone(),
+            state.verified_model_dir.clone(),
+        ) {
+            let src_path = std::path::PathBuf::from(&found.path);
+            if let Some(parent) = src_path.parent().map(std::path::Path::to_path_buf) {
+                match state
+                    .registry
+                    .import_verified_gguf_file(
+                        store,
+                        parent,
+                        src_path,
+                        verified_dir,
+                        &model_name,
+                        8192,
+                        1,
+                        "llama.cpp",
+                    )
+                    .await
+                {
+                    Ok(caps) => {
+                        imported_cid = Some(caps.model_cid.to_hex());
+                    }
+                    Err(err) => {
+                        tracing::warn!(model = %sanitize_for_log(&model_name), error = %err, "hot-import of approved local model deferred");
+                    }
+                }
+            }
+        }
+    }
+
     control_response(
         StatusCode::OK,
         serde_json::json!({
             "providing_enabled": updated.providing_enabled,
             "approved_provide_models": updated.approved_provide_models,
+            "imported_cid": imported_cid,
             "runtime_ready": probe.runtime.status == "ready",
             "restart_required": req.enable && state.model_dir.is_none() && probe.runtime.status == "ready",
         }),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlPullRequest {
+    model: String,
+    #[serde(default)]
+    cid: Option<String>,
+    #[serde(default)]
+    publisher: Option<String>,
+}
+
+async fn handle_control_pull(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ControlPullRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    let Some(plane) = state.content_plane.clone() else {
+        return control_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "Content store is not enabled on this node."}),
+        );
+    };
+    let selection = match parse_pull_selection(req.cid.as_deref(), req.publisher.as_deref()) {
+        Ok(sel) => sel,
+        Err(err) => {
+            return control_response(StatusCode::BAD_REQUEST, serde_json::json!({"error": err}));
+        }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PullProgress>(64);
+    let drain = tokio::spawn(async move {
+        let mut last = None;
+        while let Some(progress) = rx.recv().await {
+            last = Some(progress);
+        }
+        last
+    });
+    let result = plane.pull_selected(&req.model, selection, Some(tx)).await;
+    let _ = drain.await;
+    match result {
+        Ok(installed) => control_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "installed",
+                "model_id": installed.model_id,
+                "cid": installed.model_cid.to_hex(),
+                "size_bytes": installed.size_bytes,
+            }),
+        ),
+        Err(err) => control_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": format!("Model download failed: {err}")}),
+        ),
+    }
 }
 
 #[derive(Deserialize)]

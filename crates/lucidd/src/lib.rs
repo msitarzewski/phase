@@ -16,6 +16,7 @@
 #![deny(unsafe_code)]
 
 pub(crate) mod backend_io;
+pub mod bench;
 pub mod consumer;
 pub mod content;
 pub mod dht_transport;
@@ -27,6 +28,7 @@ pub mod registry;
 pub mod reputation;
 pub mod router;
 pub mod runtime_manager;
+pub mod shard_plan;
 pub mod worker_llama;
 pub mod worker_mlx;
 

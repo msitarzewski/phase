@@ -323,6 +323,7 @@ async fn set_provide_permission(
     enable: bool,
     confirm_permission: bool,
     make_available_locally: Option<bool>,
+    local_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     ctrl.api_post(
         &app,
@@ -332,8 +333,29 @@ async fn set_provide_permission(
             "enable": enable,
             "confirm_permission": confirm_permission,
             "make_available_locally": make_available_locally,
+            "local_path": local_path,
         }),
-        Duration::from_secs(15),
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pull_model(
+    app: AppHandle,
+    ctrl: State<'_, Arc<AppController>>,
+    model: String,
+    cid: Option<String>,
+) -> Result<serde_json::Value, String> {
+    ctrl.api_post(
+        &app,
+        "/api/lucid/pull",
+        serde_json::json!({
+            "model": model,
+            "cid": cid,
+        }),
+        Duration::from_secs(3600),
     )
     .await
     .map_err(|e| e.to_string())
@@ -747,6 +769,7 @@ pub fn run() {
             get_overview,
             refresh_probe,
             set_provide_permission,
+            pull_model,
             setup_runtime,
             add_model_folder,
             remove_model_folder,

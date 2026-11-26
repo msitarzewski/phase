@@ -126,13 +126,20 @@ export const lucidApi = {
     modelName: string,
     enable: boolean,
     confirmPermission: boolean,
-    makeAvailableLocally?: boolean
+    makeAvailableLocally?: boolean,
+    localPath?: string | null
   ) =>
     invoke<ProvideResponse>("set_provide_permission", {
       modelName,
       enable,
       confirmPermission,
       makeAvailableLocally: makeAvailableLocally ?? null,
+      localPath: localPath ?? null,
+    }),
+  pullModel: (model: string, cid?: string | null) =>
+    invoke<{ status: string; model_id: string; cid: string; size_bytes: number }>("pull_model", {
+      model,
+      cid: cid ?? null,
     }),
   setupRuntime: (action: "pin_detected" | "download_pinned", confirmPermission: boolean) =>
     invoke<{ detail: string; runtime: RuntimeBinaryStatus }>("setup_runtime", {

@@ -30,6 +30,14 @@ const MAX_MODEL_DIRS: usize = 16;
 const MAX_APPROVED_MODELS: usize = 256;
 const MAX_BOOTSTRAP_PEERS: usize = 8;
 
+/// A local model file explicitly approved by the user for serving.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedModelSource {
+    pub name: String,
+    pub path: PathBuf,
+    pub source: String,
+}
+
 /// Persistent user-approved node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +52,10 @@ pub struct NodeConfig {
     /// Explicit allowlist of model names/CIDs the user granted permission to
     /// provide to peers. Never implicitly populated by probing disk.
     pub approved_provide_models: Vec<String>,
+    /// Explicit file paths for user-approved local/Ollama/LM-Studio models so
+    /// startup can verify and import them into the content-addressed store
+    /// without scanning unapproved locations.
+    pub approved_model_sources: Vec<ApprovedModelSource>,
     /// Explicit list of models the user pinned for local app availability.
     pub approved_local_models: Vec<String>,
     /// Canonicalized local directories the user explicitly permitted LUCID to
@@ -69,6 +81,7 @@ impl Default for NodeConfig {
             onboarding_completed: false,
             providing_enabled: false,
             approved_provide_models: Vec::new(),
+            approved_model_sources: Vec::new(),
             approved_local_models: Vec::new(),
             model_dirs: Vec::new(),
             llama_server_binary: None,
@@ -251,8 +264,14 @@ fn validate_node_config(cfg: &NodeConfig) -> Result<()> {
     }
     if cfg.approved_provide_models.len() > MAX_APPROVED_MODELS
         || cfg.approved_local_models.len() > MAX_APPROVED_MODELS
+        || cfg.approved_model_sources.len() > MAX_APPROVED_MODELS
     {
         bail!("model allowlist exceeds maximum of {MAX_APPROVED_MODELS} entries");
+    }
+    for src in &cfg.approved_model_sources {
+        if !src.path.is_absolute() {
+            bail!("approved_model_sources path must be absolute");
+        }
     }
     if cfg.bootstrap_peers.len() > MAX_BOOTSTRAP_PEERS {
         bail!("at most {MAX_BOOTSTRAP_PEERS} bootstrap peers may be configured");

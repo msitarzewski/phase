@@ -686,3 +686,212 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
     .await
     .expect("HTTP boundary test exceeded 30 seconds");
 }
+
+#[tokio::test]
+async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox() {
+    let temp = tempfile::tempdir().expect("create isolated node temp dir");
+    let log_path = temp.path().join("lucidd.log");
+    let log = File::create(&log_path).expect("create daemon log");
+    let stderr = log.try_clone().expect("clone daemon log");
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let token_path = temp.path().join("control.token");
+    let node_cfg_path = temp.path().join("node.toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lucidd"))
+        .args([
+            "--mode",
+            "consume-only",
+            "--no-default-bootstrap",
+            "--outbound-only",
+            "--libp2p-port",
+            "0",
+        ])
+        .arg("--identity-path")
+        .arg(temp.path().join("identity.key"))
+        .arg("--policy-config")
+        .arg(temp.path().join("policy.toml"))
+        .arg("--node-config")
+        .arg(&node_cfg_path)
+        .arg("--control-token-file")
+        .arg(&token_path)
+        .arg("--artifact-dir")
+        .arg(temp.path().join("artifacts"))
+        .env("LUCIDD_HOST", "127.0.0.1")
+        .env("LUCIDD_PORT", port.to_string())
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn consume-only lucidd");
+
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Wait for readiness
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(resp) = client.get(&base_url).send().await {
+            if resp.status() == StatusCode::OK {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "daemon failed to become ready");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let token = std::fs::read_to_string(&token_path)
+        .expect("read auto-created private control token")
+        .trim()
+        .to_string();
+    assert!(!token.is_empty());
+
+    // 1. All new control endpoints reject unauthenticated callers.
+    for path in [
+        "/api/lucid/probe",
+        "/api/lucid/peers",
+        "/api/lucid/models",
+        "/api/lucid/runtime",
+    ] {
+        let unauth = client
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must require bearer token"
+        );
+    }
+
+    // 2. Read-only probe succeeds with bearer token and starts opt-in/off.
+    let probe: Value = client
+        .get(format!("{base_url}/api/lucid/probe"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(probe["onboarding_completed"], json!(false));
+    assert_eq!(probe["providing_enabled"], json!(false));
+    assert!(probe["hardware"]["cpu_cores"].as_u64().unwrap_or(0) >= 1);
+
+    // 3. Providing fails closed (428) without explicit confirm_permission: true.
+    let denied_provide = client
+        .post(format!("{base_url}/api/lucid/provide"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "model_name": "test-model",
+            "enable": true,
+            "confirm_permission": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_provide.status(), StatusCode::PRECONDITION_REQUIRED);
+
+    // 4. Runtime setup fails closed (428) without explicit confirm_permission: true.
+    let denied_runtime = client
+        .post(format!("{base_url}/api/lucid/runtime/setup"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "action": "pin_detected",
+            "confirm_permission": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_runtime.status(), StatusCode::PRECONDITION_REQUIRED);
+
+    // 5. Folder sandbox refuses sensitive system directories (/etc).
+    let blocked_folder = client
+        .post(format!("{base_url}/api/lucid/folders"))
+        .bearer_auth(&token)
+        .json(&json!({ "action": "add", "path": "/etc" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_folder.status(), StatusCode::BAD_REQUEST);
+
+    // 6. Valid model folder with a real GGUF header is discovered read-only.
+    let model_dir = temp.path().join("my-models");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("tiny-q4_k_m.gguf"),
+        b"GGUF\x03\x00\x00\x00synthetic-header-bytes",
+    )
+    .unwrap();
+    let add_folder = client
+        .post(format!("{base_url}/api/lucid/folders"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "action": "add",
+            "path": model_dir.display().to_string()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add_folder.status(), StatusCode::OK);
+    let add_body: Value = add_folder.json().await.unwrap();
+    let discovered = add_body["probe"]["discovered_models"]
+        .as_array()
+        .expect("discovered_models array");
+    assert!(
+        discovered.iter().any(|m| m["name"] == "tiny-q4_k_m"),
+        "expected tiny-q4_k_m in discovered models: {discovered:?}"
+    );
+
+    // 7. Granting explicit permission records node.toml and imports verified GGUF.
+    let grant = client
+        .post(format!("{base_url}/api/lucid/provide"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "model_name": "tiny-q4_k_m",
+            "enable": true,
+            "confirm_permission": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(grant.status(), StatusCode::OK);
+    let grant_body: Value = grant.json().await.unwrap();
+    assert_eq!(grant_body["providing_enabled"], json!(true));
+    assert!(
+        grant_body["imported_cid"]
+            .as_str()
+            .is_some_and(|c| c.len() == 64),
+        "expected hot-imported 64-hex CID, got {grant_body}"
+    );
+
+    // 8. Settings endpoint enforces thermal bounds and updates policy cleanly.
+    let bad_settings = client
+        .post(format!("{base_url}/api/lucid/settings"))
+        .bearer_auth(&token)
+        .json(&json!({ "thermal_limit_c": 200.0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_settings.status(), StatusCode::BAD_REQUEST);
+
+    let ok_settings = client
+        .post(format!("{base_url}/api/lucid/settings"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "manual_pause": true,
+            "auto_pause_on_battery": true,
+            "thermal_limit_c": 72.0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_settings.status(), StatusCode::OK);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -165,7 +165,13 @@
         await lucidApi.setupRuntime(action, true);
         runtimeBusy = false;
       }
-      const res = await lucidApi.setProvidePermission(model.name, enable, enable, true);
+      const res = await lucidApi.setProvidePermission(
+        model.name,
+        enable,
+        enable,
+        true,
+        model.local_path
+      );
       pendingProvideModel = null;
       if (res.restart_required) {
         overview = await lucidApi.restartDaemon();
@@ -202,7 +208,14 @@
         }
         let needsRestart = false;
         for (const name of chosen) {
-          const res = await lucidApi.setProvidePermission(name, true, true, true);
+          const disc = overview?.probe?.discovered_models.find((m) => m.name === name);
+          const res = await lucidApi.setProvidePermission(
+            name,
+            true,
+            true,
+            true,
+            disc?.path ?? null
+          );
           if (res.restart_required) needsRestart = true;
         }
         if (needsRestart) {
@@ -281,6 +294,21 @@
       await lucidApi.openChat(model.id);
     } catch (err) {
       errorBanner = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function handlePullModel(model: ModelEntry) {
+    try {
+      busy = true;
+      errorBanner = null;
+      showToast(`Downloading verified weights for ${model.name}…`);
+      await lucidApi.pullModel(model.name, model.cid);
+      await refresh();
+      showToast(`Downloaded & verified ${model.name}`);
+    } catch (err) {
+      errorBanner = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
     }
   }
 </script>
@@ -459,6 +487,14 @@
             {:else if !selectedModel.on_device}
               <button class="primary" onclick={() => (showJoinModal = true)}>
                 Join Network to Use
+              </button>
+            {/if}
+            {#if !selectedModel.on_device && selectedModel.peer_count > 0}
+              <button
+                disabled={busy}
+                onclick={() => selectedModel && handlePullModel(selectedModel)}
+              >
+                Download Locally (P2P)
               </button>
             {/if}
             <button

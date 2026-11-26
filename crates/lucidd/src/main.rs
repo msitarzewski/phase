@@ -110,6 +110,29 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:11435")]
         api: String,
     },
+    /// Run the whole-model independent-job baseline benchmark against a running
+    /// loopback LUCID daemon (measures p50/p95 TTFT, throughput, peer
+    /// distribution, and receipt verification; records no prompt payloads).
+    Bench {
+        /// Model name or CID to benchmark.
+        #[arg(long)]
+        model: String,
+        /// Total requests to dispatch (1..=10000).
+        #[arg(long, default_value_t = 12)]
+        requests: usize,
+        /// Maximum concurrent in-flight requests (1..=64).
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
+        /// Max tokens per request (1..=4096).
+        #[arg(long, default_value_t = 64)]
+        max_tokens: u32,
+        /// Local LUCID daemon URL (must be loopback).
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        api: String,
+        /// Optional path to write sanitized JSON report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -763,7 +786,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if cli.worker.is_some()
                 || (node_cfg.providing_enabled
                     && node_cfg.llama_server_binary.is_some()
-                    && !node_cfg.model_dirs.is_empty())
+                    && (!node_cfg.model_dirs.is_empty()
+                        || !node_cfg.approved_model_sources.is_empty()))
             {
                 NodeMode::Worker
             } else {
@@ -1020,15 +1044,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // persistent store so `/api/pull` can cache/resume content without
     // falsely claiming to have an inference worker loaded.
     let source_model_dir = if worker_choice == Some(WorkerChoice::LlamaCpp) {
-        Some(
-            cli.model_dir
-                .clone()
-                .or_else(|| node_cfg.model_dirs.first().cloned())
-                .ok_or("--model-dir is required with --worker llama-cpp")?,
-        )
+        cli.model_dir
+            .clone()
+            .or_else(|| node_cfg.model_dirs.first().cloned())
+            .or_else(|| {
+                node_cfg
+                    .approved_model_sources
+                    .first()
+                    .and_then(|s| s.path.parent().map(PathBuf::from))
+            })
     } else {
         None
     };
+    if worker_choice == Some(WorkerChoice::LlamaCpp)
+        && source_model_dir.is_none()
+        && node_cfg.approved_model_sources.is_empty()
+    {
+        return Err("--model-dir is required with --worker llama-cpp".into());
+    }
     let needs_content_store = source_model_dir.is_some()
         || effective_mode == NodeMode::ConsumeOnly
         || cli.serve_model_content
@@ -1174,54 +1207,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Auto-detect source GGUFs, verify their content, and publish
                 // signed alias→CID records before the worker can execute them.
+                // Also import any explicitly user-approved Ollama/LM-Studio/
+                // multi-folder models persisted in node.toml.
                 {
-                    let entries = std::fs::read_dir(&model_dir).map_err(|error| {
-                        format!("cannot read --model-dir {}: {error}", model_dir.display())
-                    })?;
                     let mut advertised = 0usize;
-                    for entry in entries {
-                        let entry = entry.map_err(|error| {
-                            format!(
-                                "cannot enumerate --model-dir {}: {error}",
-                                model_dir.display()
-                            )
+                    let mut scan_dirs = Vec::new();
+                    if let Some(cli_dir) = &cli.model_dir {
+                        scan_dirs.push(cli_dir.clone());
+                    } else {
+                        scan_dirs.extend(node_cfg.model_dirs.iter().cloned());
+                    }
+                    for dir in &scan_dirs {
+                        let entries = std::fs::read_dir(dir).map_err(|error| {
+                            format!("cannot read --model-dir {}: {error}", dir.display())
                         })?;
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) != Some("gguf") {
-                            continue;
-                        }
-                        let Some(model_id) =
-                            path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
-                        else {
-                            continue;
-                        };
-                        match registry
-                            .import_verified_gguf(
-                                artifact_store.clone(),
-                                model_dir.clone(),
-                                path,
-                                verified_model_dir.clone(),
-                                &model_id,
-                                cli.llama_ctx_size as u32,
-                                1,
-                                "llama.cpp",
-                            )
-                            .await
-                        {
-                            Ok(caps) => {
-                                advertised += 1;
-                                tracing::info!(
-                                    model = %model_id,
-                                    cid = %caps.model_cid.to_hex(),
-                                    "verified and advertised local model"
-                                );
+                        for entry in entries {
+                            let entry = entry.map_err(|error| {
+                                format!("cannot enumerate --model-dir {}: {error}", dir.display())
+                            })?;
+                            let path = entry.path();
+                            if path.extension().and_then(|s| s.to_str()) != Some("gguf") {
+                                continue;
                             }
-                            Err(error) => {
-                                tracing::warn!(
-                                    model = %model_id,
-                                    error = %error,
-                                    "failed to verify/import local model"
-                                );
+                            let Some(model_id) =
+                                path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                            else {
+                                continue;
+                            };
+                            match registry
+                                .import_verified_gguf(
+                                    artifact_store.clone(),
+                                    dir.clone(),
+                                    path,
+                                    verified_model_dir.clone(),
+                                    &model_id,
+                                    cli.llama_ctx_size as u32,
+                                    1,
+                                    "llama.cpp",
+                                )
+                                .await
+                            {
+                                Ok(caps) => {
+                                    advertised += 1;
+                                    tracing::info!(
+                                        model = %model_id,
+                                        cid = %caps.model_cid.to_hex(),
+                                        "verified and advertised local model"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        model = %model_id,
+                                        error = %error,
+                                        "failed to verify/import local model"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if cli.model_dir.is_none() {
+                        for approved in &node_cfg.approved_model_sources {
+                            let Some(parent) = approved.path.parent().map(PathBuf::from) else {
+                                continue;
+                            };
+                            match registry
+                                .import_verified_gguf_file(
+                                    artifact_store.clone(),
+                                    parent,
+                                    approved.path.clone(),
+                                    verified_model_dir.clone(),
+                                    &approved.name,
+                                    cli.llama_ctx_size as u32,
+                                    1,
+                                    "llama.cpp",
+                                )
+                                .await
+                            {
+                                Ok(caps) => {
+                                    advertised += 1;
+                                    tracing::info!(
+                                        model = %approved.name,
+                                        source = %approved.source,
+                                        cid = %caps.model_cid.to_hex(),
+                                        "verified and advertised approved local/Ollama model"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        model = %approved.name,
+                                        error = %error,
+                                        "failed to verify/import approved local/Ollama model"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1611,6 +1688,52 @@ async fn run_cli_subcommand(
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        Command::Bench {
+            model,
+            requests,
+            concurrency,
+            max_tokens,
+            api,
+            output,
+        } => {
+            let base = validate_loopback_api_base(&api)?;
+            let report = lucidd::bench::run_benchmark(lucidd::bench::BenchConfig {
+                api_base: base,
+                model,
+                total_requests: requests,
+                concurrency,
+                max_tokens,
+                timeout_secs: 180,
+            })
+            .await?;
+            println!(
+                "Model: {} | Requests: {}/{} ok | Verified receipts: {} | Throughput: {:.2} jobs/s ({:.1} chunks/s)",
+                report.model,
+                report.succeeded,
+                report.total_requests,
+                report.receipt_verified_count,
+                report.jobs_per_second,
+                report.chunks_per_second
+            );
+            println!(
+                "TTFT p50/p95: {:?} / {:?} ms | Duration p50/p95: {:?} / {:?} ms",
+                report.ttft_p50_ms.map(|v| v.round()),
+                report.ttft_p95_ms.map(|v| v.round()),
+                report.duration_p50_ms.map(|v| v.round()),
+                report.duration_p95_ms.map(|v| v.round()),
+            );
+            println!("Route distribution: {:?}", report.route_distribution);
+            if let Some(out_path) = output {
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+                println!("Saved sanitized benchmark report: {}", out_path.display());
+            }
             Ok(())
         }
     }

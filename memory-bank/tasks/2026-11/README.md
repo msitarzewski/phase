@@ -2,6 +2,12 @@
 
 ## Tasks Completed
 
+### 2026-11-25: Ollama/Multi-Folder Serving, Control API Tests, `lucidd bench`, & `ShardWorker` Foundation
+- Wired Ollama blob (`sha256-*`), LM Studio, and multi-folder GGUF verification/serving (`import_verified_gguf_file`, `approved_model_sources`, hot-import on `POST /api/lucid/provide`) plus 1-click `POST /api/lucid/pull` in `apps/lucid-desktop`.
+- Added real-process HTTP contract tests for `/api/lucid/*` (`401`/`428`/folder sandbox/hot-import/settings) and fixed the `fake_llama_server` `AddrInUse` teardown flake (5/5 repeats green).
+- Implemented `lucidd bench` (`crates/lucidd/src/bench.rs`) for the whole-model multi-peer baseline and the Tier-1 `ShardWorker` planner + composite stage-receipt verifier (`crates/lucidd/src/shard_plan.rs`) + full 7-question ADR draft (`memory-bank/releases/lucid-v0.2/shardworker-adr.md`).
+- See: [261125_shardworker-foundation-and-bench.md](./261125_shardworker-foundation-and-bench.md).
+
 ### 2026-11-23: Apple-Simple Self-Configuring `lucidd` & Cross-Platform Tauri v2 Desktop App
 - Built Phase 1 (`crates/lucidd/src/{node_config.rs,runtime_manager.rs,ollama/mod.rs,policy.rs,main.rs}`): read-only hardware/GPU/Ollama/LM-Studio/GGUF probe, persistent `0600` `node.toml`, SHA-256-pinned `llama.cpp b12651` runtime installer, explicit permission-first `/api/lucid/*` control endpoints, zero-flag safe startup (`NodeMode::Auto`), and CLI subcommands (`probe`, `models`, `peers`, `invite`, `join`).
 - Built Phase 2 (`apps/lucid-desktop/`): sandboxed cross-platform Tauri v2 + Svelte 5 desktop app (`#![deny(unsafe_code)]`, token isolation from WebView, strict CSP, minimal capabilities, permission-first onboarding, `lucid://` deep links, system tray) producing `.dmg` (macOS Apple Silicon, 14.06 MiB) and `.deb` (Ubuntu x86_64 & ARM64) installers in `.github/workflows/release.yml`.
