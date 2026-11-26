@@ -130,8 +130,9 @@ if [[ "$(id -u)" -eq 0 ]]; then
     chmod 0750 "$SVC_HOME"
 
     # Install binary as unprivileged user (SHA-256 verified fail-closed).
+    # `cd` out of `/root` first so `find` inside the installer can restore cwd.
     su -s /bin/bash "$SERVICE_USER" -c \
-        "bash $(printf '%q' "$INSTALLER") --repo $(printf '%q' "$REPO") --tag $(printf '%q' "$TAG") --prefix $(printf '%q' "$SVC_PREFIX")"
+        "cd $(printf '%q' "$SVC_HOME") && bash $(printf '%q' "$INSTALLER") --repo $(printf '%q' "$REPO") --tag $(printf '%q' "$TAG") --prefix $(printf '%q' "$SVC_PREFIX")"
 
     install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "${SVC_HOME}/.config/lucidd" "${SVC_HOME}/.config/phase"
     ENV_FILE="${SVC_HOME}/.config/lucidd/infrastructure.env"
