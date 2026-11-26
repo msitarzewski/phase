@@ -231,6 +231,7 @@ echo "==> Waiting for relay PeerId..."
 PEER_ID=""
 for _ in $(seq 1 15); do
     PEER_ID="$("${JOURNAL_CMD[@]}" 2>/dev/null \
+        | grep -E 'Local peer ID:|local_peer_id=' \
         | grep -oE '12D3KooW[1-9A-HJ-NP-Za-km-z]{40,60}' | tail -n 1 || true)"
     if [[ -n "$PEER_ID" ]]; then
         break
