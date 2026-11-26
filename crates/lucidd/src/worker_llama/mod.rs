@@ -774,11 +774,11 @@ fn spawn_llama_server(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    // `--jinja` enables modern chat templates + tool calling. Research
-    // brief flags this as "always set"; without it tool calls get silently
-    // dropped on the OpenAI-compat path. We don't use that path today but
-    // the cost of enabling it is zero.
+    // `--jinja` enables modern chat templates + tool calling. `--cache-reuse 256`
+    // enables KV-cache prompt-prefix shifting reuse across multi-turn chats and
+    // concurrent batch slots.
     cmd.arg("--jinja");
+    cmd.arg("--cache-reuse").arg("256");
     // Capture stdout/stderr so the supervisor can drain them (otherwise
     // a chatty child fills its pipe and blocks).
     cmd.stdin(Stdio::null());

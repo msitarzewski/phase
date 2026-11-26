@@ -244,6 +244,27 @@ pub struct Router {
     evidence: Option<Arc<EvidenceRuntime>>,
     redundant_config: RedundantVerificationConfig,
     redundant_gate: Arc<Semaphore>,
+    /// Live count of active remote jobs dispatched to each peer, used to spread
+    /// concurrent requests across equally-ranked healthy peers.
+    in_flight_by_peer: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>,
+}
+
+struct InFlightPeerGuard {
+    peer_id: PeerId,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>,
+}
+
+impl Drop for InFlightPeerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.counts.lock() {
+            if let Some(entry) = map.get_mut(&self.peer_id) {
+                *entry = entry.saturating_sub(1);
+                if *entry == 0 {
+                    map.remove(&self.peer_id);
+                }
+            }
+        }
+    }
 }
 
 impl Router {
@@ -269,6 +290,7 @@ impl Router {
             evidence: None,
             redundant_config: RedundantVerificationConfig::default(),
             redundant_gate: Arc::new(Semaphore::new(1)),
+            in_flight_by_peer: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -435,7 +457,23 @@ impl Router {
             .filter(|(_, assessment)| assessment.class != AssessmentClass::Blocked)
             .collect::<Vec<_>>();
         let blocked_count = peer_ids.len().saturating_sub(allowed.len());
-        allowed.sort_by(|left, right| compare_assessments(&left.1, &right.1));
+        let in_flight_snapshot = self
+            .in_flight_by_peer
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        allowed.sort_by(|left, right| {
+            let left_load = in_flight_snapshot.get(&left.0 .0).copied().unwrap_or(0);
+            let right_load = in_flight_snapshot.get(&right.0 .0).copied().unwrap_or(0);
+            // Spread concurrent requests across peers within the same healthy
+            // assessment class when one peer already has active in-flight work.
+            // When all peers are idle (0 in-flight), ordering is strictly
+            // identical to `compare_assessments`.
+            if left.1.class == right.1.class && left_load != right_load {
+                return left_load.cmp(&right_load);
+            }
+            compare_assessments(&left.1, &right.1)
+        });
 
         // Preserve one bounded cold-start opportunity near the front without
         // letting unlimited fresh identities displace an observed or pinned
@@ -497,7 +535,7 @@ impl Router {
             // ranking comes from the registry (route step 4). `SignedManifest`
             // is Clone, so each attempt gets its own copy of the job.
             RouteVia::Peer { peer_id } => {
-                match self.execute_via_peer(*peer_id, job.clone()).await {
+                match self.execute_via_peer_tracked(*peer_id, job.clone()).await {
                     Ok(execution) => Ok(self.attach_redundant_probe(
                         *peer_id,
                         decision.fallback_peers.first().copied(),
@@ -507,7 +545,7 @@ impl Router {
                     Err(first_err) => {
                         for (index, fb) in decision.fallback_peers.iter().enumerate() {
                             warn!(failed_peer = %peer_id, next = %fb, "relay failed; failing over to next peer");
-                            match self.execute_via_peer(*fb, job.clone()).await {
+                            match self.execute_via_peer_tracked(*fb, job.clone()).await {
                                 Ok(execution) => {
                                     let duplicate = decision.fallback_peers[index + 1..]
                                         .iter()
@@ -527,6 +565,30 @@ impl Router {
                 }
             }
         }
+    }
+
+    async fn execute_via_peer_tracked(
+        &self,
+        peer_id: PeerId,
+        job: SignedManifest<JobSpec>,
+    ) -> Result<(JobHandle, JobStream, ReceiptVerification), RouterError> {
+        {
+            if let Ok(mut map) = self.in_flight_by_peer.lock() {
+                *map.entry(peer_id).or_insert(0) += 1;
+            }
+        }
+        let guard = InFlightPeerGuard {
+            peer_id,
+            counts: Arc::clone(&self.in_flight_by_peer),
+        };
+        let (handle, mut inner_stream, verification) = self.execute_via_peer(peer_id, job).await?;
+        let tracked_stream: JobStream = Box::pin(stream! {
+            let _guard = guard;
+            while let Some(event) = futures::StreamExt::next(&mut inner_stream).await {
+                yield event;
+            }
+        });
+        Ok((handle, tracked_stream, verification))
     }
 
     fn attach_redundant_probe(

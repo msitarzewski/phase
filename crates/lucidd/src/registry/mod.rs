@@ -1301,6 +1301,10 @@ pub struct ModelRegistry {
     catalog_publication: Arc<Mutex<()>>,
     catalog_query: Mutex<()>,
     network_catalog: RwLock<NetworkCatalogCache>,
+    /// Short-TTL, bounded cache of cryptographically verified, conflict-free
+    /// alias→CID resolutions to avoid repeating WAN DHT lookups on every
+    /// `/api/chat` request.
+    alias_cid_cache: RwLock<HashMap<String, (ModelCid, tokio::time::Instant)>>,
 }
 
 impl ModelRegistry {
@@ -1475,6 +1479,7 @@ impl ModelRegistry {
             catalog_publication: Arc::new(Mutex::new(())),
             catalog_query: Mutex::new(()),
             network_catalog: RwLock::new(NetworkCatalogCache::default()),
+            alias_cid_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1535,6 +1540,7 @@ impl ModelRegistry {
             catalog_publication: Arc::new(Mutex::new(())),
             catalog_query: Mutex::new(()),
             network_catalog: RwLock::new(NetworkCatalogCache::default()),
+            alias_cid_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1752,7 +1758,26 @@ impl ModelRegistry {
         {
             return Ok(Some(caps.model_cid));
         }
-        self.resolve_alias_cid(normalized).await
+        {
+            let cache = self.alias_cid_cache.read().await;
+            if let Some((cid, cached_at)) = cache.get(normalized) {
+                if cached_at.elapsed() < CATALOG_REFRESH_INTERVAL {
+                    return Ok(Some(*cid));
+                }
+            }
+        }
+        let resolved = self.resolve_alias_cid(normalized).await?;
+        if let Some(cid) = resolved {
+            let mut cache = self.alias_cid_cache.write().await;
+            if cache.len() >= 256 {
+                cache.retain(|_, (_, at)| at.elapsed() < CATALOG_REFRESH_INTERVAL);
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+            }
+            cache.insert(normalized.to_string(), (cid, tokio::time::Instant::now()));
+        }
+        Ok(resolved)
     }
 
     /// Import one GGUF into the verified content store and make it eligible
@@ -2100,12 +2125,15 @@ impl ModelRegistry {
     /// Publish a signed human alias after the caller has verified and
     /// atomically installed the referenced content.
     pub async fn publish_alias(&self, record: AliasRecord) -> Result<()> {
+        let alias_name = record.alias.clone();
         let key = alias_dht_key(&record.alias)?;
         let signed = SignedAliasRecord::sign(record, &self.identity)?;
         self.transport
             .put_record(key, signed.encode()?)
             .await
-            .context("publish signed model alias")
+            .context("publish signed model alias")?;
+        self.alias_cid_cache.write().await.remove(&alias_name);
+        Ok(())
     }
 
     /// Explicitly opt one installed CID into content serving. Callers must only
@@ -2589,9 +2617,8 @@ impl ModelRegistry {
         &self,
         model_cid: &ModelCid,
     ) -> Result<Vec<(PeerId, ModelCapabilities)>> {
-        {
+        let lookup_cached = |cache: &NetworkCatalogCache| -> Vec<(PeerId, ModelCapabilities)> {
             let now = unix_ms_now();
-            let cache = self.network_catalog.read().await;
             let mut candidates = cache
                 .models
                 .iter()
@@ -2606,6 +2633,25 @@ impl ModelRegistry {
             // for routing and redundant-verification eligibility. The merged
             // model-list display summary is not a peer capability record.
             candidates.sort_by_key(|(peer, _)| *peer);
+            candidates
+        };
+        let needs_catalog_refresh = {
+            let cache = self.network_catalog.read().await;
+            let candidates = lookup_cached(&cache);
+            if !candidates.is_empty() {
+                return Ok(candidates);
+            }
+            cache
+                .refreshed
+                .is_none_or(|at| at.elapsed() >= CATALOG_REFRESH_INTERVAL)
+        };
+        // Refresh the multi-peer catalog before falling back to the legacy
+        // single-key DHT record (which is last-writer-wins on Kademlia and
+        // can hide additional peers serving the same model CID).
+        if needs_catalog_refresh {
+            let _ = self.discover_network_models().await;
+            let cache = self.network_catalog.read().await;
+            let candidates = lookup_cached(&cache);
             if !candidates.is_empty() {
                 return Ok(candidates);
             }
@@ -2798,20 +2844,51 @@ fn publish_worker_model_link(
         .with_context(|| format!("create verified model directory {verified_model_dir:?}"))?;
     let worker_path = verified_model_dir.join(format!("{}.gguf", model_cid.to_hex()));
     match fs::hard_link(installed_path, &worker_path) {
-        Ok(()) => {}
+        Ok(()) => {
+            // `installed_path` was just verified by the caller and `worker_path`
+            // is a brand-new hard link to the exact same inode; confirm size
+            // matches without re-hashing multi-GB weights a second time.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let src = fs::symlink_metadata(installed_path)?;
+                let dst = fs::symlink_metadata(&worker_path)?;
+                if dst.file_type().is_file()
+                    && src.dev() == dst.dev()
+                    && src.ino() == dst.ino()
+                    && dst.len() == size_bytes
+                {
+                    return Ok(());
+                }
+            }
+            verify_worker_model_link(&worker_path, blob_id, size_bytes)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_worker_model_link(&worker_path, blob_id, size_bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let (Ok(src), Ok(dst)) = (
+                    fs::symlink_metadata(installed_path),
+                    fs::symlink_metadata(&worker_path),
+                ) {
+                    if dst.file_type().is_file()
+                        && src.dev() == dst.dev()
+                        && src.ino() == dst.ino()
+                        && dst.len() == size_bytes
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            verify_worker_model_link(&worker_path, blob_id, size_bytes)
         }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "publish verified worker model {:?} from {:?}",
-                    worker_path, installed_path
-                )
-            });
-        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "publish verified worker model {:?} from {:?}",
+                worker_path, installed_path
+            )
+        }),
     }
-    verify_worker_model_link(&worker_path, blob_id, size_bytes)
 }
 
 fn verify_worker_model_link(path: &Path, expected_id: &BlobId, expected_size: u64) -> Result<()> {

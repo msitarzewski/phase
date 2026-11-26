@@ -185,12 +185,13 @@ pub fn default_runtime_dir() -> Result<PathBuf> {
     Ok(base.join("lucidd").join("runtime"))
 }
 
-/// Compute lowercase hex SHA-256 of a regular file on disk.
+/// Compute lowercase hex SHA-256 of a regular file on disk using
+/// hardware-accelerated SHA-256 (`ring`) with a bounded 1 MiB read buffer.
 pub fn sha256_file_hex(path: &Path) -> Result<String> {
     let mut file = File::open(path)
         .with_context(|| format!("failed to open {} for hashing", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -198,7 +199,7 @@ pub fn sha256_file_hex(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hex::encode(hasher.finish().as_ref()))
 }
 
 /// Run a strictly read-only probe of host hardware, existing inference tools

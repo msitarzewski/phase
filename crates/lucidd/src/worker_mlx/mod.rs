@@ -925,7 +925,7 @@ fn hash_regular_file(
         return Err("file changed before it was opened".into());
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = vec![0u8; FILE_HASH_BUFFER_BYTES];
     let mut read_bytes = 0u64;
     loop {
@@ -955,7 +955,10 @@ fn hash_regular_file(
     {
         return Err("file changed while hashing".into());
     }
-    Ok((hasher.finalize().into(), opened_identity))
+    let digest = hasher.finish();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    Ok((out, opened_identity))
 }
 
 fn read_verified_context_length(
@@ -1631,6 +1634,8 @@ struct OpenAiDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 fn parse_sse_frame(frame: &[u8], endpoint: Endpoint) -> Result<FrameAction, String> {
@@ -1679,6 +1684,7 @@ fn parse_sse_frame(frame: &[u8], endpoint: Endpoint) -> Result<FrameAction, Stri
     let text = match endpoint {
         Endpoint::Chat => {
             let mut text = choice.delta.reasoning_content.unwrap_or_default();
+            text.push_str(&choice.delta.reasoning.unwrap_or_default());
             text.push_str(&choice.delta.content.unwrap_or_default());
             text
         }

@@ -565,6 +565,19 @@ fn chat_sse_preserves_reasoning_and_content_text() {
             terminal: None,
         }
     );
+
+    let mlx32_action = parse_sse_frame(
+        br#"data: {"choices":[{"delta":{"reasoning":"plan ","content":"done"},"finish_reason":null}]}"#,
+        Endpoint::Chat,
+    )
+    .unwrap();
+    assert_eq!(
+        mlx32_action,
+        FrameAction::Delta {
+            text: "plan done".into(),
+            terminal: None,
+        }
+    );
 }
 
 #[test]

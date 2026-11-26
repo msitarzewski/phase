@@ -25,10 +25,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use tracing::warn;
 
-/// Bounded buffer used while hashing and copying blobs. Blob installation is
-/// intentionally independent of artifact size; no whole-file allocation is
-/// required by the store.
-const BLOB_COPY_BUFFER_BYTES: usize = 64 * 1024;
+/// Bounded buffer used while hashing and copying blobs (1 MiB heap-allocated).
+/// Blob installation is intentionally independent of artifact size; no
+/// whole-file allocation is required by the store.
+const BLOB_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Process-local uniqueness for staging files. create_new(true) remains the
 /// authoritative collision guard, including against stale files after a crash.
@@ -497,9 +497,12 @@ impl ArtifactStore {
     }
 
     fn hash_reader<R: Read>(mut reader: R) -> Result<(BlobId, u64)> {
-        let mut hasher = Sha256::new();
+        // Use ring's hardware-accelerated SHA-256 (ARMv8 Crypto / x86 SHA-NI
+        // with runtime CPUID detection) to keep multi-GB model hashing fast
+        // without sacrificing portability on older CPUs.
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
         let mut total = 0u64;
-        let mut buffer = [0u8; BLOB_COPY_BUFFER_BYTES];
+        let mut buffer = vec![0u8; BLOB_COPY_BUFFER_BYTES];
 
         loop {
             let bytes_read = reader
@@ -514,7 +517,7 @@ impl ArtifactStore {
             hasher.update(&buffer[..bytes_read]);
         }
 
-        Ok((BlobId(hex::encode(hasher.finalize())), total))
+        Ok((BlobId(hex::encode(hasher.finish().as_ref())), total))
     }
 
     fn copy_and_hash<R: Read, W: Write>(
@@ -522,9 +525,9 @@ impl ArtifactStore {
         mut writer: W,
         expected_size: u64,
     ) -> Result<(BlobId, u64)> {
-        let mut hasher = Sha256::new();
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
         let mut total = 0u64;
-        let mut buffer = [0u8; BLOB_COPY_BUFFER_BYTES];
+        let mut buffer = vec![0u8; BLOB_COPY_BUFFER_BYTES];
 
         loop {
             let bytes_read = reader
@@ -548,7 +551,7 @@ impl ArtifactStore {
         }
 
         writer.flush().context("flush staged blob")?;
-        Ok((BlobId(hex::encode(hasher.finalize())), total))
+        Ok((BlobId(hex::encode(hasher.finish().as_ref())), total))
     }
 
     fn verify_blob_identity(

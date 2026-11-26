@@ -1,12 +1,20 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-11-25
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 implementation checkpoint + self-configuring `lucidd` & cross-platform Tauri v2 desktop app (`v0.2.0-rc3`) + `lucidd bench` & Tier-1 `ShardWorker` planner (`b5bcee9`)
-**Phase**: LUCID v0.2 implementation is active but unreleased. Seven milestones are in progress, Intended-Stream Vertical Slice and ShardWorker are blocked on explicit gates, and Core AI is not started. Local macOS ARM64 QA and all 6 GitHub Actions CI jobs (`rustfmt`, `clippy`, `cargo audit + cargo deny`, `test (workspace)`, `native macOS app`, `desktop app (Tauri v2)`) pass with 0 vulnerabilities on `feat/lucid-consumer-experience`; `v0.2.0-rc3` release bundles (`.dmg` + `.deb` + CLI tarballs) and `scripts/setup-cloud-relay.sh` are ready for physical fleet qualification.
+**Last Updated**: 2026-11-26
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 physical fleet qualification (`v0.2.0-rc4` → `v0.2.0-rc6` live on all 5 nodes, `v0.2.0-rc7` performance sprint)
+**Phase**: LUCID v0.2 physical fleet qualification is active and advancing rapidly across all 5 hardware nodes (Cloud Relay, Ubuntu Desktop, Ubuntu Laptop, Mac M1 Max, Mac M5 Max). Full scorecard & benchmark trend live in [fleet-progress-report.md](releases/lucid-v0.2/fleet-progress-report.md).
 
 ---
 
 ## Major Deliverables
+
+### Physical Fleet Qualification & Performance Iteration (`v0.2.0-rc4` → `v0.2.0-rc7`, 2026-11-26)
+
+- **Live 5-Node Physical Fleet & Public DNS**: Provisioned hardened Cloud Relay (`User=lucid`, TCP `4001`, `18.5 MiB` RSS, Caddy untouched) and updated `bootstrap.phasebased.net` TXT via Porkbun v3 API; verified zero-config bootstrap across Mac M5 Max (`366 ms`), Ubuntu Desktop (`51 ms` relay reservation), Mac M1 Max, and Ubuntu Laptop (`DCUtR`).
+- **Benchmark Progression (`lucidd bench`, `100%` verified Ed25519 receipts)**: Progressed from `3.7 ch/s` (`4,468 ms` TTFT p50, Run #1 CPU fallback) → `12.0 tok/s` (`2,710 ms`, Run #2 Mac M1 Max Metal `c=2`) → `24.1 tok/s` (`2,422 ms`, Run #4 `c=4`) → **`24.7 tok/s`** (`1,696 ms` TTFT p50, **`-30%` TTFT**, **`6.7×` Run #1**, Run #5B `v0.2.0-rc7`).
+- **Physical 10.18 GB P2P Pull + Interrupt & Resume**: Pulled `qwen3.8-iq3xxs:latest` (`10,934,860,704 B`) from Ubuntu Desktop → Mac M1 Max, interrupted at `172 MiB`, resumed at exact byte offset (`180,289,536 B`), SHA-256 verified (`c0b7c303…`), and installed read-only.
+- **Security & Portability Hardening**: Verified default-deny rejection of uninvited DCUtR-connected Ubuntu Laptop; fixed 2012 Ivy Bridge BMI1 `andn` `SIGILL` via baseline `x86-64` Linux release flags; fixed `:latest` human-name routing in `ModelRegistry::resolve_model_cid`; honored `node.toml` `serve_model_content`; added Ollama CUDA-12 library discovery + graceful stale-runtime fallback; cut startup catalog restore from `20.19s → 9.2 ms` (2,194×) + eliminated inode triple-hashing + switched multi-GB SHA-256 to hardware-accelerated `ring::digest::SHA256` (`~2.7 GB/s`, 7.8× faster); added short-TTL verified alias cache, multi-peer catalog refresh in `find_peers_for_model`, in-flight load-aware peer spreading, and `--cache-reuse 256`.
+- **Tier-1 `ShardWorker` Real GGUF Validation**: Inspected real `86.7 GB` `DeepSeek-V4-Flash` GGUF in `<100 ms` into a coordinator-signed 3-stage fleet plan (`43 layers`).
 
 ### Self-configuring `lucidd`, Tauri v2 desktop app, `lucidd bench`, & Tier-1 `ShardWorker` foundation (2026-11-23 → 2026-11-25)
 
