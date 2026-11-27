@@ -11,8 +11,8 @@
 #     (`User=lucid`, `NoNewPrivileges=true`, `ProtectSystem=strict`,
 #     `ProtectHome=read-only`, `MemoryDenyWriteExecute=true`).
 #   - Verifies the downloaded release archive against SHA256SUMS.txt fail-closed.
-#   - Opens ONLY inbound TCP 4001 in ufw (leaves 80/443, SSH, Caddy, and
-#     Tailscale untouched).
+#   - Opens ONLY the configured inbound TCP relay port in ufw (leaves other
+#     services, SSH, Caddy, and Tailscale untouched).
 #   - Rejects loopback, RFC1918, and Tailscale CGNAT (100.64.0.0/10) IPs.
 
 set -euo pipefail
@@ -20,6 +20,7 @@ set -euo pipefail
 REPO="${PHASE_RELEASE_REPO:-msitarzewski/phase}"
 TAG="${PHASE_RELEASE_TAG:-v0.2.0-rc4}"
 PUBLIC_IP=""
+RELAY_PORT=4001
 SKIP_FIREWALL=0
 PREFIX="${HOME}/.local"
 SERVICE_USER="lucid"
@@ -35,8 +36,9 @@ Options:
   --ip IPV4             Static public IPv4 address (auto-detected if omitted)
   --tag TAG             GitHub Release tag to install (default: v0.2.0-rc4)
   --repo OWNER/REPO     GitHub repository (default: msitarzewski/phase)
+  --port PORT           Relay TCP port: 4001 (default) or 443
   --prefix DIR          Install prefix for bin/lucidd (non-root mode, default: ~/.local)
-  --no-firewall         Skip adding the `ufw allow 4001/tcp` rule
+  --no-firewall         Skip adding the relay TCP rule to ufw
   -h, --help            Show this help
 EOF
 }
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --ip) PUBLIC_IP="$2"; shift 2 ;;
         --tag) TAG="$2"; shift 2 ;;
         --repo) REPO="$2"; shift 2 ;;
+        --port) RELAY_PORT="$2"; shift 2 ;;
         --prefix) PREFIX="$2"; shift 2 ;;
         --no-firewall) SKIP_FIREWALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -53,8 +56,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$RELAY_PORT" in
+    4001|443) ;;
+    *)
+        echo "ERROR: --port must be 4001 or 443." >&2
+        exit 1
+        ;;
+esac
+
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "ERROR: Cloud Relay setup must run on Linux." >&2
+    exit 1
+fi
+
+if [[ "$RELAY_PORT" -eq 443 && "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: --port 443 requires root setup so systemd can grant only CAP_NET_BIND_SERVICE to the unprivileged User=lucid process." >&2
     exit 1
 fi
 
@@ -96,7 +112,7 @@ if [[ -z "$PUBLIC_IP" ]] || ! is_public_ipv4 "$PUBLIC_IP"; then
     exit 1
 fi
 
-echo "==> Setting up LUCID Cloud Relay (${TAG}) on public IPv4 ${PUBLIC_IP}:4001"
+echo "==> Setting up LUCID Cloud Relay (${TAG}) on public IPv4 ${PUBLIC_IP}:${RELAY_PORT}"
 
 # Locate or download install-lucid.sh once.
 TMP_INSTALLER=""
@@ -138,13 +154,17 @@ if [[ "$(id -u)" -eq 0 ]]; then
     ENV_FILE="${SVC_HOME}/.config/lucidd/infrastructure.env"
     cat > "$ENV_FILE" <<EOF
 # Configured by setup-cloud-relay.sh
-LUCIDD_EXTERNAL_ADDRESS=/ip4/${PUBLIC_IP}/tcp/4001
-LUCIDD_LIBP2P_PORT=4001
+LUCIDD_EXTERNAL_ADDRESS=/ip4/${PUBLIC_IP}/tcp/${RELAY_PORT}
+LUCIDD_LIBP2P_PORT=${RELAY_PORT}
 EOF
     chown "${SERVICE_USER}:${SERVICE_USER}" "$ENV_FILE"
     chmod 0600 "$ENV_FILE"
 
     UNIT_FILE="/etc/systemd/system/lucidd-relay.service"
+    BIND_CAPABILITIES=""
+    if [[ "$RELAY_PORT" -eq 443 ]]; then
+        BIND_CAPABILITIES=$'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE'
+    fi
     cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=lucidd — bounded Phase relay/AutoNAT infrastructure node
@@ -159,7 +179,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 UMask=0077
-Environment=LUCIDD_LIBP2P_PORT=4001
+Environment=LUCIDD_LIBP2P_PORT=${RELAY_PORT}
 Environment=LUCIDD_PORT=11434
 Environment=LUCIDD_HOST=127.0.0.1
 Environment=RUST_LOG=info,phase_net=info,lucidd=info
@@ -174,6 +194,7 @@ LimitNOFILE=65536
 TasksMax=512
 MemoryMax=1G
 CPUQuota=200%
+${BIND_CAPABILITIES}
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -197,8 +218,8 @@ EOF
 
     if [[ "$SKIP_FIREWALL" -eq 0 ]] && command -v ufw >/dev/null 2>&1; then
         if ufw status 2>/dev/null | grep -qi '^Status: active'; then
-            echo "==> Allowing inbound TCP 4001/tcp in ufw (leaving 80/443, SSH, Caddy, Tailscale untouched)..."
-            ufw allow 4001/tcp comment "LUCID libp2p relay"
+            echo "==> Allowing inbound TCP ${RELAY_PORT} in ufw (leaving other services, SSH, Caddy, and Tailscale untouched)..."
+            ufw allow "${RELAY_PORT}/tcp" comment "LUCID libp2p relay"
         fi
     fi
 
@@ -213,8 +234,8 @@ else
 
     if [[ "$SKIP_FIREWALL" -eq 0 ]] && command -v ufw >/dev/null 2>&1; then
         if sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
-            echo "==> Allowing inbound TCP 4001/tcp in ufw (leaving 80/443, SSH, Caddy, Tailscale untouched)..."
-            sudo ufw allow 4001/tcp comment "LUCID libp2p relay"
+            echo "==> Allowing inbound TCP ${RELAY_PORT} in ufw (leaving other services, SSH, Caddy, and Tailscale untouched)..."
+            sudo ufw allow "${RELAY_PORT}/tcp" comment "LUCID libp2p relay"
         fi
     fi
 
@@ -244,7 +265,7 @@ echo ""
 echo ""
 
 if [[ -n "$PEER_ID" ]]; then
-    MULTIADDR="/ip4/${PUBLIC_IP}/tcp/4001/p2p/${PEER_ID}"
+    MULTIADDR="/ip4/${PUBLIC_IP}/tcp/${RELAY_PORT}/p2p/${PEER_ID}"
     echo "================================================================"
     echo "Cloud Relay is UP!"
     echo ""
