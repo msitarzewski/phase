@@ -36,8 +36,8 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_stream::stream;
 use bytes::{Bytes, BytesMut};
@@ -105,6 +105,11 @@ const CHILD_IO_BUFFER_BYTES: usize = 4 * 1024;
 const BUNDLE_ROOT_DOMAIN: &[u8] = b"phase/mlx-bundle-root/v1\0";
 
 use crate::registry::{ModelCid, MAX_MODEL_SIZE_BYTES};
+use crate::worker_llama::{ResidentModelInfo, ResidentModelKind, ResidentModels};
+
+/// Backend label reported for the model held by [`MlxWorker`]; matches the
+/// `backend` of the `ModelCapabilities` this node advertises for it.
+pub const MLX_BACKEND: &str = "mlx";
 
 /// Verified, bounded metadata derived from bundle bytes rather than CLI
 /// strings. Callers can safely use this for signed alias metadata.
@@ -180,6 +185,10 @@ struct Inner {
     runtime_snapshot: RuntimeSnapshot,
     client: reqwest::Client,
     server: Mutex<Option<Arc<MlxServer>>>,
+    /// The backend that last passed readiness, mirrored outside the async
+    /// `server` lock (held across a whole cold load) so residency can be read
+    /// synchronously and never waits behind a load.
+    ready: std::sync::Mutex<Option<ReadyServer>>,
     capacity: Arc<Semaphore>,
     /// `true` once a backend has ended abnormally (or a restart failed)
     /// without a later successful full re-hash; the next spawn then streams
@@ -215,6 +224,7 @@ impl MlxWorker {
                 runtime_snapshot: validated.runtime_snapshot,
                 client,
                 server: Mutex::new(None),
+                ready: std::sync::Mutex::new(None),
                 capacity: Arc::new(Semaphore::new(1)),
                 content_reverify_required: AtomicBool::new(false),
                 #[cfg(test)]
@@ -257,6 +267,36 @@ impl MlxWorker {
 
     pub fn port_binding_status(&self) -> &'static str {
         MLX_PORT_BINDING_STATUS
+    }
+
+    /// The model resident right now: present only while the backend that
+    /// passed readiness and warm-up is still running and has not been
+    /// invalidated (crash, cancellation, protocol failure, or shutdown).
+    pub fn resident_models(&self) -> Vec<ResidentModelInfo> {
+        resident_models_of(&self.inner)
+    }
+
+    /// [`ResidentModels`] source for this worker that does not keep it alive.
+    pub fn resident_models_handle(&self) -> ResidentModels {
+        let inner = Arc::downgrade(&self.inner);
+        ResidentModels::new(move || {
+            inner
+                .upgrade()
+                .map(|inner| resident_models_of(&inner))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Record `server` as the backend that just passed readiness.
+    fn publish_ready(&self, server: &Arc<MlxServer>) {
+        *self
+            .inner
+            .ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReadyServer {
+            server: Arc::downgrade(server),
+            since: SystemTime::now(),
+        });
     }
 
     /// Spawn the pinned backend if necessary and complete its bounded health
@@ -338,6 +378,7 @@ impl MlxWorker {
             match wait_for_ready(&self.inner.client, &server, &self.inner.config).await {
                 Ok(()) => {
                     *slot = Some(server.clone());
+                    self.publish_ready(&server);
                     return Ok(server);
                 }
                 Err(error) => {
@@ -360,6 +401,36 @@ impl MlxWorker {
             }
         }
         Err(WorkerError::Other(last_failure.into()))
+    }
+}
+
+/// A backend that passed readiness and warm-up at `since`. Weak, so the
+/// mirror never extends the backend's lifetime past the `server` slot; a
+/// replaced, failed, or dropped backend therefore never reads as resident
+/// even before the next successful load overwrites this record.
+struct ReadyServer {
+    server: Weak<MlxServer>,
+    since: SystemTime,
+}
+
+fn resident_models_of(inner: &Inner) -> Vec<ResidentModelInfo> {
+    let ready = inner
+        .ready
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(ready) = ready.as_ref() else {
+        return Vec::new();
+    };
+    match ready.server.upgrade() {
+        Some(server) if !server.is_failed() => vec![ResidentModelInfo {
+            model_id: inner.config.model_cid.to_hex(),
+            backend: MLX_BACKEND,
+            kind: ResidentModelKind::Generation,
+            // This adapter never offloads layers to other machines.
+            trusted_circle_sharded: false,
+            loaded_since: ready.since,
+        }],
+        _ => Vec::new(),
     }
 }
 
