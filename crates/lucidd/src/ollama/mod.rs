@@ -564,6 +564,11 @@ fn public_route_explanation(input: &str) -> String {
 fn public_routed_via(decision: &RouteDecision) -> Option<String> {
     match decision.via {
         RouteVia::Local => Some("local".to_string()),
+        RouteVia::TrustedCircleSharded => Some(
+            crate::shard_plan::ShardTrustTier::TrustedCircle
+                .trust_label()
+                .to_string(),
+        ),
         RouteVia::Peer { .. } => Some("peer".to_string()),
         RouteVia::Refused { .. } => None,
     }

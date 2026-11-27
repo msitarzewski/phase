@@ -97,6 +97,9 @@ const REDUNDANT_SAMPLE_DOMAIN: &[u8] = b"lucid-redundant-sample:v1\0";
 pub enum RouteVia {
     /// Dispatch to the local worker.
     Local,
+    /// Dispatch to the local coordinator offloading layers to Tier-1
+    /// trusted-circle RPC peers (`--llama-rpc-servers`).
+    TrustedCircleSharded,
     /// Relay to a peer over `/phase/job-relay/1.0.0`.
     Peer { peer_id: PeerId },
     /// Refuse — the reason is human-readable for the HTTP layer.
@@ -200,6 +203,11 @@ impl RouteDecision {
     pub fn header_value(&self) -> Option<String> {
         match &self.via {
             RouteVia::Local => Some("local".to_string()),
+            RouteVia::TrustedCircleSharded => Some(
+                crate::shard_plan::ShardTrustTier::TrustedCircle
+                    .trust_label()
+                    .to_string(),
+            ),
             RouteVia::Peer { peer_id } => {
                 let s = peer_id.to_string();
                 let short: String = s
@@ -245,6 +253,7 @@ pub struct Router {
     evidence: Option<Arc<EvidenceRuntime>>,
     consumer: Option<Arc<ConsumerControl>>,
     allow_open_peers: bool,
+    local_worker_uses_rpc_offload: bool,
     redundant_config: RedundantVerificationConfig,
     redundant_gate: Arc<Semaphore>,
     /// Live count of active remote jobs dispatched to each peer, used to spread
@@ -313,6 +322,7 @@ impl Router {
             evidence: None,
             consumer: None,
             allow_open_peers: false,
+            local_worker_uses_rpc_offload: false,
             redundant_config: RedundantVerificationConfig::default(),
             redundant_gate: Arc::new(Semaphore::new(1)),
             in_flight_by_peer: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -327,6 +337,15 @@ impl Router {
     ) -> Self {
         self.consumer = consumer;
         self.allow_open_peers = allow_open_peers;
+        self
+    }
+
+    /// Mark the local worker as using Tier-1 RPC layer offload (`--llama-rpc-servers`).
+    /// When enabled, `X-Lucid-Local-Only` requests are refused (because activations
+    /// leave this host for RPC peers) and local dispatch reports
+    /// `"trusted-circle-sharded"` instead of `"local"`.
+    pub fn with_local_rpc_offload(mut self, uses_rpc_offload: bool) -> Self {
+        self.local_worker_uses_rpc_offload = uses_rpc_offload;
         self
     }
 
@@ -381,17 +400,28 @@ impl Router {
             .unwrap_or(model_id);
 
         // 1. Local-only privacy posture wins over everything else.
-        if local_only && !(has_local_worker && local_has_model) {
+        //    A local worker using Tier-1 RPC layer offload ships prompt-derived
+        //    activations to trusted-circle peers, so it does not satisfy
+        //    `X-Lucid-Local-Only`.
+        if local_only
+            && !(has_local_worker && local_has_model && !self.local_worker_uses_rpc_offload)
+        {
+            let reason = if has_local_worker
+                && local_has_model
+                && self.local_worker_uses_rpc_offload
+            {
+                format!(
+                    "local-only requested but model '{model_id}' runs on trusted-circle RPC layer offload"
+                )
+            } else {
+                format!("local-only requested but model '{model_id}' not loaded locally")
+            };
             return (
                 RouteDecision {
-                    via: RouteVia::Refused {
-                        reason: format!(
-                            "local-only requested but model '{model_id}' not loaded locally"
-                        ),
-                    },
+                    via: RouteVia::Refused { reason },
                     model_id: model_id.to_string(),
                     fallback_peers: Vec::new(),
-                    explanation: "local-only privacy policy refused remote routing".to_string(),
+                    explanation: "local-only privacy policy refused non-local routing".to_string(),
                 },
                 None,
             );
@@ -429,15 +459,26 @@ impl Router {
             }
         }
 
-        // 3. Local has the model — fast path.
+        // 3. Local has the model — fast path (labelled honestly if RPC-offloaded).
         if let Some(local_model) = local_model.filter(|_| has_local_worker) {
+            let (via, explanation) = if self.local_worker_uses_rpc_offload {
+                (
+                    RouteVia::TrustedCircleSharded,
+                    "local coordinator offloads layers to trusted-circle RPC peers; remote reputation was not consulted"
+                        .to_string(),
+                )
+            } else {
+                (
+                    RouteVia::Local,
+                    "local worker is loaded; remote reputation was not consulted".to_string(),
+                )
+            };
             return (
                 RouteDecision {
-                    via: RouteVia::Local,
+                    via,
                     model_id: model_id.to_string(),
                     fallback_peers: Vec::new(),
-                    explanation: "local worker is loaded; remote reputation was not consulted"
-                        .to_string(),
+                    explanation,
                 },
                 Some(local_model.model_cid),
             );
@@ -618,7 +659,7 @@ impl Router {
             RouteVia::Refused { reason } => Err(RouterError::Refused {
                 reason: reason.clone(),
             }),
-            RouteVia::Local => {
+            RouteVia::Local | RouteVia::TrustedCircleSharded => {
                 let worker = self
                     .local_worker
                     .as_ref()

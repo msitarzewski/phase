@@ -1093,6 +1093,17 @@ fn header_value_local_and_peer_shapes() {
     };
     assert_eq!(d.header_value().as_deref(), Some("local"));
 
+    let sharded = RouteDecision {
+        via: RouteVia::TrustedCircleSharded,
+        model_id: "x".into(),
+        fallback_peers: Vec::new(),
+        explanation: "test fixture".into(),
+    };
+    assert_eq!(
+        sharded.header_value().as_deref(),
+        Some("trusted-circle-sharded")
+    );
+
     // Peer header should be `peer:<8 chars>`.
     let identity = NodeIdentity::generate();
     let pubkey = identity.verifying_key().to_bytes();
@@ -1110,6 +1121,55 @@ fn header_value_local_and_peer_shapes() {
     assert!(hv.starts_with("peer:"), "got {hv}");
     // 5 for "peer:" + 8 short id = 13.
     assert_eq!(hv.len(), 13, "got {hv}");
+}
+
+#[tokio::test]
+async fn rpc_offload_worker_refuses_local_only_and_reports_trusted_circle_sharded() {
+    let identity = NodeIdentity::generate();
+    let transport = Arc::new(MockDht::default());
+    let registry = Arc::new(ModelRegistry::new(identity.clone(), transport));
+    let policy = Arc::new(PolicyEngine::new_for_tests(
+        PolicyConfig::default(),
+        PolicyState::default(),
+    ));
+    registry
+        .advertise_loaded(sample_caps("gemma-4-12b", 9))
+        .await
+        .unwrap();
+
+    let router = Router::new(
+        Some(Arc::new(EchoWorker::new())),
+        registry,
+        policy,
+        identity,
+        build_test_discovery(),
+    )
+    .with_local_rpc_offload(true);
+
+    // X-Lucid-Local-Only must fail closed when the worker offloads layers over RPC.
+    let local_only = router.route("gemma-4-12b", true).await;
+    match &local_only.via {
+        RouteVia::Refused { reason } => {
+            assert!(
+                reason.contains("trusted-circle RPC"),
+                "expected RPC refusal reason, got: {reason}"
+            );
+        }
+        other => panic!("expected Refused for local_only RPC worker, got {other:?}"),
+    }
+    assert!(local_only.header_value().is_none());
+
+    // Normal request reports trusted-circle-sharded rather than local.
+    let normal = router.route("gemma-4-12b", false).await;
+    assert!(
+        matches!(normal.via, RouteVia::TrustedCircleSharded),
+        "expected TrustedCircleSharded, got {:?}",
+        normal.via
+    );
+    assert_eq!(
+        normal.header_value().as_deref(),
+        Some("trusted-circle-sharded")
+    );
 }
 
 // --- SEC-05: receipt verify + bind -----------------------------------

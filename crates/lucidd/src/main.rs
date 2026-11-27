@@ -1173,6 +1173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Optional local worker.
+    let mut local_worker_uses_rpc_offload = false;
     let local_worker: Option<Arc<dyn DynWorker>> = if no_local_worker {
         tracing::info!(
             mode = ?effective_mode,
@@ -1453,7 +1454,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // verifying a relayed receipt can bind worker_pubkey -> our
                 // PeerId (a random key would fail that bind). See the echo arm.
                 let worker_identity = node_identity.clone();
-                Some(Arc::new(LlamaCppWorker::new(worker_identity, config)) as Arc<dyn DynWorker>)
+                let worker = Arc::new(LlamaCppWorker::new(worker_identity, config));
+                local_worker_uses_rpc_offload = worker.uses_rpc_layer_offload();
+                if local_worker_uses_rpc_offload {
+                    tracing::info!(
+                        trust_label = worker.execution_trust_label(),
+                        "local llama-cpp worker uses trusted-circle RPC layer offload"
+                    );
+                }
+                Some(worker as Arc<dyn DynWorker>)
             }
             WorkerChoice::Mlx => {
                 let prepared = prepared_mlx_startup
@@ -1624,6 +1633,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery.clone(),
         )
         .with_remote_access(Some(consumer.clone()), cli.allow_open_peers)
+        .with_local_rpc_offload(local_worker_uses_rpc_offload)
         .with_evidence_runtime(evidence)
         .with_redundant_verification(redundant_config),
     );
