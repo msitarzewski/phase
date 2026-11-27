@@ -879,7 +879,9 @@ fn rpc_offload_flags_require_rpc_servers_for_tensor_split() {
     assert!(validate_rpc_offload_flags(&rpc, Some("30,70")).is_ok());
     let error = validate_rpc_offload_flags(&[], Some("30,70")).unwrap_err();
     assert!(
-        error.to_string().contains("requires --llama-rpc-servers"),
+        error
+            .to_string()
+            .contains("requires --llama-rpc-servers or --llama-rpc-peers"),
         "{error}"
     );
     assert!(validate_rpc_offload_flags(&rpc, Some("0,0")).is_err());
@@ -1080,6 +1082,8 @@ async fn supervisor_kills_reaps_and_releases_port_on_kill_signal() {
             config: worker.inner.config.clone(),
             model_path: PathBuf::from("/nonexistent.gguf"),
             embeddings: false,
+            rpc_endpoints: Vec::new(),
+            rpc_peer_proxies: None,
         },
         child,
     ));
@@ -1142,6 +1146,8 @@ async fn dropping_the_loaded_model_handle_kills_the_supervised_child() {
             config: worker.inner.config.clone(),
             model_path: PathBuf::from("/nonexistent.gguf"),
             embeddings: false,
+            rpc_endpoints: Vec::new(),
+            rpc_peer_proxies: None,
         },
         child,
     ));
