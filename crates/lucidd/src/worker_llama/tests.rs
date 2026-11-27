@@ -86,6 +86,39 @@ fn inference_with_sampling(entries: &[(&str, &str)], max_tokens: Option<u32>) ->
 }
 
 #[test]
+fn loopback_rpc_server_validation_enforces_strict_loopback_and_bounds() {
+    assert!(validate_loopback_rpc_servers(&["127.0.0.1:50052".to_string()]).is_ok());
+    assert!(validate_loopback_rpc_servers(&["[::1]:50052".to_string()]).is_ok());
+    for bad in [
+        "0.0.0.0:50052",
+        "192.168.1.50:50052",
+        "100.124.94.123:50052",
+        "127.0.0.1:0",
+        "localhost:50052",
+        "not-an-addr",
+    ] {
+        assert!(
+            validate_loopback_rpc_servers(&[bad.to_string()]).is_err(),
+            "non-loopback or invalid RPC endpoint must fail: {bad}"
+        );
+    }
+    let too_many = vec!["127.0.0.1:50052".to_string(); 17];
+    assert!(validate_loopback_rpc_servers(&too_many).is_err());
+}
+
+#[test]
+fn tensor_split_validation_rejects_malformed_or_zero_weights() {
+    assert!(validate_tensor_split("30,70").is_ok());
+    assert!(validate_tensor_split("0.25, 0.75").is_ok());
+    for bad in ["", "0,0", "-1,50", "NaN,50", "inf,50", "70;rm -rf /"] {
+        assert!(
+            validate_tensor_split(bad).is_err(),
+            "invalid tensor_split must fail: {bad}"
+        );
+    }
+}
+
+#[test]
 fn completion_request_rejects_server_owned_sampling_fields() {
     for key in ["n_predict", "prompt", "messages", "stream", "cache_prompt"] {
         let spec = inference_with_sampling(&[(key, "1")], Some(32));

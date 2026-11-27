@@ -157,6 +157,15 @@ pub struct LlamaCppConfig {
     /// concurrent tokio tests).
     #[doc(hidden)]
     pub extra_env: Vec<(String, String)>,
+
+    /// Optional loopback-only (`127.0.0.1:<PORT>` / `[::1]:<PORT>`) `ggml-rpc-server`
+    /// tunnel endpoints for Tier-1 Trusted-Circle layer slicing (`--rpc`).
+    /// Non-loopback addresses are rejected defense-in-depth because `ggml-rpc`
+    /// has no native auth/TLS and must always traverse an encrypted tunnel.
+    pub rpc_servers: Vec<String>,
+
+    /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g. `"30,70"`).
+    pub tensor_split: Option<String>,
 }
 
 impl Default for LlamaCppConfig {
@@ -171,8 +180,73 @@ impl Default for LlamaCppConfig {
             model_load_timeout: Duration::from_secs(60),
             per_request_idle_timeout: Duration::from_secs(30),
             extra_env: Vec::new(),
+            rpc_servers: Vec::new(),
+            tensor_split: None,
         }
     }
+}
+
+/// Validate that every configured `ggml-rpc` server address is strictly loopback
+/// (`127.0.0.1:<port>` or `[::1]:<port>`, non-zero port, at most 16 endpoints).
+pub fn validate_loopback_rpc_servers(servers: &[String]) -> std::io::Result<()> {
+    if servers.len() > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "at most 16 loopback ggml-rpc servers are supported",
+        ));
+    }
+    for raw in servers {
+        let addr: std::net::SocketAddr = raw.trim().parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid ggml-rpc server socket address: {raw:?}"),
+            )
+        })?;
+        if !addr.ip().is_loopback() || addr.port() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "ggml-rpc server address must be a non-zero loopback endpoint (127.0.0.1:PORT or [::1]:PORT), got {raw:?}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate `--tensor-split` syntax: 1..=16 comma-separated finite non-negative
+/// weights with at least one positive weight.
+pub fn validate_tensor_split(spec: &str) -> std::io::Result<()> {
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    if parts.is_empty() || parts.len() > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tensor_split must contain 1..=16 comma-separated weights",
+        ));
+    }
+    let mut sum = 0.0f64;
+    for part in parts {
+        let v: f64 = part.parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid tensor_split weight: {part:?}"),
+            )
+        })?;
+        if !v.is_finite() || v < 0.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("tensor_split weight must be finite and >= 0, got {part:?}"),
+            ));
+        }
+        sum += v;
+    }
+    if sum <= 0.0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tensor_split must have at least one positive weight",
+        ));
+    }
+    Ok(())
 }
 
 /// State of a single loaded model. Held inside the worker's `DashMap`
@@ -368,6 +442,8 @@ impl LlamaCppWorker {
             self.inner.config.default_context_size,
             &self.inner.config.extra_env,
             embeddings,
+            &self.inner.config.rpc_servers,
+            self.inner.config.tensor_split.as_deref(),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -718,6 +794,7 @@ fn resolve_model_path(model_dir: &Path, model_id: &str) -> Result<PathBuf, Strin
 
 /// Spawn the actual subprocess. Returns immediately — caller waits on
 /// `/health` separately.
+#[allow(clippy::too_many_arguments)]
 fn spawn_llama_server(
     binary: &Path,
     model: &Path,
@@ -726,6 +803,8 @@ fn spawn_llama_server(
     ctx_size: usize,
     extra_env: &[(String, String)],
     embeddings: bool,
+    rpc_servers: &[String],
+    tensor_split: Option<&str>,
 ) -> std::io::Result<Child> {
     // SEC-04 (L8): require an absolute binary path. Resolving `llama-server`
     // via the inherited `$PATH` is a binary-hijack vector (an attacker who
@@ -779,6 +858,16 @@ fn spawn_llama_server(
     // concurrent batch slots.
     cmd.arg("--jinja");
     cmd.arg("--cache-reuse").arg("256");
+    if !rpc_servers.is_empty() {
+        validate_loopback_rpc_servers(rpc_servers)?;
+        let normalized: Vec<String> = rpc_servers.iter().map(|s| s.trim().to_string()).collect();
+        cmd.arg("--rpc").arg(normalized.join(","));
+        cmd.arg("--split-mode").arg("layer");
+        if let Some(split) = tensor_split {
+            validate_tensor_split(split)?;
+            cmd.arg("--tensor-split").arg(split.trim());
+        }
+    }
     // Capture stdout/stderr so the supervisor can drain them (otherwise
     // a chatty child fills its pipe and blocks).
     cmd.stdin(Stdio::null());
@@ -985,6 +1074,8 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                     config.default_context_size,
                     &config.extra_env,
                     embeddings,
+                    &config.rpc_servers,
+                    config.tensor_split.as_deref(),
                 );
                 match respawned {
                     Ok(c) => {

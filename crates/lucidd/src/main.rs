@@ -234,6 +234,16 @@ struct Cli {
     #[arg(long, default_value_t = 8192)]
     llama_ctx_size: usize,
 
+    /// Optional loopback-only `ggml-rpc-server` endpoints (`127.0.0.1:<PORT>`)
+    /// for Tier-1 Trusted-Circle sliced-layer execution across invited peers.
+    #[arg(long, value_delimiter = ',')]
+    llama_rpc_servers: Vec<String>,
+
+    /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g.
+    /// `30,70`) used when `--llama-rpc-servers` is set.
+    #[arg(long)]
+    llama_tensor_split: Option<String>,
+
     /// Optional loopback port (`127.0.0.1:<PORT>`) of a local Tier-1
     /// Trusted-Circle stage runner. When set, inbound `/phase/shard-stage/1.0.0`
     /// requests are forwarded to this loopback bridge ONLY while `cluster_enabled`
@@ -1389,12 +1399,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 #[cfg(not(target_os = "linux"))]
                 let extra_env = Vec::new();
+                if !cli.llama_rpc_servers.is_empty() {
+                    lucidd::worker_llama::validate_loopback_rpc_servers(&cli.llama_rpc_servers)?;
+                }
+                if let Some(split) = cli.llama_tensor_split.as_deref() {
+                    lucidd::worker_llama::validate_tensor_split(split)?;
+                }
+                let model_load_timeout = if cli.llama_rpc_servers.is_empty() {
+                    LlamaCppConfig::default().model_load_timeout
+                } else {
+                    std::time::Duration::from_secs(300)
+                };
                 let config = LlamaCppConfig {
                     server_binary_path,
                     model_dir: verified_model_dir,
                     default_n_gpu_layers: n_gpu_layers,
                     default_context_size: cli.llama_ctx_size,
+                    model_load_timeout,
                     extra_env,
+                    rpc_servers: cli.llama_rpc_servers.clone(),
+                    tensor_split: cli.llama_tensor_split.clone(),
                     ..Default::default()
                 };
                 tracing::info!(?config, "worker: llama-cpp");

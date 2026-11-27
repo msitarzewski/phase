@@ -191,6 +191,7 @@ fn setup(model_id: &str) -> TestModel {
         model_load_timeout: Duration::from_secs(10),
         per_request_idle_timeout: Duration::from_secs(5),
         extra_env: Vec::new(),
+        ..Default::default()
     };
     TestModel {
         _dir: dir,
@@ -241,6 +242,7 @@ fn multi_model_worker(
             ("FAKE_LLAMA_TOKENS".to_string(), "a,b".to_string()),
             ("FAKE_LLAMA_DELAY_MS".to_string(), "1".to_string()),
         ],
+        ..Default::default()
     };
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), config);
     (dir, worker)
@@ -634,6 +636,7 @@ async fn real_llama_server_smoke_test_requires_explicit_hardware_env() {
         model_load_timeout: Duration::from_secs(120),
         per_request_idle_timeout: Duration::from_secs(60),
         extra_env: Vec::new(),
+        ..Default::default()
     };
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), config);
     let manifest = make_manifest(&model_id, "Say hi in five words.");
