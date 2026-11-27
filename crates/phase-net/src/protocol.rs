@@ -925,6 +925,175 @@ fn validate_shard_stage_schema(schema_version: u16) -> Result<(), ShardStageErro
     }
 }
 
+// ---------------------------------------------------------------------------
+// ShardRpc — workload-neutral authorized opaque byte tunnel.
+// ---------------------------------------------------------------------------
+
+/// Protocol identifier for an authorized, bounded, bidirectional opaque byte
+/// tunnel between two peers.
+///
+/// After a fixed-shape [`ShardRpcOpen`] / [`ShardRpcDecision`] handshake the
+/// substream carries raw bytes in both directions until either side closes,
+/// the negotiated idle or session bound elapses, or the serving side revokes
+/// the session. `phase-net` never interprets the tunnelled bytes; the workload
+/// layer decides who may open a tunnel and what local endpoint it reaches.
+pub const SHARD_RPC_PROTOCOL: &str = "/phase/shard-rpc/1.0.0";
+
+/// Schema version carried in every shard-rpc handshake envelope.
+pub const SHARD_RPC_SCHEMA_VERSION: u16 = 1;
+
+/// Maximum human-readable refusal detail in a [`ShardRpcDecision`].
+pub const SHARD_RPC_MAX_REASON_BYTES: usize = 1024;
+
+/// Silence bound: a tunnel with no bytes in either direction for this long
+/// is torn down. Long-lived tunnels are legitimately quiet between uses, so
+/// the bound is generous but always finite.
+pub const SHARD_RPC_MIN_IDLE_TIMEOUT_MS: u64 = 1_000;
+pub const SHARD_RPC_MAX_IDLE_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1000;
+pub const SHARD_RPC_DEFAULT_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+/// Total lifetime bound of one tunnel session, regardless of activity.
+pub const SHARD_RPC_MIN_SESSION_MS: u64 = 1_000;
+pub const SHARD_RPC_MAX_SESSION_MS: u64 = 24 * 60 * 60 * 1000;
+pub const SHARD_RPC_DEFAULT_SESSION_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// Requester-to-server tunnel open envelope carried over [`SHARD_RPC_PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardRpcOpen {
+    pub schema_version: u16,
+    /// Unique 32-byte identifier correlating both ends of one tunnel session.
+    pub session_id: [u8; 32],
+    /// Requested silence bound (ms). Both ends enforce it.
+    pub idle_timeout_ms: u64,
+    /// Requested total session lifetime (ms). Both ends enforce it.
+    pub max_session_ms: u64,
+}
+
+impl ShardRpcOpen {
+    /// An open envelope with the default idle and session bounds.
+    pub fn new(session_id: [u8; 32]) -> Self {
+        Self {
+            schema_version: SHARD_RPC_SCHEMA_VERSION,
+            session_id,
+            idle_timeout_ms: SHARD_RPC_DEFAULT_IDLE_TIMEOUT_MS,
+            max_session_ms: SHARD_RPC_DEFAULT_SESSION_MS,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ShardRpcError> {
+        validate_shard_rpc_schema(self.schema_version)?;
+        if !(SHARD_RPC_MIN_IDLE_TIMEOUT_MS..=SHARD_RPC_MAX_IDLE_TIMEOUT_MS)
+            .contains(&self.idle_timeout_ms)
+        {
+            return Err(ShardRpcError::InvalidIdleTimeout {
+                actual_ms: self.idle_timeout_ms,
+                minimum_ms: SHARD_RPC_MIN_IDLE_TIMEOUT_MS,
+                maximum_ms: SHARD_RPC_MAX_IDLE_TIMEOUT_MS,
+            });
+        }
+        if !(SHARD_RPC_MIN_SESSION_MS..=SHARD_RPC_MAX_SESSION_MS).contains(&self.max_session_ms) {
+            return Err(ShardRpcError::InvalidSessionLimit {
+                actual_ms: self.max_session_ms,
+                minimum_ms: SHARD_RPC_MIN_SESSION_MS,
+                maximum_ms: SHARD_RPC_MAX_SESSION_MS,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Server-to-requester handshake decision. Raw tunnel bytes follow only an
+/// [`ShardRpcDecisionKind::Accepted`] decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardRpcDecision {
+    pub schema_version: u16,
+    pub session_id: [u8; 32],
+    pub kind: ShardRpcDecisionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardRpcDecisionKind {
+    Accepted,
+    Rejected { reason: String },
+}
+
+impl ShardRpcDecision {
+    pub fn accepted(session_id: [u8; 32]) -> Self {
+        Self {
+            schema_version: SHARD_RPC_SCHEMA_VERSION,
+            session_id,
+            kind: ShardRpcDecisionKind::Accepted,
+        }
+    }
+
+    /// A rejection whose reason is clamped (on a UTF-8 boundary) to
+    /// [`SHARD_RPC_MAX_REASON_BYTES`] and never empty.
+    pub fn rejected(session_id: [u8; 32], reason: impl Into<String>) -> Self {
+        let mut reason = reason.into();
+        if reason.len() > SHARD_RPC_MAX_REASON_BYTES {
+            let mut end = SHARD_RPC_MAX_REASON_BYTES;
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+        }
+        if reason.is_empty() {
+            reason.push_str("rejected");
+        }
+        Self {
+            schema_version: SHARD_RPC_SCHEMA_VERSION,
+            session_id,
+            kind: ShardRpcDecisionKind::Rejected { reason },
+        }
+    }
+
+    pub fn validate_for(&self, expected_session: [u8; 32]) -> Result<(), ShardRpcError> {
+        validate_shard_rpc_schema(self.schema_version)?;
+        if self.session_id != expected_session {
+            return Err(ShardRpcError::WrongSession);
+        }
+        if let ShardRpcDecisionKind::Rejected { reason } = &self.kind {
+            if reason.is_empty() || reason.len() > SHARD_RPC_MAX_REASON_BYTES {
+                return Err(ShardRpcError::InvalidReason);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ShardRpcError {
+    #[error("unsupported shard rpc schema {actual}; expected {expected}")]
+    UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("shard rpc decision belongs to a different session")]
+    WrongSession,
+    #[error("shard rpc idle timeout {actual_ms}ms is outside {minimum_ms}..={maximum_ms}ms")]
+    InvalidIdleTimeout {
+        actual_ms: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+    #[error("shard rpc session limit {actual_ms}ms is outside {minimum_ms}..={maximum_ms}ms")]
+    InvalidSessionLimit {
+        actual_ms: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+    #[error("shard rpc rejection reason is empty or exceeds its size limit")]
+    InvalidReason,
+}
+
+fn validate_shard_rpc_schema(schema_version: u16) -> Result<(), ShardRpcError> {
+    if schema_version == SHARD_RPC_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(ShardRpcError::UnsupportedSchema {
+            actual: schema_version,
+            expected: SHARD_RPC_SCHEMA_VERSION,
+        })
+    }
+}
+
 /// Job offer from client to node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobOffer {
@@ -1690,6 +1859,79 @@ mod tests {
                 expected: 2,
                 actual: 1
             })
+        );
+    }
+
+    #[test]
+    fn shard_rpc_handshake_enforces_schema_bounds_and_session_binding() {
+        let session_id = [7_u8; 32];
+        let open = ShardRpcOpen::new(session_id);
+        open.validate().unwrap();
+        assert_eq!(open.idle_timeout_ms, SHARD_RPC_DEFAULT_IDLE_TIMEOUT_MS);
+        assert_eq!(open.max_session_ms, SHARD_RPC_DEFAULT_SESSION_MS);
+
+        let mut schema = open.clone();
+        schema.schema_version = SHARD_RPC_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            schema.validate(),
+            Err(ShardRpcError::UnsupportedSchema { .. })
+        ));
+        for idle in [
+            0,
+            SHARD_RPC_MIN_IDLE_TIMEOUT_MS - 1,
+            SHARD_RPC_MAX_IDLE_TIMEOUT_MS + 1,
+        ] {
+            let mut bad = open.clone();
+            bad.idle_timeout_ms = idle;
+            assert!(matches!(
+                bad.validate(),
+                Err(ShardRpcError::InvalidIdleTimeout { .. })
+            ));
+        }
+        for session in [
+            0,
+            SHARD_RPC_MIN_SESSION_MS - 1,
+            SHARD_RPC_MAX_SESSION_MS + 1,
+        ] {
+            let mut bad = open.clone();
+            bad.max_session_ms = session;
+            assert!(matches!(
+                bad.validate(),
+                Err(ShardRpcError::InvalidSessionLimit { .. })
+            ));
+        }
+
+        let accepted = ShardRpcDecision::accepted(session_id);
+        accepted.validate_for(session_id).unwrap();
+        assert_eq!(
+            accepted.validate_for([8_u8; 32]),
+            Err(ShardRpcError::WrongSession)
+        );
+
+        // Rejection reasons are clamped on a UTF-8 boundary and never empty,
+        // so a server can never emit a decision its peer must refuse.
+        let long = ShardRpcDecision::rejected(session_id, "é".repeat(SHARD_RPC_MAX_REASON_BYTES));
+        long.validate_for(session_id).unwrap();
+        match &long.kind {
+            ShardRpcDecisionKind::Rejected { reason } => {
+                assert!(reason.len() <= SHARD_RPC_MAX_REASON_BYTES);
+                assert!(reason.chars().all(|c| c == 'é'));
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        ShardRpcDecision::rejected(session_id, "")
+            .validate_for(session_id)
+            .unwrap();
+        let forged = ShardRpcDecision {
+            schema_version: SHARD_RPC_SCHEMA_VERSION,
+            session_id,
+            kind: ShardRpcDecisionKind::Rejected {
+                reason: "x".repeat(SHARD_RPC_MAX_REASON_BYTES + 1),
+            },
+        };
+        assert_eq!(
+            forged.validate_for(session_id),
+            Err(ShardRpcError::InvalidReason)
         );
     }
 }

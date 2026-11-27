@@ -210,6 +210,12 @@ pub struct LlamaCppConfig {
     /// has no native auth/TLS and must always traverse an encrypted tunnel.
     pub rpc_servers: Vec<String>,
 
+    /// Optional layer offload to enrolled peers over the Noise-encrypted
+    /// `/phase/shard-rpc/1.0.0` tunnel. Every spawn binds its own loopback
+    /// proxy per peer and appends those endpoints to `--rpc` after
+    /// `rpc_servers`; see [`rpc_peers`].
+    pub rpc_peer_offload: Option<rpc_peers::RpcPeerOffload>,
+
     /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g. `"30,70"`).
     /// Only meaningful together with `rpc_servers`.
     pub tensor_split: Option<String>,
@@ -264,11 +270,16 @@ impl Default for LlamaCppConfig {
             per_request_idle_timeout: Duration::from_secs(30),
             extra_env: Vec::new(),
             rpc_servers: Vec::new(),
+            rpc_peer_offload: None,
             tensor_split: None,
             rpc_cluster_gate: None,
         }
     }
 }
+
+/// Upper bound on `--rpc` endpoints (explicit loopback servers plus enrolled
+/// peer proxies) handed to one `llama-server`.
+pub const MAX_RPC_ENDPOINTS: usize = 16;
 
 fn rpc_offload_refused() -> WorkerError {
     WorkerError::Other(
@@ -288,7 +299,7 @@ pub fn validate_rpc_offload_flags(
     if tensor_split.is_some() && rpc_servers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "--llama-tensor-split requires --llama-rpc-servers",
+            "--llama-tensor-split requires --llama-rpc-servers or --llama-rpc-peers",
         ));
     }
     validate_loopback_rpc_servers(rpc_servers)?;
@@ -301,10 +312,10 @@ pub fn validate_rpc_offload_flags(
 /// Validate that every configured `ggml-rpc` server address is strictly loopback
 /// (`127.0.0.1:<port>` or `[::1]:<port>`, non-zero port, at most 16 endpoints).
 pub fn validate_loopback_rpc_servers(servers: &[String]) -> std::io::Result<()> {
-    if servers.len() > 16 {
+    if servers.len() > MAX_RPC_ENDPOINTS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "at most 16 loopback ggml-rpc servers are supported",
+            format!("at most {MAX_RPC_ENDPOINTS} loopback ggml-rpc servers are supported"),
         ));
     }
     for raw in servers {
@@ -553,7 +564,7 @@ impl LlamaCppWorker {
     /// its models then execute on the Tier-1 trusted circle, not only on this
     /// host — routing and privacy decisions must treat it accordingly.
     pub fn uses_rpc_layer_offload(&self) -> bool {
-        !self.inner.config.rpc_servers.is_empty()
+        !self.inner.config.rpc_servers.is_empty() || self.inner.config.rpc_peer_offload.is_some()
     }
 
     /// Honest execution label for jobs served by this worker:
@@ -586,6 +597,16 @@ impl LlamaCppWorker {
             }
         }
         Err(rpc_offload_refused())
+    }
+
+    /// The configured trusted-circle gate, or a permanently closed one when
+    /// none was wired (fail closed).
+    fn rpc_gate(&self) -> RpcClusterGate {
+        self.inner
+            .config
+            .rpc_cluster_gate
+            .clone()
+            .unwrap_or_else(|| RpcClusterGate::new(|| false))
     }
 
     /// `true` unless RPC layer offload is configured and the trusted-circle
@@ -690,6 +711,19 @@ impl LlamaCppWorker {
         let port_guard = self.allocate_port()?;
         let port = port_guard.port();
         let api_key = LlamaApiKey::generate()?;
+        // Enrolled-peer offload: this spawn's own loopback proxies, owned (like
+        // the port) by whoever owns the child, so a lost tunnel retires only
+        // the model that used it.
+        let rpc_peer_proxies = match &self.inner.config.rpc_peer_offload {
+            Some(offload) => Some(offload.bind(self.rpc_gate()).await.map_err(|error| {
+                WorkerError::Other(format!("bind trusted-circle RPC peer proxies: {error}"))
+            })?),
+            None => None,
+        };
+        let mut rpc_endpoints = self.inner.config.rpc_servers.clone();
+        if let Some(proxies) = &rpc_peer_proxies {
+            rpc_endpoints.extend(proxies.rpc_endpoints());
+        }
         let mut child = llama_server_command(
             &self.inner.config.server_binary_path,
             &model_path,
@@ -699,7 +733,7 @@ impl LlamaCppWorker {
             self.inner.config.default_context_size,
             &self.inner.config.extra_env,
             embeddings,
-            &self.inner.config.rpc_servers,
+            &rpc_endpoints,
             self.inner.config.tensor_split.as_deref(),
         )
         .and_then(|mut cmd| cmd.spawn())
@@ -753,6 +787,8 @@ impl LlamaCppWorker {
             config: self.inner.config.clone(),
             model_path,
             embeddings,
+            rpc_endpoints,
+            rpc_peer_proxies,
         };
 
         // The supervisor task owns the child and its port for the model's
@@ -1250,6 +1286,12 @@ struct SupervisorInput {
     /// Whether this instance was spawned with `--embeddings`. Re-spawns on
     /// crash must reuse the same flavour or the endpoint shape would flip.
     embeddings: bool,
+    /// The complete `--rpc` list of this model (explicit servers plus its own
+    /// peer proxies); respawns reuse it.
+    rpc_endpoints: Vec<String>,
+    /// This model's enrolled-peer proxies, if any. Dropped only after the
+    /// last child is reaped, which closes every tunnel it carried.
+    rpc_peer_proxies: Option<rpc_peers::RpcPeerProxySet>,
 }
 
 /// Long-running task: watch the child, restart on crash up to 3 times in
@@ -1273,16 +1315,29 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
         config,
         model_path,
         embeddings,
+        rpc_endpoints,
+        rpc_peer_proxies,
     } = input;
     let port = port_guard.port();
     let mut slot = Some(initial_child);
     drain_child_io(&mut slot);
+    let mut tunnel_losses = rpc_peer_proxies
+        .as_ref()
+        .map(rpc_peers::RpcPeerProxySet::remote_losses);
 
     let killed = tokio::select! {
         biased;
         // `Err` means the `LoadedModel` handle was dropped: nobody can reach
         // this child any more, so it must not outlive the handle.
         _ = kill.wait_for(|requested| *requested) => true,
+        // One of this model's trusted-circle tunnels ended outside
+        // llama-server's control: its next use of that ggml-rpc socket would
+        // abort it, possibly mid-request. Retire it now; the next request
+        // cold-loads over fresh tunnels.
+        () = rpc_tunnel_lost(&mut tunnel_losses) => {
+            tracing::warn!(model = %model_id, port, "trusted-circle RPC tunnel lost; retiring model");
+            true
+        }
         () = supervise(
             &mut slot,
             &model_id,
@@ -1292,6 +1347,7 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
             &config,
             &model_path,
             embeddings,
+            &rpc_endpoints,
         ) => false,
     };
 
@@ -1305,10 +1361,22 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
             tracing::warn!(model = %model_id, %error, "failed to kill llama-server child");
         }
     }
+    drop(rpc_peer_proxies);
     failed_flag.store(true, std::sync::atomic::Ordering::Release);
     failed.notify_waiters();
     drop(port_guard);
     stopped.send_replace(true);
+}
+
+/// Resolves when one of this model's peer tunnels is lost; never without
+/// enrolled-peer offload.
+async fn rpc_tunnel_lost(losses: &mut Option<watch::Receiver<u64>>) {
+    if let Some(losses) = losses {
+        if losses.changed().await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending().await
 }
 
 /// The supervision loop proper. Returns once the model is terminally dead
@@ -1325,6 +1393,7 @@ async fn supervise(
     config: &LlamaCppConfig,
     model_path: &Path,
     embeddings: bool,
+    rpc_endpoints: &[String],
 ) {
     // Sliding window of recent crash timestamps. If we accumulate three
     // entries inside a 60 s window, give up.
@@ -1413,7 +1482,7 @@ async fn supervise(
                 tokio::time::sleep(backoff).await;
                 // A crash must not silently re-establish remote layer links
                 // after the operator has withdrawn the trusted-circle opt-in.
-                if !config.rpc_servers.is_empty()
+                if !rpc_endpoints.is_empty()
                     && !config
                         .rpc_cluster_gate
                         .as_ref()
@@ -1434,7 +1503,7 @@ async fn supervise(
                     config.default_context_size,
                     &config.extra_env,
                     embeddings,
-                    &config.rpc_servers,
+                    rpc_endpoints,
                     config.tensor_split.as_deref(),
                 )
                 .and_then(|mut cmd| cmd.spawn())
@@ -2462,6 +2531,8 @@ impl Drop for Inner {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+pub mod rpc_peers;
 
 #[cfg(test)]
 mod tests;

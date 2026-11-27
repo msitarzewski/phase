@@ -1443,3 +1443,675 @@ async fn stalled_peer_negotiation_does_not_block_streams_to_healthy_peers() {
     stalled_blob.abort();
     held.abort();
 }
+
+// ---------------------------------------------------------------------------
+// /phase/shard-rpc/1.0.0 — authorized opaque byte tunnel over real swarms.
+// ---------------------------------------------------------------------------
+
+/// Two real swarms over loopback TCP (Noise + yamux), `requester` dialled
+/// into `server`.
+async fn connected_shard_rpc_pair() -> (Arc<Discovery>, Arc<Discovery>) {
+    let requester = Arc::new(Discovery::new(DiscoveryConfig::default()).expect("requester"));
+    let server = Arc::new(Discovery::new(DiscoveryConfig::default()).expect("server"));
+    let server_peer = *server.local_peer_id();
+    server
+        .listen("/ip4/127.0.0.1/tcp/0")
+        .await
+        .expect("server listen");
+    let mut server_addr = loopback_dial_addr(&server).await;
+    server_addr.push(Protocol::P2p(server_peer));
+    requester
+        .dial_peer(&server_addr.to_string())
+        .await
+        .expect("requester dials server");
+    wait_for_peer_path(&requester, server_peer, &[ReachabilityPath::Direct]).await;
+    (requester, server)
+}
+
+fn shard_rpc_open(session: u8, idle_timeout_ms: u64, max_session_ms: u64) -> ShardRpcOpen {
+    ShardRpcOpen {
+        schema_version: crate::protocol::SHARD_RPC_SCHEMA_VERSION,
+        session_id: [session; 32],
+        idle_timeout_ms,
+        max_session_ms,
+    }
+}
+
+/// Server handler that admits every caller onto a fresh in-memory duplex and
+/// hands the far end of that duplex (plus the authenticated caller) to the
+/// test, so the test plays the server-side local endpoint.
+fn duplex_shard_rpc_handler(
+    revoked: Option<Arc<tokio::sync::Notify>>,
+) -> (
+    ShardRpcHandler,
+    mpsc::UnboundedReceiver<(PeerId, ShardRpcOpen, tokio::io::DuplexStream)>,
+) {
+    let (admitted_tx, admitted_rx) = mpsc::unbounded_channel();
+    let handler = ShardRpcHandler::new(move |peer, open| {
+        let admitted_tx = admitted_tx.clone();
+        let revoked = revoked.clone();
+        async move {
+            let (endpoint_io, test_io) = tokio::io::duplex(256 * 1024);
+            admitted_tx
+                .send((peer, open, test_io))
+                .expect("test keeps the admission channel open");
+            let endpoint = ShardRpcLocalEndpoint::new(endpoint_io);
+            ShardRpcAdmission::Accept(match revoked {
+                Some(revoked) => endpoint.with_revocation(async move { revoked.notified().await }),
+                None => endpoint,
+            })
+        }
+    });
+    (handler, admitted_rx)
+}
+
+fn pseudo_random_bytes(len: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed.max(1);
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_tunnel_carries_bidirectional_bytes_between_real_peers() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let requester_peer = *requester.local_peer_id();
+    let server_peer = *server.local_peer_id();
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+
+    let open = shard_rpc_open(1, 30_000, 60_000);
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, open.clone())
+        .await
+        .expect("enrolled requester is admitted");
+    assert_eq!(tunnel.peer(), server_peer);
+    assert_eq!(tunnel.session_id(), open.session_id);
+    let (caller, admitted_open, mut server_side) = admitted.recv().await.expect("admission");
+    assert_eq!(
+        caller, requester_peer,
+        "handler sees the authenticated PeerId"
+    );
+    assert_eq!(admitted_open, open);
+
+    let (splice_io, mut requester_side) = tokio::io::duplex(256 * 1024);
+    let requester_session = tokio::spawn(tunnel.splice(splice_io, None));
+
+    // Multi-MiB in both directions at once proves streaming with backpressure
+    // (neither duplex nor the yamux window can hold the whole payload).
+    let upload = pseudo_random_bytes(3 * 1024 * 1024 + 17, 0x5eed);
+    let download = pseudo_random_bytes(2 * 1024 * 1024 + 5, 0xfeed);
+    let (upload_len, download_len) = (upload.len(), download.len());
+    let (mut requester_read, mut requester_write) = tokio::io::split(requester_side);
+    let (mut server_read, mut server_write) = tokio::io::split(server_side);
+    let expected_upload = upload.clone();
+    let expected_download = download.clone();
+    let (sent_up, sent_down, got_up, got_down) =
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                async move {
+                    requester_write.write_all(&upload).await.unwrap();
+                    requester_write
+                },
+                async move {
+                    server_write.write_all(&download).await.unwrap();
+                    server_write
+                },
+                async move {
+                    let mut got = vec![0_u8; upload_len];
+                    server_read.read_exact(&mut got).await.unwrap();
+                    (server_read, got)
+                },
+                async move {
+                    let mut got = vec![0_u8; download_len];
+                    requester_read.read_exact(&mut got).await.unwrap();
+                    (requester_read, got)
+                },
+            )
+        })
+        .await
+        .expect("bidirectional transfer completes");
+    assert!(
+        got_up.1 == expected_upload,
+        "requester -> server bytes arrive intact and in order"
+    );
+    assert!(
+        got_down.1 == expected_download,
+        "server -> requester bytes arrive intact and in order"
+    );
+
+    // Small request/response round trips after the bulk transfer.
+    requester_side = got_down.0.unsplit(sent_up);
+    server_side = got_up.0.unsplit(sent_down);
+    for round in 0_u8..8 {
+        requester_side.write_all(&[round; 9]).await.unwrap();
+        let mut request = [0_u8; 9];
+        server_side.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, [round; 9]);
+        server_side.write_all(&[round ^ 0xff; 3]).await.unwrap();
+        let mut response = [0_u8; 3];
+        requester_side.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [round ^ 0xff; 3]);
+    }
+
+    // Closing the requester's local endpoint half-closes the tunnel: the
+    // server-side endpoint sees EOF, then closes in turn, ending both sessions.
+    requester_side.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), server_side.read_to_end(&mut rest))
+        .await
+        .expect("server endpoint observes EOF")
+        .unwrap();
+    assert!(rest.is_empty());
+    drop(server_side);
+    let report = tokio::time::timeout(Duration::from_secs(5), requester_session)
+        .await
+        .expect("requester session ends")
+        .unwrap();
+    assert_eq!(report.end, ShardRpcSessionEnd::LocalClosed, "{report:?}");
+    assert_eq!(report.bytes_to_remote, upload_len as u64 + 8 * 9);
+    assert_eq!(report.bytes_from_remote, download_len as u64 + 8 * 3);
+    assert_eq!(report.error, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_tunnel_fails_closed_without_handler_or_on_rejection() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+
+    // No handler installed: the stream is dropped before any handshake, so
+    // no tunnel can ever be established.
+    let error = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(2, 30_000, 60_000))
+        .await
+        .expect_err("no handler means no tunnel");
+    assert!(
+        error.to_string().contains("shard rpc"),
+        "unexpected error: {error:#}"
+    );
+
+    // A refusing handler: the requester gets the bounded reason and no bytes
+    // ever reach a local endpoint.
+    let handler = ShardRpcHandler::new(|_peer, _open| async {
+        ShardRpcAdmission::reject("caller is not enrolled")
+    });
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+    let error = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(3, 30_000, 60_000))
+        .await
+        .expect_err("rejected caller gets no tunnel");
+    assert!(
+        error.to_string().contains("rejected")
+            && error.to_string().contains("caller is not enrolled"),
+        "unexpected error: {error:#}"
+    );
+
+    // Out-of-bounds limits are refused locally, before any stream is opened.
+    let error = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(4, 0, 60_000))
+        .await
+        .expect_err("invalid idle bound");
+    assert!(error.to_string().contains("idle timeout"), "{error:#}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_revocation_and_handler_withdrawal_drop_active_sessions() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+    let revoke = Arc::new(tokio::sync::Notify::new());
+    let (handler, mut admitted) = duplex_shard_rpc_handler(Some(revoke.clone()));
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+
+    // 1. The admitting handler's revocation signal fires mid-session.
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(5, 30_000, 60_000))
+        .await
+        .unwrap();
+    let (_, _, mut server_side) = admitted.recv().await.unwrap();
+    let (splice_io, mut requester_side) = tokio::io::duplex(64 * 1024);
+    let session = tokio::spawn(tunnel.splice(splice_io, None));
+    requester_side.write_all(b"ping").await.unwrap();
+    let mut ping = [0_u8; 4];
+    server_side.read_exact(&mut ping).await.unwrap();
+    assert_eq!(&ping, b"ping");
+
+    revoke.notify_waiters();
+    // The server-side endpoint is closed and the requester's endpoint sees
+    // EOF; a real local endpoint then closes, which ends the session at once.
+    let mut server_rest = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        server_side.read_to_end(&mut server_rest),
+    )
+    .await
+    .expect("server endpoint is closed on revocation");
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        requester_side.read_to_end(&mut rest),
+    )
+    .await
+    .expect("requester endpoint observes the end of the tunnel")
+    .unwrap();
+    assert!(rest.is_empty());
+    drop(requester_side);
+    let report = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("revocation tears the requester session down promptly")
+        .unwrap();
+    assert_eq!(report.end, ShardRpcSessionEnd::RemoteClosed, "{report:?}");
+    assert_eq!(report.bytes_to_remote, 4);
+
+    // 2. Withdrawing the handler revokes every session it admitted, and new
+    //    tunnels are refused.
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(6, 30_000, 60_000))
+        .await
+        .unwrap();
+    let (_, _, _server_side) = admitted.recv().await.unwrap();
+    let (splice_io, _requester_side) = tokio::io::duplex(64 * 1024);
+    let session = tokio::spawn(tunnel.splice(splice_io, None));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!session.is_finished(), "precondition: session is live");
+    server.set_shard_rpc_handler(None).unwrap();
+    // Even if the local endpoint never closes, the half-close linger bounds
+    // how long the remote teardown takes to end this session.
+    let report = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("handler withdrawal ends the session")
+        .unwrap();
+    assert_eq!(report.end, ShardRpcSessionEnd::RemoteClosed, "{report:?}");
+    assert!(requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(7, 30_000, 60_000))
+        .await
+        .is_err());
+
+    // 3. A requester-side revocation ends the session from that end too.
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(8, 30_000, 60_000))
+        .await
+        .unwrap();
+    let (_, _, mut server_side) = admitted.recv().await.unwrap();
+    let local_revoke = Arc::new(tokio::sync::Notify::new());
+    let waiter = local_revoke.clone();
+    let (splice_io, _requester_side) = tokio::io::duplex(64 * 1024);
+    let session = tokio::spawn(tunnel.splice(
+        splice_io,
+        Some(Box::pin(async move { waiter.notified().await })),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    local_revoke.notify_waiters();
+    let report = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.end, ShardRpcSessionEnd::Revoked);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), server_side.read_to_end(&mut rest))
+        .await
+        .expect("server endpoint sees the requester-side revocation")
+        .unwrap();
+}
+
+/// `true` once `stream` reports EOF or an error within `within`.
+async fn raw_stream_closed(stream: &mut libp2p::swarm::Stream, within: Duration) -> bool {
+    let mut byte = [0_u8; 1];
+    matches!(
+        tokio::time::timeout(within, stream.read(&mut byte)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_serving_side_enforces_bounds_without_requester_cooperation() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    use tokio::io::AsyncReadExt as _;
+
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+
+    // Idle bound. The requester takes the raw substream and never runs a
+    // splice (so it enforces nothing): the server alone must reap the silent
+    // tunnel, closing both its local endpoint and the substream.
+    let idle_ms = crate::protocol::SHARD_RPC_MIN_IDLE_TIMEOUT_MS;
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(9, idle_ms, 60_000))
+        .await
+        .unwrap();
+    let mut raw = tunnel.stream;
+    let (_, _, mut server_side) = admitted.recv().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let mut sink = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), server_side.read_to_end(&mut sink))
+        .await
+        .expect("server reaps the idle tunnel's local endpoint")
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(idle_ms - 50));
+    assert!(
+        raw_stream_closed(&mut raw, Duration::from_secs(5)).await,
+        "server closes the idle substream"
+    );
+
+    // Session bound. The raw requester keeps the tunnel busy; the server must
+    // still end it at the lifetime bound.
+    let session_ms = crate::protocol::SHARD_RPC_MIN_SESSION_MS;
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(10, 30_000, session_ms))
+        .await
+        .unwrap();
+    let raw = tunnel.stream;
+    let (_, _, server_side) = admitted.recv().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let drain = tokio::spawn(async move {
+        let mut server_side = server_side;
+        let mut sink = Vec::new();
+        let _ = server_side.read_to_end(&mut sink).await;
+        sink.len()
+    });
+    let chatter = tokio::spawn(async move {
+        let mut raw = raw;
+        while raw.write_all(b"busy").await.is_ok() && raw.flush().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let drained = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("server ends a busy tunnel at its session bound")
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(session_ms - 50));
+    assert!(
+        drained > 0,
+        "the tunnel was carrying traffic when it expired"
+    );
+    tokio::time::timeout(Duration::from_secs(5), chatter)
+        .await
+        .expect("requester writes fail once the server has ended the session")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_traffic_in_either_direction_postpones_the_idle_bound() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+    let idle_ms = crate::protocol::SHARD_RPC_MIN_IDLE_TIMEOUT_MS;
+    let tunnel = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(11, idle_ms, 60_000))
+        .await
+        .unwrap();
+    let (_, _, mut server_side) = admitted.recv().await.unwrap();
+    let (splice_io, mut requester_side) = tokio::io::duplex(64 * 1024);
+    let session = tokio::spawn(tunnel.splice(splice_io, None));
+
+    // 2.5 idle bounds of steady traffic, alternating direction.
+    let started = tokio::time::Instant::now();
+    let mut round = 0_u8;
+    while started.elapsed() < Duration::from_millis(idle_ms * 5 / 2) {
+        let mut byte = [0_u8; 1];
+        if round.is_multiple_of(2) {
+            requester_side.write_all(&[round]).await.unwrap();
+            server_side.read_exact(&mut byte).await.unwrap();
+        } else {
+            server_side.write_all(&[round]).await.unwrap();
+            requester_side.read_exact(&mut byte).await.unwrap();
+        }
+        assert_eq!(byte[0], round);
+        round = round.wrapping_add(1);
+        tokio::time::sleep(Duration::from_millis(idle_ms / 4)).await;
+    }
+    assert!(
+        !session.is_finished(),
+        "an active tunnel must outlive its idle bound"
+    );
+
+    // Silence: now it is reaped.
+    let report = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("tunnel is reaped once traffic stops")
+        .unwrap();
+    assert!(
+        matches!(
+            report.end,
+            ShardRpcSessionEnd::IdleTimeout | ShardRpcSessionEnd::RemoteClosed
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_global_session_and_outbound_caps_fail_closed() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+
+    // Global inbound session cap: other peers hold every session slot. The
+    // caller is admitted by the handler but refused a session, and the
+    // endpoint the handler produced is dropped.
+    let held: Vec<_> = (0..MAX_INBOUND_SHARD_RPC_SESSIONS)
+        .map(|_| {
+            server
+                .shard_rpc_sessions
+                .try_acquire(PeerId::random())
+                .expect("slot")
+        })
+        .collect();
+    let refused = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(12, 30_000, 60_000))
+        .await
+        .expect_err("no session slot left");
+    assert!(
+        refused.to_string().contains("session limit reached"),
+        "{refused:#}"
+    );
+    let (_, _, mut orphan) = admitted.recv().await.unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut orphan, &mut rest),
+    )
+    .await
+    .expect("refused endpoint is dropped")
+    .unwrap();
+    drop(held);
+    requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(13, 30_000, 60_000))
+        .await
+        .expect("a freed slot admits the session");
+
+    // Outbound cap: with every outbound slot taken, no stream is opened.
+    let all = requester
+        .outbound_shard_rpc_sessions
+        .clone()
+        .try_acquire_many_owned(MAX_OUTBOUND_SHARD_RPC_SESSIONS as u32)
+        .expect("drain outbound slots");
+    let error = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(14, 30_000, 60_000))
+        .await
+        .expect_err("outbound cap");
+    assert!(
+        error
+            .to_string()
+            .contains("outbound shard rpc session limit"),
+        "{error:#}"
+    );
+    drop(all);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_withdrawal_during_admission_and_peer_filter_fail_closed() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+
+    // A handler that admits only after the test releases it; the handler is
+    // withdrawn in between, so the admitted endpoint must not be used.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (gate_release, gate_entered) = (release.clone(), entered.clone());
+    server
+        .set_shard_rpc_handler(Some(ShardRpcHandler::new(move |_peer, _open| {
+            let (release, entered) = (gate_release.clone(), gate_entered.clone());
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                ShardRpcAdmission::Accept(ShardRpcLocalEndpoint::new(tokio::io::duplex(1024).0))
+            }
+        })))
+        .unwrap();
+    let opening = {
+        let requester = requester.clone();
+        tokio::spawn(async move {
+            requester
+                .open_shard_rpc_tunnel(server_peer, shard_rpc_open(15, 30_000, 60_000))
+                .await
+        })
+    };
+    entered.notified().await;
+    let (replacement, _replacement_admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(replacement)).unwrap();
+    release.notify_one();
+    let error = opening
+        .await
+        .unwrap()
+        .expect_err("withdrawn handler's admission must not stand");
+    assert!(
+        error.to_string().contains("withdrawn during admission"),
+        "{error:#}"
+    );
+
+    // Peer filter: a filtered peer is dropped before anything is read, so the
+    // admission callback never runs and nothing is revealed.
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let requester_peer = *requester.local_peer_id();
+    server
+        .set_shard_rpc_handler(Some(
+            ShardRpcHandler::new(move |_peer, _open| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { ShardRpcAdmission::reject("unreachable") }
+            })
+            .with_peer_filter(move |peer| *peer != requester_peer),
+        ))
+        .unwrap();
+    let error = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(16, 30_000, 60_000))
+        .await
+        .expect_err("filtered peer gets no tunnel");
+    assert!(
+        !error.to_string().contains("unreachable"),
+        "filtered peers never reach admission: {error:#}"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_rpc_inbound_sessions_are_bounded_per_peer() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    let (requester, server) = connected_shard_rpc_pair().await;
+    let server_peer = *server.local_peer_id();
+    let (handler, mut admitted) = duplex_shard_rpc_handler(None);
+    server.set_shard_rpc_handler(Some(handler)).unwrap();
+
+    let mut sessions = Vec::new();
+    for index in 0..MAX_INBOUND_SHARD_RPC_SESSIONS_PER_PEER {
+        let tunnel = requester
+            .open_shard_rpc_tunnel(
+                server_peer,
+                shard_rpc_open(20 + index as u8, 30_000, 60_000),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("session {index} within the cap: {error:#}"));
+        let (_, _, server_side) = admitted.recv().await.unwrap();
+        let (splice_io, requester_side) = tokio::io::duplex(1024);
+        sessions.push((
+            tokio::spawn(tunnel.splice(splice_io, None)),
+            requester_side,
+            server_side,
+        ));
+    }
+    let over_cap = requester
+        .open_shard_rpc_tunnel(server_peer, shard_rpc_open(99, 30_000, 60_000))
+        .await;
+    assert!(
+        over_cap.is_err(),
+        "the per-peer inbound cap admits no extra session"
+    );
+
+    // Releasing one session frees exactly one slot.
+    let (session, requester_side, server_side) = sessions.pop().unwrap();
+    drop(requester_side);
+    drop(server_side);
+    tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("released session ends")
+        .unwrap();
+    let mut reopened = None;
+    for _ in 0..50 {
+        match requester
+            .open_shard_rpc_tunnel(server_peer, shard_rpc_open(98, 30_000, 60_000))
+            .await
+        {
+            Ok(tunnel) => {
+                reopened = Some(tunnel);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert!(reopened.is_some(), "a freed slot admits a new session");
+    for (session, _, _) in sessions {
+        session.abort();
+    }
+}
+
+/// `phase-net` stays a workload-neutral substrate: no inference-backend or
+/// model-format names in its non-test sources, and unsafe code stays denied.
+#[test]
+fn phase_net_sources_stay_workload_neutral_and_deny_unsafe_code() {
+    let sources = [
+        ("lib.rs", include_str!("../lib.rs")),
+        ("peer.rs", include_str!("../peer.rs")),
+        ("protocol.rs", include_str!("../protocol.rs")),
+        ("discovery/mod.rs", include_str!("mod.rs")),
+    ];
+    // Assembled at runtime so this file does not itself contain the needles.
+    let forbidden: Vec<String> = [["lla", "ma"], ["gg", "ml"], ["ml", "x"], ["gg", "uf"]]
+        .iter()
+        .map(|parts| parts.concat())
+        .collect();
+    for (name, source) in sources {
+        let lowered = source.to_ascii_lowercase();
+        for needle in &forbidden {
+            assert!(
+                !lowered.contains(needle.as_str()),
+                "phase-net/src/{name} names workload backend {needle:?}"
+            );
+        }
+    }
+    assert!(
+        include_str!("../lib.rs").contains("#![deny(unsafe_code)]"),
+        "phase-net must keep #![deny(unsafe_code)]"
+    );
+}

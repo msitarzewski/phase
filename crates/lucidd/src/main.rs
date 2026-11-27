@@ -239,8 +239,19 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     llama_rpc_servers: Vec<String>,
 
+    /// Optional comma-separated enrolled PeerIds for Tier-1 Trusted-Circle
+    /// layer offload over the Noise-encrypted `/phase/shard-rpc/1.0.0` tunnel.
+    /// Each peer gets an ephemeral `127.0.0.1` proxy that llama-server uses as
+    /// one more `--rpc` endpoint (after any `--llama-rpc-servers`, in order).
+    /// The peer admits the tunnel only if this node is enrolled there and its
+    /// `cluster_enabled` is on; this node also requires `cluster_enabled`.
+    #[arg(long, value_delimiter = ',', value_name = "PEER_ID")]
+    llama_rpc_peers: Vec<String>,
+
     /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g.
-    /// `30,70`) used when `--llama-rpc-servers` is set.
+    /// `30,70`) used when `--llama-rpc-servers` or `--llama-rpc-peers` is set.
+    /// llama.cpp orders a model's devices RPC-first: the weights apply to the
+    /// `--rpc` endpoints in order, then to local GPUs.
     #[arg(long)]
     llama_tensor_split: Option<String>,
 
@@ -250,6 +261,14 @@ struct Cli {
     /// is opted in and caller authz + signed partition-plan verification pass.
     #[arg(long)]
     shard_stage_bridge_port: Option<u16>,
+
+    /// Optional loopback port (`127.0.0.1:<PORT>`) of an operator-run
+    /// `ggml-rpc-server -H 127.0.0.1 -p <PORT> -c`. When set, enrolled peers
+    /// may open `/phase/shard-rpc/1.0.0` tunnels that are bridged to it, ONLY
+    /// while `cluster_enabled` is on; turning it off drops live tunnels.
+    /// Default: off (no tunnel is ever admitted).
+    #[arg(long)]
+    shard_rpc_bridge_port: Option<u16>,
 
     /// Absolute path to the pinned `mlx_lm.server` entry point. Required with
     /// `--worker mlx`; PATH lookup is intentionally not performed.
@@ -478,12 +497,17 @@ fn prepare_mlx_startup(cli: &Cli, platform_supported: bool) -> Result<PreparedMl
 }
 
 /// Fail fast on an inconsistent Tier-1 RPC offload flag set: non-loopback or
-/// malformed `--llama-rpc-servers`, a malformed `--llama-tensor-split`, or a
-/// `--llama-tensor-split` without `--llama-rpc-servers` (which llama-server
-/// would otherwise silently ignore).
-fn validate_llama_rpc_cli(cli: &Cli) -> Result<(), String> {
-    lucidd::worker_llama::validate_rpc_offload_flags(
+/// malformed `--llama-rpc-servers`, malformed or duplicate `--llama-rpc-peers`,
+/// a malformed `--llama-tensor-split`, a `--llama-tensor-split` with no RPC
+/// endpoint at all (which llama-server would otherwise silently ignore), too
+/// many endpoints, or a zero `--shard-rpc-bridge-port`.
+fn validate_llama_rpc_cli(cli: &Cli) -> Result<Vec<PeerId>, String> {
+    if cli.shard_rpc_bridge_port == Some(0) {
+        return Err("--shard-rpc-bridge-port must be a non-zero loopback port".into());
+    }
+    lucidd::worker_llama::rpc_peers::validate_rpc_offload_cli(
         &cli.llama_rpc_servers,
+        &cli.llama_rpc_peers,
         cli.llama_tensor_split.as_deref(),
     )
     .map_err(|error| error.to_string())
@@ -927,7 +951,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Tier-1 RPC offload flags fail fast, before any identity, DNS, libp2p,
     // or HTTP listener is opened.
-    validate_llama_rpc_cli(&cli)?;
+    let llama_rpc_peers = validate_llama_rpc_cli(&cli)?;
+    if !llama_rpc_peers.is_empty() && worker_choice != Some(WorkerChoice::LlamaCpp) {
+        return Err("--llama-rpc-peers requires a llama-cpp worker (--worker llama-cpp)".into());
+    }
 
     // Persistent identity: libp2p peer-id + receipt signing key derive
     // from this. Default location: ~/.config/phase/identity.key (or the
@@ -1420,17 +1447,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let extra_env = Vec::new();
                 // Flags were validated by `validate_llama_rpc_cli` at startup;
                 // the worker re-validates them before every spawn.
-                let model_load_timeout = if cli.llama_rpc_servers.is_empty() {
-                    LlamaCppConfig::default().model_load_timeout
+                // Enrolled-peer layer offload: every llama-server spawn gets its
+                // own loopback proxy per peer, tunnelled over
+                // /phase/shard-rpc/1.0.0 (see `worker_llama::rpc_peers`).
+                let rpc_peer_offload = if llama_rpc_peers.is_empty() {
+                    None
                 } else {
-                    std::time::Duration::from_secs(300)
+                    Some(lucidd::worker_llama::rpc_peers::RpcPeerOffload::new(
+                        discovery.clone(),
+                        llama_rpc_peers.clone(),
+                        lucidd::worker_llama::rpc_peers::RpcPeerTunnelConfig::default(),
+                    )?)
                 };
-                if !cli.llama_rpc_servers.is_empty()
-                    && !node_config_store.snapshot().cluster_enabled
-                {
+                let uses_rpc = !cli.llama_rpc_servers.is_empty() || rpc_peer_offload.is_some();
+                let model_load_timeout = if uses_rpc {
+                    std::time::Duration::from_secs(300)
+                } else {
+                    LlamaCppConfig::default().model_load_timeout
+                };
+                if uses_rpc && !node_config_store.snapshot().cluster_enabled {
                     tracing::warn!(
                         rpc_servers = cli.llama_rpc_servers.len(),
-                        "--llama-rpc-servers is set but cluster_enabled = false: every llama-cpp job is refused until the trusted-circle opt-in is enabled in node.toml / settings"
+                        rpc_peers = llama_rpc_peers.len(),
+                        "trusted-circle RPC layer offload is configured but cluster_enabled = false: every llama-cpp job is refused until the trusted-circle opt-in is enabled in node.toml / settings"
                     );
                 }
                 let config = LlamaCppConfig {
@@ -1441,6 +1480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     model_load_timeout,
                     extra_env,
                     rpc_servers: cli.llama_rpc_servers.clone(),
+                    rpc_peer_offload,
                     tensor_split: cli.llama_tensor_split.clone(),
                     // Layer offload ships prompt-derived activations to RPC
                     // peers, so it follows the live `cluster_enabled` opt-in.
@@ -1460,6 +1500,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(
                         trust_label = worker.execution_trust_label(),
                         "local llama-cpp worker uses trusted-circle RPC layer offload"
+                    );
+                }
+                if !llama_rpc_peers.is_empty() {
+                    tracing::info!(
+                        peers = ?llama_rpc_peers,
+                        "trusted-circle RPC layer offload tunnels to enrolled peers over /phase/shard-rpc/1.0.0"
                     );
                 }
                 Some(worker as Arc<dyn DynWorker>)
@@ -1554,6 +1600,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loopback_port = bridge_port,
             cluster_enabled = node_config_store.snapshot().cluster_enabled,
             "registered opt-in Tier-1 Trusted-Circle shard stage handler"
+        );
+    }
+
+    // Provider side of Tier-1 layer offload: bridge enrolled peers' shard-rpc
+    // tunnels to the operator's loopback ggml-rpc-server. Installed only when
+    // the operator configures the bridge port; every tunnel is still refused
+    // unless `cluster_enabled = true` and the caller is enrolled, and live
+    // tunnels drop as soon as either stops holding.
+    if let Some(bridge_port) = cli.shard_rpc_bridge_port {
+        let shard_rpc_handler = lucidd::shard_worker::make_opt_in_inbound_shard_rpc_handler(
+            policy.clone(),
+            node_config_store.clone(),
+            bridge_port,
+        )?;
+        discovery.set_shard_rpc_handler(Some(shard_rpc_handler))?;
+        tracing::info!(
+            loopback_port = bridge_port,
+            cluster_enabled = node_config_store.snapshot().cluster_enabled,
+            "registered opt-in Tier-1 Trusted-Circle shard rpc bridge"
         );
     }
 
@@ -2230,6 +2295,58 @@ mod tests {
             let cli = Cli::try_parse_from(args.clone()).expect("flags parse");
             assert!(validate_llama_rpc_cli(&cli).is_ok(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn llama_rpc_peers_and_shard_rpc_bridge_flags_fail_fast() {
+        let peer = PeerId::random().to_string();
+        let cli = Cli::try_parse_from([
+            "lucidd",
+            "--llama-rpc-peers",
+            &peer,
+            "--llama-tensor-split",
+            "40,60",
+        ])
+        .expect("flags parse");
+        assert_eq!(
+            validate_llama_rpc_cli(&cli).expect("peers alone satisfy a tensor split"),
+            vec![peer.parse::<PeerId>().unwrap()]
+        );
+
+        let other = PeerId::random().to_string();
+        let both = format!("{peer},{other}");
+        let cli = Cli::try_parse_from([
+            "lucidd",
+            "--llama-rpc-servers",
+            "127.0.0.1:50052",
+            "--llama-rpc-peers",
+            &both,
+        ])
+        .expect("flags parse");
+        assert_eq!(validate_llama_rpc_cli(&cli).unwrap().len(), 2);
+
+        for args in [
+            vec!["lucidd", "--llama-rpc-peers", "not-a-peer-id"],
+            vec!["lucidd", "--llama-rpc-peers", &format!("{peer},{peer}")],
+            vec![
+                "lucidd",
+                "--llama-rpc-peers",
+                &peer,
+                "--llama-rpc-servers",
+                "198.51.100.7:50052",
+            ],
+            vec!["lucidd", "--shard-rpc-bridge-port", "0"],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("flags parse");
+            assert!(validate_llama_rpc_cli(&cli).is_err(), "{args:?}");
+        }
+
+        let cli = Cli::try_parse_from(["lucidd", "--shard-rpc-bridge-port", "50052"])
+            .expect("flags parse");
+        assert!(validate_llama_rpc_cli(&cli).unwrap().is_empty());
+        assert_eq!(cli.shard_rpc_bridge_port, Some(50052));
+        let cli = Cli::try_parse_from(["lucidd"]).expect("flags parse");
+        assert_eq!(cli.shard_rpc_bridge_port, None, "bridge is off by default");
     }
 
     #[test]

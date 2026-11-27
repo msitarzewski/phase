@@ -52,10 +52,11 @@ use crate::protocol::{
     BlobStreamFrame, BlobStreamFrameKind, BlobStreamRequest, BlobStreamValidator, JobOffer,
     JobRelayRequest, JobRelayResponse, JobRelayStreamControl, JobRelayStreamControlKind,
     JobRelayStreamFrame, JobRelayStreamFrameKind, JobRelayStreamOpen, JobRelayStreamValidator,
-    JobResponse, RejectionReason, ShardStageRequest, ShardStageResponse, ShardStageResponseKind,
-    BLOB_STREAM_MAX_CHUNK_BYTES, BLOB_STREAM_MAX_METADATA_BYTES, BLOB_STREAM_PROTOCOL,
-    JOB_RELAY_STREAM_DEFAULT_IDLE_TIMEOUT_MS, JOB_RELAY_STREAM_MAX_EVENT_BYTES,
-    JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_PROTOCOL, JOB_RELAY_STREAM_SCHEMA_VERSION,
+    JobResponse, RejectionReason, ShardRpcDecision, ShardRpcDecisionKind, ShardRpcOpen,
+    ShardStageRequest, ShardStageResponse, ShardStageResponseKind, BLOB_STREAM_MAX_CHUNK_BYTES,
+    BLOB_STREAM_MAX_METADATA_BYTES, BLOB_STREAM_PROTOCOL, JOB_RELAY_STREAM_DEFAULT_IDLE_TIMEOUT_MS,
+    JOB_RELAY_STREAM_MAX_EVENT_BYTES, JOB_RELAY_STREAM_MAX_OPEN_BYTES, JOB_RELAY_STREAM_PROTOCOL,
+    JOB_RELAY_STREAM_SCHEMA_VERSION, SHARD_RPC_MAX_REASON_BYTES, SHARD_RPC_PROTOCOL,
     SHARD_STAGE_MAX_PAYLOAD_BYTES, SHARD_STAGE_MAX_PLAN_BYTES, SHARD_STAGE_MAX_RECEIPT_BYTES,
     SHARD_STAGE_PROTOCOL, SHARD_STAGE_SCHEMA_VERSION,
 };
@@ -70,6 +71,38 @@ const JOB_RELAY_PROTOCOL: &str = "/phase/job-relay/1.0.0";
 
 const MAX_INBOUND_STREAM_TASKS: usize = 64;
 const MAX_INBOUND_STREAMS_PER_PEER: usize = 4;
+/// Shard-rpc tunnels are long-lived, so they get their own admission pools:
+/// a quiet tunnel can neither starve request/response-shaped substreams nor
+/// be starved by them. A session slot is taken only once the workload handler
+/// has admitted the caller, so peers that never complete a handshake (or are
+/// refused) cannot occupy one.
+pub const MAX_INBOUND_SHARD_RPC_SESSIONS: usize = 32;
+pub const MAX_INBOUND_SHARD_RPC_SESSIONS_PER_PEER: usize = 8;
+/// Short-lived slots for streams still in the open/admission handshake. The
+/// per-peer allowance matches the per-peer session cap so an admitted peer
+/// opening several tunnels at once is never dropped mid-handshake; peers a
+/// workload filter rejects never reach this pool.
+pub const MAX_PENDING_SHARD_RPC_HANDSHAKES: usize = 32;
+pub const MAX_PENDING_SHARD_RPC_HANDSHAKES_PER_PEER: usize =
+    MAX_INBOUND_SHARD_RPC_SESSIONS_PER_PEER;
+pub const MAX_OUTBOUND_SHARD_RPC_SESSIONS: usize = 128;
+/// The requester writes its fixed-size open envelope immediately after
+/// negotiation, so a stream that has not delivered it within this bound is
+/// dropped and its handshake slot freed.
+const SHARD_RPC_OPEN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on writing a decision frame; raw tunnel bytes never flow before the
+/// admission decision is written.
+const SHARD_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SHARD_RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// After one direction reaches EOF (forwarded as a write shutdown to the
+/// other side) the remaining direction gets this long to drain. A peer that
+/// stops sending is almost always about to close; a long linger would only
+/// delay propagating a remote teardown to the local endpoint.
+const SHARD_RPC_HALF_CLOSE_LINGER: Duration = Duration::from_secs(2);
+const SHARD_RPC_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHARD_RPC_SPLICE_BUFFER_BYTES: usize = 64 * 1024;
+const SHARD_RPC_OPEN_WIRE_MAX_BYTES: usize = 256;
+const SHARD_RPC_DECISION_WIRE_MAX_BYTES: usize = SHARD_RPC_MAX_REASON_BYTES + 256;
 const MAX_BLOB_BYTES_PER_PEER_PER_SECOND: usize = 16 * 1024 * 1024;
 const BLOB_BANDWIDTH_WINDOW: Duration = Duration::from_secs(1);
 
@@ -153,6 +186,204 @@ pub type ShardStageHandler = Arc<
         + Sync
         + 'static,
 >;
+
+type ShardRpcAdmit = Arc<
+    dyn Fn(PeerId, ShardRpcOpen) -> Pin<Box<dyn Future<Output = ShardRpcAdmission> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+type ShardRpcPeerFilter = Arc<dyn Fn(&PeerId) -> bool + Send + Sync + 'static>;
+
+/// Workload-neutral tunnel admission service for [`SHARD_RPC_PROTOCOL`].
+///
+/// `phase-net` validates the open envelope and supplies the authenticated
+/// libp2p `PeerId`; the workload layer decides whether that peer may open a
+/// tunnel and, if so, which local byte endpoint the tunnel reaches. An
+/// optional synchronous peer filter runs before any byte is read, so peers
+/// the workload would never admit are dropped without holding a handshake
+/// slot and without learning anything about the serving node.
+#[derive(Clone)]
+pub struct ShardRpcHandler {
+    admit_fn: ShardRpcAdmit,
+    peer_filter: Option<ShardRpcPeerFilter>,
+}
+
+impl ShardRpcHandler {
+    pub fn new<F, Fut>(admit: F) -> Self
+    where
+        F: Fn(PeerId, ShardRpcOpen) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ShardRpcAdmission> + Send + 'static,
+    {
+        Self {
+            admit_fn: Arc::new(move |peer, open| Box::pin(admit(peer, open))),
+            peer_filter: None,
+        }
+    }
+
+    /// Drop inbound streams from peers for which `filter` returns `false`
+    /// before reading anything from them.
+    pub fn with_peer_filter(
+        mut self,
+        filter: impl Fn(&PeerId) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.peer_filter = Some(Arc::new(filter));
+        self
+    }
+
+    /// The synchronous pre-filter: `false` means streams from `peer` are
+    /// dropped before anything is read.
+    pub fn accepts_peer(&self, peer: &PeerId) -> bool {
+        self.peer_filter.as_ref().is_none_or(|filter| filter(peer))
+    }
+
+    /// Run the admission callback (what `phase-net` does once a validated
+    /// open envelope has arrived from an accepted peer).
+    pub async fn admit(&self, peer: PeerId, open: ShardRpcOpen) -> ShardRpcAdmission {
+        (self.admit_fn)(peer, open).await
+    }
+}
+
+impl std::fmt::Debug for ShardRpcHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardRpcHandler")
+            .field("peer_filter", &self.peer_filter.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resolves when an established tunnel session must be torn down (for
+/// example, because the operator withdrew the authorization that admitted it).
+pub type ShardRpcRevocation = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+trait ShardRpcLocalIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static {}
+
+impl<T> ShardRpcLocalIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
+{
+}
+
+/// The local byte endpoint an admitted tunnel is spliced onto, plus an
+/// optional revocation signal that ends the session early.
+pub struct ShardRpcLocalEndpoint {
+    io: Box<dyn ShardRpcLocalIo>,
+    revoked: Option<ShardRpcRevocation>,
+}
+
+impl ShardRpcLocalEndpoint {
+    pub fn new(
+        io: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    ) -> Self {
+        Self {
+            io: Box::new(io),
+            revoked: None,
+        }
+    }
+
+    /// End the session as soon as `revoked` resolves.
+    pub fn with_revocation(mut self, revoked: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.revoked = Some(Box::pin(revoked));
+        self
+    }
+}
+
+impl std::fmt::Debug for ShardRpcLocalEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardRpcLocalEndpoint")
+            .field("revocable", &self.revoked.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Admission decision returned by a [`ShardRpcHandler`].
+#[derive(Debug)]
+pub enum ShardRpcAdmission {
+    Accept(ShardRpcLocalEndpoint),
+    Reject { reason: String },
+}
+
+impl ShardRpcAdmission {
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Reject {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Why a spliced tunnel session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardRpcSessionEnd {
+    /// The local endpoint closed (or failed) first.
+    LocalClosed,
+    /// The remote peer closed (or failed) first.
+    RemoteClosed,
+    /// No bytes moved in either direction for the negotiated idle bound.
+    IdleTimeout,
+    /// The negotiated total session lifetime elapsed.
+    SessionExpired,
+    /// The revocation signal fired, or the serving handler was replaced.
+    Revoked,
+}
+
+/// Outcome of one spliced tunnel session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRpcSessionReport {
+    pub end: ShardRpcSessionEnd,
+    pub bytes_to_remote: u64,
+    pub bytes_from_remote: u64,
+    /// Transport error that ended the session, if it did not end cleanly.
+    pub error: Option<String>,
+}
+
+/// An accepted outbound tunnel, not yet spliced onto a local endpoint.
+/// Holds one of the bounded outbound session slots until dropped.
+pub struct ShardRpcTunnel {
+    peer: PeerId,
+    session_id: [u8; 32],
+    stream: libp2p::swarm::Stream,
+    idle_timeout: Duration,
+    max_session: Duration,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ShardRpcTunnel {
+    pub fn peer(&self) -> PeerId {
+        self.peer
+    }
+
+    pub fn session_id(&self) -> [u8; 32] {
+        self.session_id
+    }
+
+    /// Pump bytes between `local` and the remote peer until either side
+    /// closes, the negotiated idle or session bound elapses, or `revoked`
+    /// resolves.
+    pub async fn splice(
+        self,
+        local: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+        revoked: Option<ShardRpcRevocation>,
+    ) -> ShardRpcSessionReport {
+        let Self {
+            stream,
+            idle_timeout,
+            max_session,
+            _permit,
+            ..
+        } = self;
+        splice_shard_rpc_session(stream, local, idle_timeout, max_session, revoked).await
+    }
+}
+
+impl std::fmt::Debug for ShardRpcTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardRpcTunnel")
+            .field("peer", &self.peer)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_session", &self.max_session)
+            .finish_non_exhaustive()
+    }
+}
 
 struct InboundStreamAdmission {
     global: Arc<Semaphore>,
@@ -839,6 +1070,15 @@ pub struct Discovery {
     job_relay_stream_handler: Arc<RwLock<Option<JobRelayStreamHandler>>>,
     blob_stream_handler: Arc<RwLock<Option<BlobStreamHandler>>>,
     shard_stage_handler: Arc<RwLock<Option<ShardStageHandler>>>,
+    shard_rpc_handler: Arc<RwLock<Option<ShardRpcHandler>>>,
+    /// Bumped whenever the shard-rpc handler is replaced or cleared. Every
+    /// inbound session watches it, so withdrawing the handler tears down the
+    /// sessions it admitted; dropping `Discovery` closes the channel and has
+    /// the same effect.
+    shard_rpc_generation: tokio::sync::watch::Sender<u64>,
+    outbound_shard_rpc_sessions: Arc<Semaphore>,
+    #[cfg(test)]
+    shard_rpc_sessions: Arc<InboundStreamAdmission>,
     /// Background driver task. `run()` takes this to await shutdown; if the
     /// daemon never calls `run()`, the task is torn down when Discovery
     /// drops (the cmd_rx side sees its last Sender go and exits).
@@ -1035,6 +1275,9 @@ impl Discovery {
         let incoming_shard_stage_streams = job_relay_stream_control
             .accept(StreamProtocol::new(SHARD_STAGE_PROTOCOL))
             .context("register shard stage protocol")?;
+        let incoming_shard_rpc_streams = job_relay_stream_control
+            .accept(StreamProtocol::new(SHARD_RPC_PROTOCOL))
+            .context("register shard rpc protocol")?;
         let job_relay_stream_handler: Arc<RwLock<Option<JobRelayStreamHandler>>> =
             Arc::new(RwLock::new(None));
         let blob_stream_handler: Arc<RwLock<Option<BlobStreamHandler>>> =
@@ -1057,6 +1300,24 @@ impl Discovery {
             incoming_shard_stage_streams,
             shard_stage_handler.clone(),
             inbound_stream_admission,
+        ));
+        let shard_rpc_handler: Arc<RwLock<Option<ShardRpcHandler>>> = Arc::new(RwLock::new(None));
+        let (shard_rpc_generation, shard_rpc_generation_rx) = tokio::sync::watch::channel(0_u64);
+        let shard_rpc_sessions = InboundStreamAdmission::new(
+            MAX_INBOUND_SHARD_RPC_SESSIONS,
+            MAX_INBOUND_SHARD_RPC_SESSIONS_PER_PEER,
+        );
+        tokio::spawn(run_incoming_shard_rpc_streams(
+            incoming_shard_rpc_streams,
+            shard_rpc_handler.clone(),
+            ShardRpcAdmissionPools {
+                handshakes: InboundStreamAdmission::new(
+                    MAX_PENDING_SHARD_RPC_HANDSHAKES,
+                    MAX_PENDING_SHARD_RPC_HANDSHAKES_PER_PEER,
+                ),
+                sessions: shard_rpc_sessions.clone(),
+            },
+            shard_rpc_generation_rx,
         ));
 
         // Wire up bootstrap peers. Format expected:
@@ -1119,6 +1380,11 @@ impl Discovery {
             job_relay_stream_handler,
             blob_stream_handler,
             shard_stage_handler,
+            shard_rpc_handler,
+            shard_rpc_generation,
+            outbound_shard_rpc_sessions: Arc::new(Semaphore::new(MAX_OUTBOUND_SHARD_RPC_SESSIONS)),
+            #[cfg(test)]
+            shard_rpc_sessions,
             driver: Some(driver),
         })
     }
@@ -1643,6 +1909,86 @@ impl Discovery {
             .write()
             .map_err(|_| anyhow!("shard stage handler lock poisoned"))?;
         *slot = handler;
+        Ok(())
+    }
+
+    /// Open an authorized opaque byte tunnel to `peer` over
+    /// [`SHARD_RPC_PROTOCOL`].
+    ///
+    /// Returns only after the serving side has admitted the session; raw
+    /// bytes never cross before that. A refusal surfaces as an error carrying
+    /// the server's bounded reason. At most [`MAX_OUTBOUND_SHARD_RPC_SESSIONS`]
+    /// tunnels (handshaking or spliced) exist at once.
+    pub async fn open_shard_rpc_tunnel(
+        &self,
+        peer: PeerId,
+        open: ShardRpcOpen,
+    ) -> Result<ShardRpcTunnel> {
+        open.validate().map_err(anyhow::Error::new)?;
+        let permit = self
+            .outbound_shard_rpc_sessions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("outbound shard rpc session limit reached"))?;
+        let negotiation_deadline =
+            tokio::time::Instant::now() + OUTBOUND_STREAM_NEGOTIATION_TIMEOUT;
+
+        let mut control = self.job_relay_stream_control.clone();
+        let mut stream = tokio::time::timeout_at(
+            negotiation_deadline,
+            control.open_stream(peer, StreamProtocol::new(SHARD_RPC_PROTOCOL)),
+        )
+        .await
+        .map_err(|_| anyhow!("shard rpc negotiation timed out"))?
+        .map_err(|error| anyhow!("open shard rpc stream to {peer}: {error}"))?;
+        drop(control);
+
+        tokio::time::timeout_at(
+            negotiation_deadline,
+            write_postcard_frame(&mut stream, &open, SHARD_RPC_OPEN_WIRE_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| anyhow!("shard rpc open write timed out"))?
+        .context("write shard rpc open")?;
+
+        let decision: ShardRpcDecision = tokio::time::timeout(
+            SHARD_RPC_ADMISSION_TIMEOUT + SHARD_RPC_HANDSHAKE_TIMEOUT,
+            read_postcard_frame(&mut stream, SHARD_RPC_DECISION_WIRE_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| anyhow!("shard rpc admission decision timed out"))?
+        .context("read shard rpc admission decision")?;
+        decision
+            .validate_for(open.session_id)
+            .map_err(anyhow::Error::new)?;
+        match decision.kind {
+            ShardRpcDecisionKind::Accepted => Ok(ShardRpcTunnel {
+                peer,
+                session_id: open.session_id,
+                stream,
+                idle_timeout: Duration::from_millis(open.idle_timeout_ms),
+                max_session: Duration::from_millis(open.max_session_ms),
+                _permit: permit,
+            }),
+            ShardRpcDecisionKind::Rejected { reason } => {
+                let _ = tokio::time::timeout(SHARD_RPC_TEARDOWN_TIMEOUT, stream.close()).await;
+                Err(anyhow!("shard rpc tunnel rejected by {peer}: {reason}"))
+            }
+        }
+    }
+
+    /// Install or clear the inbound shard-rpc admission callback. With no
+    /// handler, inbound tunnels are dropped before any handshake. Replacing
+    /// or clearing the handler also tears down every inbound session the
+    /// previous handler admitted.
+    pub fn set_shard_rpc_handler(&self, handler: Option<ShardRpcHandler>) -> Result<()> {
+        let mut slot = self
+            .shard_rpc_handler
+            .write()
+            .map_err(|_| anyhow!("shard rpc handler lock poisoned"))?;
+        *slot = handler;
+        self.shard_rpc_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
     }
 
@@ -2309,6 +2655,425 @@ async fn serve_incoming_shard_stage_stream(
     write_postcard_frame(&mut stream, &response, SHARD_STAGE_RESPONSE_WIRE_MAX_BYTES).await?;
     stream.close().await.context("close shard stage stream")?;
     Ok(())
+}
+
+/// Inbound shard-rpc admission pools: short-lived handshake slots, and
+/// long-lived session slots taken only after the workload admits the caller.
+struct ShardRpcAdmissionPools {
+    handshakes: Arc<InboundStreamAdmission>,
+    sessions: Arc<InboundStreamAdmission>,
+}
+
+async fn run_incoming_shard_rpc_streams(
+    mut incoming: libp2p_stream::IncomingStreams,
+    handler_slot: Arc<RwLock<Option<ShardRpcHandler>>>,
+    pools: ShardRpcAdmissionPools,
+    generation: tokio::sync::watch::Receiver<u64>,
+) {
+    while let Some((peer, stream)) = incoming.next().await {
+        let accepted = handler_slot
+            .read()
+            .map(|handler| handler.as_ref().is_some_and(|h| h.accepts_peer(&peer)))
+            .unwrap_or(false);
+        if !accepted {
+            // No handler, or a peer the workload would never admit: drop the
+            // stream before reading anything (indistinguishable to the peer).
+            debug!(peer = %peer, "dropping inbound shard rpc stream");
+            drop(stream);
+            continue;
+        }
+        let Some(handshake) = pools.handshakes.try_acquire(peer) else {
+            warn!(peer = %peer, "dropping inbound shard rpc stream at handshake limit");
+            drop(stream);
+            continue;
+        };
+        let handler_slot = handler_slot.clone();
+        let sessions = pools.sessions.clone();
+        let generation = generation.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_incoming_shard_rpc_stream(
+                peer,
+                stream,
+                handler_slot,
+                handshake,
+                sessions,
+                generation,
+            )
+            .await
+            {
+                warn!(peer = %peer, error = %error, "shard rpc inbound stream failed");
+            }
+        });
+    }
+}
+
+async fn reject_shard_rpc_open(
+    stream: &mut libp2p::swarm::Stream,
+    session_id: [u8; 32],
+    reason: String,
+) -> Result<()> {
+    let decision = ShardRpcDecision::rejected(session_id, reason);
+    tokio::time::timeout(SHARD_RPC_HANDSHAKE_TIMEOUT, async {
+        write_postcard_frame(stream, &decision, SHARD_RPC_DECISION_WIRE_MAX_BYTES).await?;
+        stream
+            .close()
+            .await
+            .context("close rejected shard rpc stream")
+    })
+    .await
+    .map_err(|_| anyhow!("shard rpc rejection write timed out"))?
+}
+
+async fn serve_incoming_shard_rpc_stream(
+    peer: PeerId,
+    mut stream: libp2p::swarm::Stream,
+    handler_slot: Arc<RwLock<Option<ShardRpcHandler>>>,
+    handshake: InboundStreamPermit,
+    sessions: Arc<InboundStreamAdmission>,
+    mut generation: tokio::sync::watch::Receiver<u64>,
+) -> Result<()> {
+    // Sessions are bound to the handler generation that admits them.
+    let admitted_generation = *generation.borrow_and_update();
+
+    let open: ShardRpcOpen = tokio::time::timeout(
+        SHARD_RPC_OPEN_READ_TIMEOUT,
+        read_postcard_frame(&mut stream, SHARD_RPC_OPEN_WIRE_MAX_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow!("shard rpc open timed out"))?
+    .context("read shard rpc open")?;
+    if let Err(error) = open.validate() {
+        return reject_shard_rpc_open(
+            &mut stream,
+            open.session_id,
+            format!("invalid shard rpc open: {error}"),
+        )
+        .await;
+    }
+
+    let handler = handler_slot
+        .read()
+        .map_err(|_| anyhow!("shard rpc handler lock poisoned"))?
+        .clone();
+    let Some(handler) = handler else {
+        return reject_shard_rpc_open(
+            &mut stream,
+            open.session_id,
+            "no shard rpc handler installed".to_string(),
+        )
+        .await;
+    };
+
+    let admission = match tokio::time::timeout(
+        SHARD_RPC_ADMISSION_TIMEOUT,
+        handler.admit(peer, open.clone()),
+    )
+    .await
+    {
+        Ok(admission) => admission,
+        Err(_) => ShardRpcAdmission::reject("shard rpc admission timed out"),
+    };
+    let endpoint = match admission {
+        ShardRpcAdmission::Accept(endpoint) => endpoint,
+        ShardRpcAdmission::Reject { reason } => {
+            return reject_shard_rpc_open(&mut stream, open.session_id, reason).await;
+        }
+    };
+    if *generation.borrow() != admitted_generation {
+        return reject_shard_rpc_open(
+            &mut stream,
+            open.session_id,
+            "shard rpc handler was withdrawn during admission".to_string(),
+        )
+        .await;
+    }
+    let Some(session_permit) = sessions.try_acquire(peer) else {
+        return reject_shard_rpc_open(
+            &mut stream,
+            open.session_id,
+            "shard rpc session limit reached".to_string(),
+        )
+        .await;
+    };
+
+    tokio::time::timeout(
+        SHARD_RPC_HANDSHAKE_TIMEOUT,
+        write_postcard_frame(
+            &mut stream,
+            &ShardRpcDecision::accepted(open.session_id),
+            SHARD_RPC_DECISION_WIRE_MAX_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("shard rpc accept write timed out"))??;
+    drop(handshake);
+
+    let ShardRpcLocalEndpoint { io, revoked } = endpoint;
+    let endpoint_revoked = revoked.unwrap_or_else(|| Box::pin(std::future::pending()));
+    let handler_withdrawn = async move {
+        // A closed channel means `Discovery` itself is gone: also revoke.
+        while generation.changed().await.is_ok() {
+            if *generation.borrow() != admitted_generation {
+                return;
+            }
+        }
+    };
+    let revocation: ShardRpcRevocation = Box::pin(async move {
+        tokio::select! {
+            () = endpoint_revoked => {}
+            () = handler_withdrawn => {}
+        }
+    });
+
+    let report = splice_shard_rpc_session(
+        stream,
+        io,
+        Duration::from_millis(open.idle_timeout_ms),
+        Duration::from_millis(open.max_session_ms),
+        Some(revocation),
+    )
+    .await;
+    drop(session_permit);
+    info!(
+        peer = %peer,
+        end = ?report.end,
+        bytes_to_peer = report.bytes_to_remote,
+        bytes_from_peer = report.bytes_from_remote,
+        error = report.error.as_deref().unwrap_or(""),
+        "inbound shard rpc session ended"
+    );
+    Ok(())
+}
+
+/// Millisecond activity clock shared by both splice directions.
+struct SpliceActivity {
+    started: tokio::time::Instant,
+    last_active_ms: std::sync::atomic::AtomicU64,
+}
+
+impl SpliceActivity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_active_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_active_ms
+            .fetch_max(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn idle_deadline(&self, idle_timeout: Duration) -> tokio::time::Instant {
+        let last = self
+            .last_active_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.started + Duration::from_millis(last) + idle_timeout
+    }
+}
+
+/// Which side of one splice direction failed.
+enum PumpError {
+    Source(std::io::Error),
+    Sink(std::io::Error),
+}
+
+async fn pump_local_to_remote<R, W>(
+    from: &mut R,
+    to: &mut W,
+    activity: &SpliceActivity,
+    moved: &std::sync::atomic::AtomicU64,
+) -> std::result::Result<(), PumpError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0_u8; SHARD_RPC_SPLICE_BUFFER_BYTES];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(from, &mut buffer)
+            .await
+            .map_err(PumpError::Source)?;
+        if read == 0 {
+            return to.close().await.map_err(PumpError::Sink);
+        }
+        activity.touch();
+        to.write_all(&buffer[..read])
+            .await
+            .map_err(PumpError::Sink)?;
+        to.flush().await.map_err(PumpError::Sink)?;
+        moved.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
+        activity.touch();
+    }
+}
+
+async fn pump_remote_to_local<R, W>(
+    from: &mut R,
+    to: &mut W,
+    activity: &SpliceActivity,
+    moved: &std::sync::atomic::AtomicU64,
+) -> std::result::Result<(), PumpError>
+where
+    R: AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0_u8; SHARD_RPC_SPLICE_BUFFER_BYTES];
+    loop {
+        let read = from.read(&mut buffer).await.map_err(PumpError::Source)?;
+        if read == 0 {
+            return tokio::io::AsyncWriteExt::shutdown(to)
+                .await
+                .map_err(PumpError::Sink);
+        }
+        activity.touch();
+        tokio::io::AsyncWriteExt::write_all(to, &buffer[..read])
+            .await
+            .map_err(PumpError::Sink)?;
+        tokio::io::AsyncWriteExt::flush(to)
+            .await
+            .map_err(PumpError::Sink)?;
+        moved.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
+        activity.touch();
+    }
+}
+
+/// Splice an established tunnel substream onto a local byte endpoint.
+///
+/// Both directions run concurrently with half-close propagation: EOF from
+/// one side is forwarded as a write shutdown to the other, which then has
+/// [`SHARD_RPC_HALF_CLOSE_LINGER`] to finish. The session also ends on the
+/// idle bound (no bytes in either direction), the total session bound, or
+/// revocation; the local endpoint is then closed and the substream reset.
+async fn splice_shard_rpc_session<L>(
+    remote: libp2p::swarm::Stream,
+    local: L,
+    idle_timeout: Duration,
+    max_session: Duration,
+    revoked: Option<ShardRpcRevocation>,
+) -> ShardRpcSessionReport
+where
+    L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+{
+    let activity = SpliceActivity::new();
+    let to_remote = std::sync::atomic::AtomicU64::new(0);
+    let from_remote = std::sync::atomic::AtomicU64::new(0);
+    let (mut remote_reader, mut remote_writer) = AsyncReadExt::split(remote);
+    let (mut local_reader, mut local_writer) = tokio::io::split(local);
+    let session_deadline = tokio::time::Instant::now() + max_session;
+    let mut revoked = revoked.unwrap_or_else(|| Box::pin(std::future::pending()));
+
+    let (end, error) = {
+        let upstream =
+            pump_local_to_remote(&mut local_reader, &mut remote_writer, &activity, &to_remote);
+        let downstream = pump_remote_to_local(
+            &mut remote_reader,
+            &mut local_writer,
+            &activity,
+            &from_remote,
+        );
+        tokio::pin!(upstream, downstream);
+        let mut upstream_done = false;
+        let mut downstream_done = false;
+        let mut first_closed: Option<ShardRpcSessionEnd> = None;
+        let mut linger_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let idle_deadline = activity.idle_deadline(idle_timeout);
+            // Revocation and the bounds are polled before the pumps, so a
+            // fired revocation can never lose to a pump with buffered data.
+            tokio::select! {
+                biased;
+                () = &mut revoked => {
+                    break (ShardRpcSessionEnd::Revoked, None);
+                }
+                () = tokio::time::sleep_until(session_deadline) => {
+                    break (ShardRpcSessionEnd::SessionExpired, None);
+                }
+                () = tokio::time::sleep_until(idle_deadline) => {
+                    if activity.idle_deadline(idle_timeout) <= tokio::time::Instant::now() {
+                        break (ShardRpcSessionEnd::IdleTimeout, None);
+                    }
+                }
+                () = async {
+                    match linger_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let first = first_closed.unwrap_or(ShardRpcSessionEnd::LocalClosed);
+                    break (first, Some("half-closed tunnel did not finish within the linger bound".to_string()));
+                }
+                result = &mut upstream, if !upstream_done => {
+                    upstream_done = true;
+                    match result {
+                        Ok(()) => {
+                            let first = *first_closed.get_or_insert(ShardRpcSessionEnd::LocalClosed);
+                            if downstream_done {
+                                break (first, None);
+                            }
+                            linger_deadline = Some(tokio::time::Instant::now() + SHARD_RPC_HALF_CLOSE_LINGER);
+                        }
+                        // Once one side has closed, the end is attributed to
+                        // it; a later error only rides along in `error`.
+                        Err(PumpError::Source(error)) => {
+                            break (first_closed.unwrap_or(ShardRpcSessionEnd::LocalClosed), Some(error.to_string()));
+                        }
+                        Err(PumpError::Sink(error)) => {
+                            break (first_closed.unwrap_or(ShardRpcSessionEnd::RemoteClosed), Some(error.to_string()));
+                        }
+                    }
+                }
+                result = &mut downstream, if !downstream_done => {
+                    downstream_done = true;
+                    match result {
+                        Ok(()) => {
+                            let first = *first_closed.get_or_insert(ShardRpcSessionEnd::RemoteClosed);
+                            if upstream_done {
+                                break (first, None);
+                            }
+                            linger_deadline = Some(tokio::time::Instant::now() + SHARD_RPC_HALF_CLOSE_LINGER);
+                        }
+                        Err(PumpError::Source(error)) => {
+                            break (first_closed.unwrap_or(ShardRpcSessionEnd::RemoteClosed), Some(error.to_string()));
+                        }
+                        Err(PumpError::Sink(error)) => {
+                            break (first_closed.unwrap_or(ShardRpcSessionEnd::LocalClosed), Some(error.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // The local endpoint is closed first, so a revoked serving side cuts its
+    // local backend off before anything else.
+    let _ = tokio::time::timeout(
+        SHARD_RPC_TEARDOWN_TIMEOUT,
+        tokio::io::AsyncWriteExt::shutdown(&mut local_writer),
+    )
+    .await;
+    drop(local_reader);
+    drop(local_writer);
+    // A clean end (both directions finished) closes the substream gracefully.
+    // Any other end — revocation, a bound, a transport error — drops it while
+    // still open, which resets it: the peer's reads end and, unlike a mere
+    // FIN, its writes fail at once instead of vanishing into a closed stream.
+    let clean = error.is_none()
+        && matches!(
+            end,
+            ShardRpcSessionEnd::LocalClosed | ShardRpcSessionEnd::RemoteClosed
+        );
+    if clean {
+        let _ = tokio::time::timeout(SHARD_RPC_TEARDOWN_TIMEOUT, remote_writer.close()).await;
+    }
+    drop(remote_reader);
+    drop(remote_writer);
+
+    ShardRpcSessionReport {
+        end,
+        bytes_to_remote: to_remote.into_inner(),
+        bytes_from_remote: from_remote.into_inner(),
+        error,
+    }
 }
 
 async fn serve_incoming_blob_stream(

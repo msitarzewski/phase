@@ -1149,3 +1149,521 @@ async fn real_llama_server_rejects_unauthenticated_loopback_requests() {
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert!(health.status().is_success());
 }
+
+// -----------------------------------------------------------------------
+// Wave 2: Tier-1 RPC layer offload to enrolled peers over the
+// Noise-encrypted `/phase/shard-rpc/1.0.0` libp2p tunnel.
+// -----------------------------------------------------------------------
+
+mod shard_rpc_tunnel {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use lucidd::node_config::{NodeConfig, NodeConfigStore};
+    use lucidd::shard_worker::make_opt_in_inbound_shard_rpc_handler;
+    use lucidd::worker_llama::rpc_peers::{RpcPeerOffload, RpcPeerTunnelConfig};
+    use lucidd::worker_llama::RpcClusterGate;
+    use lucidd::PolicyEngine;
+    use phase_identity::NodeIdentity;
+    use phase_net::{Discovery, DiscoveryConfig, PeerId};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    pub(super) fn discovery_for(identity: &NodeIdentity) -> Arc<Discovery> {
+        Arc::new(
+            Discovery::new(DiscoveryConfig {
+                identity: Some(identity.clone()),
+                ..DiscoveryConfig::default()
+            })
+            .expect("discovery"),
+        )
+    }
+
+    pub(super) async fn connect(client: &Discovery, server: &Discovery) {
+        server.listen("/ip4/127.0.0.1/tcp/0").await.expect("listen");
+        let mut address = None;
+        for _ in 0..100 {
+            if let Some(found) = server.listen_addrs().await.unwrap().into_iter().next() {
+                address = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let address = address.expect("server listen address");
+        client
+            .dial_peer(&format!("{address}/p2p/{}", server.local_peer_id()))
+            .await
+            .expect("dial");
+        for _ in 0..250 {
+            if client
+                .reachability_snapshot()
+                .await
+                .unwrap()
+                .connections
+                .iter()
+                .any(|connection| connection.peer_id == *server.local_peer_id())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("coordinator never connected to provider");
+    }
+
+    /// A provider node that enrolls `coordinator` (explicit allowlist entry)
+    /// and bridges admitted tunnels to `127.0.0.1:<bridge_port>`.
+    pub(super) struct Provider {
+        pub(super) discovery: Arc<Discovery>,
+        pub(super) node_config: Arc<NodeConfigStore>,
+        _policy_dir: tempfile::TempDir,
+    }
+
+    pub(super) async fn provider_enrolling(
+        coordinator: &NodeIdentity,
+        bridge_port: u16,
+    ) -> Provider {
+        let identity = NodeIdentity::generate();
+        let discovery = discovery_for(&identity);
+        let policy_dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            PolicyEngine::load_or_default(Some(policy_dir.path().join("policy.toml")))
+                .await
+                .unwrap(),
+        );
+        let coordinator_key = hex::encode(coordinator.peer_id_bytes());
+        policy
+            .update_config(|config| config.authorized_submitters = vec![coordinator_key])
+            .unwrap();
+        let node_config = NodeConfigStore::in_memory(NodeConfig {
+            cluster_enabled: true,
+            ..NodeConfig::default()
+        });
+        discovery
+            .set_shard_rpc_handler(Some(
+                make_opt_in_inbound_shard_rpc_handler(policy, node_config.clone(), bridge_port)
+                    .unwrap(),
+            ))
+            .unwrap();
+        Provider {
+            discovery,
+            node_config,
+            _policy_dir: policy_dir,
+        }
+    }
+
+    /// Loopback TCP forwarder in front of `upstream` that counts bytes in
+    /// each direction (stand-in for, or tap in front of, `ggml-rpc-server`).
+    pub(super) struct CountingForwarder {
+        pub(super) port: u16,
+        pub(super) to_upstream: Arc<AtomicU64>,
+        pub(super) from_upstream: Arc<AtomicU64>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for CountingForwarder {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn copy_counting(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        counter: Arc<AtomicU64>,
+    ) {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while let Ok(read) = from.read(&mut buffer).await {
+            if read == 0 || to.write_all(&buffer[..read]).await.is_err() {
+                break;
+            }
+            counter.fetch_add(read as u64, Ordering::SeqCst);
+        }
+        let _ = to.shutdown().await;
+    }
+
+    /// `upstream = None` echoes instead of forwarding.
+    pub(super) async fn counting_forwarder(upstream: Option<u16>) -> CountingForwarder {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let to_upstream = Arc::new(AtomicU64::new(0));
+        let from_upstream = Arc::new(AtomicU64::new(0));
+        let (up, down) = (to_upstream.clone(), from_upstream.clone());
+        let task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (up, down) = (up.clone(), down.clone());
+                tokio::spawn(async move {
+                    match upstream {
+                        Some(upstream) => {
+                            if let Ok(target) =
+                                TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, upstream)).await
+                            {
+                                let _ = target.set_nodelay(true);
+                                let (client_read, client_write) = socket.into_split();
+                                let (target_read, target_write) = target.into_split();
+                                tokio::join!(
+                                    copy_counting(client_read, target_write, up),
+                                    copy_counting(target_read, client_write, down),
+                                );
+                            }
+                        }
+                        None => {
+                            // Echo; a chunk containing `BYE` makes the backend
+                            // hang up on that one connection.
+                            let mut socket = socket;
+                            let mut buffer = vec![0_u8; 64 * 1024];
+                            while let Ok(read) = socket.read(&mut buffer).await {
+                                if read == 0 || buffer[..read].windows(3).any(|w| w == b"BYE") {
+                                    break;
+                                }
+                                if socket.write_all(&buffer[..read]).await.is_err() {
+                                    break;
+                                }
+                                up.fetch_add(read as u64, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        CountingForwarder {
+            port,
+            to_upstream,
+            from_upstream,
+            task,
+        }
+    }
+
+    pub(super) fn switch_gate(open: bool) -> (RpcClusterGate, Arc<AtomicBool>) {
+        let state = Arc::new(AtomicBool::new(open));
+        let reader = state.clone();
+        (
+            RpcClusterGate::new(move || reader.load(Ordering::SeqCst)),
+            state,
+        )
+    }
+
+    pub(super) fn offload_to(coordinator: &Arc<Discovery>, provider: PeerId) -> RpcPeerOffload {
+        RpcPeerOffload::new(
+            coordinator.clone(),
+            vec![provider],
+            RpcPeerTunnelConfig::default(),
+        )
+        .expect("rpc peer offload config")
+    }
+
+    /// The `ggml-rpc` HELLO frame the pinned llama.cpp client opens with.
+    pub(super) fn hello() -> Vec<u8> {
+        let mut frame = vec![0x0e];
+        frame.extend_from_slice(&24_u64.to_le_bytes());
+        frame.extend_from_slice(&[0_u8; 24]);
+        frame
+    }
+
+    /// Connect to a `--rpc` endpoint as llama-server's ggml-rpc client does
+    /// and prove the bytes reach the provider's backend and return.
+    pub(super) async fn rpc_client(endpoint: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(endpoint)
+            .await
+            .expect("--rpc endpoint accepts");
+        let hello = hello();
+        stream.write_all(&hello).await.unwrap();
+        let mut echoed = vec![0_u8; hello.len()];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+            .await
+            .expect("tunnel round trip")
+            .unwrap();
+        assert_eq!(echoed, hello);
+        stream
+    }
+
+    /// `true` once `stream` reports EOF or an error.
+    pub(super) async fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+        let mut byte = [0_u8; 1];
+        matches!(
+            tokio::time::timeout(within, stream.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+}
+
+/// The `--rpc` endpoint the fixture launcher recorded for the child serving
+/// `model` (searching `ports`), with that child's port.
+fn rpc_endpoint_for(dir: &Path, ports: std::ops::Range<u16>, model: &str) -> (u16, String) {
+    for port in ports {
+        let Ok(raw) = std::fs::read_to_string(dir.join(format!("fixture.{port}.argv"))) else {
+            continue;
+        };
+        let argv: Vec<&str> = raw.lines().collect();
+        if argv
+            .iter()
+            .any(|arg| arg.ends_with(&format!("{model}.gguf")))
+        {
+            let index = argv
+                .iter()
+                .position(|arg| *arg == "--rpc")
+                .expect("llama-server receives --rpc");
+            return (port, argv[index + 1].to_string());
+        }
+    }
+    panic!("no spawn recorded for {model}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_loser() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    use shard_rpc_tunnel::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let coordinator_identity = NodeIdentity::generate();
+    let coordinator = discovery_for(&coordinator_identity);
+    let backend = counting_forwarder(None).await;
+    let provider = provider_enrolling(&coordinator_identity, backend.port).await;
+    connect(&coordinator, &provider.discovery).await;
+    let provider_peer = *provider.discovery.local_peer_id();
+
+    let (gate, _gate_open) = switch_gate(true);
+    let fx = flexible_worker(
+        &["alpha", "beta"],
+        2,
+        3,
+        &[],
+        Duration::from_secs(10),
+        |config| {
+            config.rpc_peer_offload = Some(offload_to(&coordinator, provider_peer));
+            config.tensor_split = Some("30,70".to_string());
+            config.rpc_cluster_gate = Some(gate);
+        },
+    );
+    assert!(fx.worker.uses_rpc_layer_offload());
+    assert_eq!(fx.worker.execution_trust_label(), "trusted-circle-sharded");
+
+    for model in ["alpha", "beta"] {
+        let (completion, error) = run_to_final(&fx.worker, model).await.expect("dispatch");
+        assert_eq!(completion, Completion::Stop, "{model}: {error:?}");
+    }
+    let (alpha_port, alpha_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "alpha");
+    let (beta_port, beta_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "beta");
+    assert_ne!(alpha_rpc, beta_rpc, "every spawn binds its own peer proxy");
+    for endpoint in [&alpha_rpc, &beta_rpc] {
+        let address: std::net::SocketAddr = endpoint.parse().unwrap();
+        assert!(address.ip().is_loopback());
+    }
+    let joined = spawn_argv(fx.dir.path(), alpha_port).join(" ");
+    assert!(
+        joined.contains(&format!(
+            "--rpc {alpha_rpc} --split-mode layer --tensor-split 30,70"
+        )),
+        "{joined}"
+    );
+
+    // Each model's llama-server holds a tunnel to the enrolled provider.
+    let mut alpha_link = rpc_client(&alpha_rpc).await;
+    let mut beta_link = rpc_client(&beta_rpc).await;
+
+    // alpha's link dies on the provider side (its backend hangs up). Only
+    // alpha is retired; beta keeps serving warm on its own healthy tunnel.
+    alpha_link.write_all(b"BYE").await.unwrap();
+    assert!(closed_within(&mut alpha_link, Duration::from_secs(5)).await);
+    drop(alpha_link);
+    assert!(
+        wait_port_bindable(alpha_port, Duration::from_secs(8)).await,
+        "the model whose tunnel was lost must be retired"
+    );
+    assert!(
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, beta_port)).is_err(),
+        "a model with a healthy tunnel must stay resident"
+    );
+    let (completion, error) = run_to_final(&fx.worker, "beta").await.expect("beta warm");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    beta_link.write_all(b"still-up").await.unwrap();
+    let mut echoed = [0_u8; 8];
+    beta_link.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"still-up");
+    assert_eq!(spawned_models(fx.dir.path()), ["alpha", "beta"]);
+
+    // The next alpha request cold-loads over a fresh proxy.
+    let (completion, error) = run_to_final(&fx.worker, "alpha")
+        .await
+        .expect("alpha reload");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    assert_eq!(spawned_models(fx.dir.path()), ["alpha", "beta", "alpha"]);
+    let (_, reloaded_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "alpha");
+    assert_ne!(reloaded_rpc, alpha_rpc);
+
+    // The provider withdrawing cluster_enabled drops beta's live tunnel and
+    // retires beta too.
+    provider
+        .node_config
+        .update(|config| {
+            config.cluster_enabled = false;
+            Ok(())
+        })
+        .unwrap();
+    assert!(closed_within(&mut beta_link, Duration::from_secs(5)).await);
+    drop(beta_link);
+    assert!(
+        wait_port_bindable(beta_port, Duration::from_secs(8)).await,
+        "RPC-backed model must be retired after its tunnel is revoked"
+    );
+}
+
+/// End-to-end Tier-1 layer offload through the shard-rpc tunnel with the
+/// real binaries: `llama-server --rpc <coordinator proxy>` -> libp2p (Noise)
+/// -> enrolled provider -> loopback `ggml-rpc-server`. Requires
+/// `LLAMA_SERVER_PATH`, `LLAMA_RPC_SERVER_PATH` (the pinned build's
+/// `ggml-rpc-server`) and a small embedding GGUF in
+/// `LLAMA_TEST_EMBED_MODEL_PATH`. llama.cpp puts RPC devices first in a
+/// model's device list, so the default `LLAMA_TEST_RPC_TENSOR_SPLIT` of `1,0`
+/// places every offloaded layer on the tunnelled RPC device and none on the
+/// local GPU; override it if the host has a different device list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn real_llama_server_offloads_layers_through_shard_rpc_tunnel() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    use shard_rpc_tunnel::*;
+    use std::sync::atomic::Ordering;
+
+    let missing = "real shard-rpc gate unavailable: set LLAMA_SERVER_PATH, LLAMA_RPC_SERVER_PATH and LLAMA_TEST_EMBED_MODEL_PATH";
+    let server_bin = PathBuf::from(std::env::var("LLAMA_SERVER_PATH").expect(missing));
+    let rpc_bin = PathBuf::from(std::env::var("LLAMA_RPC_SERVER_PATH").expect(missing));
+    let model_path = PathBuf::from(std::env::var("LLAMA_TEST_EMBED_MODEL_PATH").expect(missing));
+    let split = std::env::var("LLAMA_TEST_RPC_TENSOR_SPLIT").unwrap_or_else(|_| "1,0".to_string());
+    let model_dir = model_path.parent().expect("model dir").to_path_buf();
+    let model_id = model_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("model stem")
+        .to_string();
+
+    // Provider: operator-run loopback ggml-rpc-server, tapped by a counting
+    // forwarder so the test can prove tensors crossed the tunnel.
+    let rpc_port = free_port();
+    let mut rpc_server = tokio::process::Command::new(&rpc_bin)
+        .env_clear()
+        .args(["-H", "127.0.0.1", "-p", &rpc_port.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ggml-rpc-server");
+    let mut listening = false;
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", rpc_port))
+            .await
+            .is_ok()
+        {
+            listening = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(listening, "ggml-rpc-server never listened");
+    // Our probe connection took the server's only client slot briefly; let it
+    // notice the disconnect before llama-server connects.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tap = counting_forwarder(Some(rpc_port)).await;
+
+    let coordinator_identity = NodeIdentity::generate();
+    let coordinator = discovery_for(&coordinator_identity);
+    let provider = provider_enrolling(&coordinator_identity, tap.port).await;
+    connect(&coordinator, &provider.discovery).await;
+    let (gate, _) = switch_gate(true);
+    let offload = offload_to(&coordinator, *provider.discovery.local_peer_id());
+
+    let embed = |worker: LlamaCppWorker, label: &'static str| {
+        let model_id = model_id.clone();
+        async move {
+            let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+                model_cid: model_id,
+                input: vec!["trusted circle layer offload".to_string()],
+            }))
+            .sign_with(&NodeIdentity::generate())
+            .expect("sign");
+            let (_handle, mut stream) = worker.execute(manifest).await.expect(label);
+            let mut vector = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    JobEvent::Output(chunk) => {
+                        vector = Some(serde_json::from_slice::<Vec<f32>>(&chunk.data).unwrap());
+                    }
+                    JobEvent::Final { result, error } => {
+                        assert_eq!(result.completion, Completion::Stop, "{label}: {error:?}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            vector.unwrap_or_else(|| panic!("{label}: no embedding vector"))
+        }
+    };
+
+    let port = free_port();
+    let sharded = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_binary_path: server_bin.clone(),
+            model_dir: model_dir.clone(),
+            default_n_gpu_layers: i32::MAX,
+            default_context_size: 512,
+            server_port_range: port..(port + 1),
+            max_loaded_models: 1,
+            model_load_timeout: Duration::from_secs(180),
+            per_request_idle_timeout: Duration::from_secs(120),
+            rpc_peer_offload: Some(offload),
+            tensor_split: Some(split),
+            rpc_cluster_gate: Some(gate),
+            ..Default::default()
+        },
+    );
+    assert_eq!(sharded.execution_trust_label(), "trusted-circle-sharded");
+    let remote = embed(sharded.clone(), "sharded embedding").await;
+    let sent = tap.to_upstream.load(Ordering::SeqCst);
+    let received = tap.from_upstream.load(Ordering::SeqCst);
+    eprintln!("shard-rpc tunnel carried {sent} bytes to and {received} bytes from ggml-rpc-server");
+    assert!(
+        sent > 8 * 1024 * 1024,
+        "model tensors must cross the tunnel to the RPC device (sent {sent} bytes)"
+    );
+    assert!(received > 0);
+
+    // The same input computed entirely locally must agree.
+    let local_port = free_port();
+    let local = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_binary_path: server_bin,
+            model_dir,
+            default_n_gpu_layers: i32::MAX,
+            default_context_size: 512,
+            server_port_range: local_port..(local_port + 1),
+            max_loaded_models: 1,
+            model_load_timeout: Duration::from_secs(180),
+            per_request_idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        },
+    );
+    let reference = embed(local, "local embedding").await;
+    assert_eq!(remote.len(), reference.len());
+    let dot: f64 = remote
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let cosine = dot / (norm(&remote) * norm(&reference));
+    eprintln!("cosine(sharded, local) = {cosine:.6}");
+    assert!(
+        cosine > 0.999,
+        "sharded and local embeddings diverge: {cosine}"
+    );
+
+    drop(sharded);
+    let _ = rpc_server.start_kill();
+    let _ = rpc_server.wait().await;
+}
