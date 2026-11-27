@@ -4,6 +4,21 @@ This guide is for a LUCID **consumer** that must use outbound TCP through Tor,
 including systems where a browser cannot reach the local LUCID API. It uses an
 explicit relay address and PeerID instead of DNS TXT bootstrap.
 
+> **Important transport boundary:** `lucidd` does **not** yet implement a built-in
+> SOCKS5/Tor transport. The command below relies on **TailsOS's host firewall**
+> transparently proxying the logged-in `amnesia` user's outgoing Internet TCP
+> traffic through Tor (while dropping UDP/QUIC).
+> - Running this exact command on **macOS or ordinary Linux** connects **directly**
+>   without Tor and exposes your real IP address (and under `torsocks`, learned
+>   QUIC/UDP peer addresses can bypass Tor).
+> - On TailsOS, traffic to **local-network private addresses** (such as RFC 1918
+>   LAN ranges) is not forced through Tor by Tails' transparent proxy, and `lucidd`
+>   currently records peer-reported addresses—so if a serving GPU sits on the same
+>   local network, `lucidd` may dial it directly over LAN outside Tor.
+> - Tails' transparent TCP proxy also shares one Tor circuit per destination
+>   `(IP, port)`; distinct per-identity circuits require explicit SOCKS5
+>   `IsolateSOCKSAuth` support (tracked in our post-v0.2 `--tor-socks5` plan).
+
 ## What this protects
 
 When Tor carries the consumer's outbound connection, the relay and reachable

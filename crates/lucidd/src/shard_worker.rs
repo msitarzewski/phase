@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 
 use crate::node_config::NodeConfigStore;
-use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine};
+use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::shard_plan::{
     sign_stage_receipt, verify_composite_shard_chain, verify_shard_plan,
     CompositeShardVerification, ShardStageAssignment, ShardStageReceiptBody, ShardTrustTier,
@@ -553,24 +553,7 @@ fn is_enrolled_shard_rpc_peer(policy: &PolicyEngine, caller: &PeerId) -> bool {
     let Some(pubkey_hex) = ed25519_pubkey_hex_for_peer(caller) else {
         return false;
     };
-    let explicitly_listed = |config: &PolicyConfig| {
-        config
-            .authorized_submitters
-            .iter()
-            .any(|key| key.eq_ignore_ascii_case(&pubkey_hex))
-    };
-    let before = policy.config();
-    if before.allow_unauthenticated_jobs {
-        return explicitly_listed(&before);
-    }
-    // `is_authorized_submitter` also honours enrollment grants, but it admits
-    // everyone if the escape hatch flipped on since `before` was read; a
-    // second snapshot closes that window.
-    if !policy.is_authorized_submitter(&pubkey_hex) {
-        return false;
-    }
-    let after = policy.config();
-    !after.allow_unauthenticated_jobs || explicitly_listed(&after)
+    policy.is_explicitly_enrolled_submitter(&pubkey_hex)
 }
 
 /// Lowercase-hex Ed25519 key that `peer` was derived from, or `None` for any

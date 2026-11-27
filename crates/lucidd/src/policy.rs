@@ -369,6 +369,29 @@ impl PolicyEngine {
             })
     }
 
+    /// True iff `pubkey_hex` is explicitly listed in `authorized_submitters`
+    /// or holds an unexpired enrollment grant. Unlike `is_authorized_submitter`,
+    /// this NEVER honors the `allow_unauthenticated_jobs` development bypass,
+    /// so privileged capabilities (such as Tier-1 `/phase/shard-rpc/1.0.0`
+    /// tunnels) fail closed for strangers while still honoring live enrollment
+    /// grants.
+    pub fn is_explicitly_enrolled_submitter(&self, pubkey_hex: &str) -> bool {
+        let explicitly_listed = self
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .config
+            .authorized_submitters
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case(pubkey_hex));
+        explicitly_listed
+            || self.enrollment.read().ok().is_some_and(|store| {
+                store
+                    .as_ref()
+                    .is_some_and(|store| store.is_authorized(pubkey_hex))
+            })
+    }
+
     /// Attach durable grants created by explicit local operator invitations.
     /// Other model/resource policy and signer-to-transport binding still apply.
     pub fn attach_enrollment_store(&self, store: Arc<crate::consumer::EnrollmentStore>) {

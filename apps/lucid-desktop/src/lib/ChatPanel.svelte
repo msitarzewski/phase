@@ -128,8 +128,13 @@
   <div class="messages" aria-live="polite">
     {#if messages.length === 0}
       <div class="empty-state">
-        <strong>Start a private chat</strong>
-        <span>Select a model and send a message.</span>
+        {#if localOnly}
+          <strong>Local-only chat</strong>
+          <span>Requests stay strictly on this device (X-Lucid-Local-Only). History is kept in memory only.</span>
+        {:else}
+          <strong>Start a chat</strong>
+          <span>History is kept in memory only and sent with each turn to whichever local or enrolled circle device serves the selected model. Check "Local Only" to keep prompts on this device.</span>
+        {/if}
       </div>
     {:else}
       {#each messages as message}
