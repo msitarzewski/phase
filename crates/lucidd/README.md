@@ -2,7 +2,7 @@
 
 The **LUCID inference daemon** — the open GPU-inference flagship built on the Phase substrate. `lucidd` presents the Ollama API on `:11434`, runs inference and embeddings through pluggable workers, routes each request locally or across the Phase DHT, and returns cryptographically verifiable signed receipts.
 
-**Current checkout: LUCID v0.2 implementation checkpoint, unreleased (reviewed 2026-11-22).** Phase Core and LUCID v0.1/v0.1.1 are shipped history. Features below describe this checkout; real cross-network/NAT, large pull/resume, MLX and the remaining release matrix still require acceptance. See the [authoritative tracker](../../memory-bank/releases/lucid-v0.2/README.md#progress-tracker) and [physical test runbook](../../memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22).
+**Current checkout: LUCID v0.2 active physical qualification (`v0.2.0-rc8+`, reviewed 2026-11-27).** Phase Core and LUCID v0.1/v0.1.1 are shipped history. Physical 5-node fleet tests (`Runs #1–#12`: `120/120` verified Ed25519 receipts, `10.18 GB` P2P pull/resume, `71.3 tok/s` cellular+ProtonVPN MLX, `98.0 tok/s` 2-Mac burst, and `5.7 → 16.4 → 21.3 tok/s` real sliced 2-Mac `gemma-4-12B`) are recorded in [fleet-progress-report.md](../../memory-bank/releases/lucid-v0.2/fleet-progress-report.md). See the [authoritative tracker](../../memory-bank/releases/lucid-v0.2/README.md#progress-tracker) and [multi-agent sprint plan](../../memory-bank/releases/lucid-v0.2/multi-agent-sprint-plan.md).
 
 License: **AGPL-3.0-or-later** (the flagship is copyleft so no one can fork it closed). Depends on `phase-net`, `phase-identity`, `phase-manifest`, `phase-receipt`, and `phase-protocol`.
 
@@ -23,9 +23,20 @@ Point an Ollama-compatible client at `http://localhost:11434`. The supported end
 | `POST /api/show` | JSON | Verified installed/loaded/remote model metadata; unknown models fail explicitly |
 | `GET /api/ps` | JSON | Honest empty list until runtime residency telemetry is wired |
 | `GET /api/version` | JSON | Capability sniff |
-| `GET /api/lucid/status` | JSON | Bearer-authenticated local node/enrollment status (used by `apps/lucid-macos`) |
+| `GET /api/lucid/status` | JSON | Bearer-authenticated local node/enrollment/policy status |
+| `GET /api/lucid/probe` | JSON | Read-only hardware, GPU backend, runtime, & local GGUF discovery |
+| `GET /api/lucid/models` | JSON | Combined local + discovered network models (`peer_count`, CID, capabilities) |
+| `POST /api/lucid/provide` | JSON | Permission-gated (`confirm_permission: true`) model serving opt-in & Ollama/LM-Studio hot-import |
+| `POST /api/lucid/pull` | JSON | Permission-gated P2P verified model download/resume |
+| `GET /api/lucid/peers` | JSON | Connected libp2p peers & active transport paths (`direct` / `relayed`) |
+| `POST /api/lucid/settings` | JSON | Hot-update `policy.toml` / `node.toml` (`manual_pause`, `thermal_limit_c`, `cluster_enabled`, etc.) |
+| `GET /api/lucid/runtime` | JSON | Inspect pinned `llama.cpp b12651` runtime status |
+| `POST /api/lucid/runtime/setup` | JSON | Permission-gated SHA-256-verified `llama.cpp b12651` download or pin |
 | `POST /api/lucid/enroll` | JSON | Bearer-authenticated opaque network invitation enrollment |
-| `POST /api/lucid/invitations` | JSON | Bearer-authenticated one-time invitation creation on a serving contributor |
+| `POST /api/lucid/invitations` | JSON | Bearer-authenticated one-time invitation creation on a serving or shard-worker node |
+| `GET /api/lucid/cluster` | JSON | Tier-1 Trusted-Circle cluster status, `cluster_enabled`, loopback bridge status, & inspectable GGUF layer counts |
+| `POST /api/lucid/cluster/plan` | JSON | Generate & sign a Tier-1 `SignedShardPartitionPlan` (`UntrustedSpotChecked` fails closed with `403`) |
+| `POST /api/lucid/cluster/execute` | JSON | Opt-in (`cluster_enabled = true`) cross-machine `/phase/shard-stage/1.0.0` execution returning chained Ed25519 stage receipts |
 
 **Response headers:**
 - `X-Lucid-Routed-Via` — `local` or `peer:<short-id>` (where the job actually ran)
@@ -38,13 +49,13 @@ The Ollama HTTP surface is **unauthenticated** and binds `127.0.0.1` by default.
 
 ## Workers
 
-- **`llama-cpp`** (`--worker llama-cpp`) — real inference + embeddings by managing `llama-server` subprocesses (one per loaded model; any of llama.cpp's Metal/CUDA/ROCm/Vulkan backends). Streams tokens over `POST /completion`; embeddings via a separate `--embeddings` instance over `POST /embedding`. Crash supervision (restart with backoff, 3-crash/60s circuit-break), `/health` polling, per-request hang detection, and LRU model eviction at the resident-model cap.
+- **`llama-cpp`** (`--worker llama-cpp`) — real inference + embeddings by managing `llama-server` subprocesses (Metal, CUDA, ROCm, Vulkan, CPU) with `--jinja`, `--cache-reuse 256`, crash supervision, `/health` polling, per-request hang detection, LRU eviction, Ollama CUDA-12 library auto-discovery, and optional strict loopback-only `--llama-rpc-servers` + `--llama-tensor-split` for Tier-1 Trusted-Circle sliced-layer execution across `ggml-rpc-server` peers.
 - **`echo`** (`--worker echo`) — no GPU, no model. Reverses the last message (chat) and emits deterministic SHA-256-seeded vectors (embeddings). Explicit development/CI/demo selection; it cannot count as real-model acceptance.
-- **`mlx`** (`--worker mlx`) — experimental macOS ARM64 adapter for a pinned `mlx_lm.server` entry point and immutable canonical model bundle. Inference only; real hardware acceptance remains open. See the [MLX contract](../../memory-bank/releases/lucid-v0.2/mlx-backend.md).
+- **`mlx`** (`--worker mlx`) — macOS ARM64 adapter for a pinned `mlx_lm.server` entry point and immutable canonical model bundle (supports `mlx-lm 0.32.x` `delta.reasoning`, hardware-accelerated `ring` SHA-256 hashing, and `SIGTERM`/`SIGINT` graceful child reaping). Physically verified on Apple M5 Max (`66.7 tok/s` local, `71.3 tok/s` over Cellular+ProtonVPN → Cloud Relay → Ubuntu Desktop). See [mlx-backend.md](../../memory-bank/releases/lucid-v0.2/mlx-backend.md).
 
-The llama.cpp and echo workers serve inference and embeddings; MLX serves inference. Workers sign receipts with the node identity, so peer-served receipts bind to the serving node's PeerId. Worker mode requires an explicit `--worker` selection.
+The llama.cpp and echo workers serve inference and embeddings; MLX serves inference. Workers sign receipts with the node identity, so peer-served receipts bind to the serving node's PeerId.
 
-**Research backends:** `CoreAIWorker` (Apple Neural Engine) and `ShardWorker` have no production implementation. Sharding is gated on the independent whole-model baseline and partial-compute verification. See [decisions.md](../../memory-bank/decisions.md).
+**Tier-1 `ShardWorker` & Research Backends:** Tier-1 Trusted-Circle sharding (`trusted-circle-sharded`) is physically verified both at the protocol/chained-receipt layer (`/phase/shard-stage/1.0.0`, `POST /api/lucid/cluster/execute`) and with real sliced multi-Mac GGUF inference (`--llama-rpc-servers` + `ggml-rpc-server`, `135.6 GiB` pooled Metal 4, `5.7 → 16.4 → 21.3 tok/s`). Tier-2 `UntrustedSpotChecked` remains strictly fail-closed pending partial-compute verification ADR approval; native libp2p `/phase/shard-rpc/1.0.0` tunneling is the next implementation milestone. `CoreAIWorker` (Apple Neural Engine) remains a non-blocking research gate. See [shardworker-adr.md](../../memory-bank/releases/lucid-v0.2/shardworker-adr.md) and [decisions.md](../../memory-bank/decisions.md).
 
 ---
 
@@ -98,11 +109,15 @@ Loaded models are advertised on the Kademlia DHT under `b"phase/model/" || model
 --llama-server-binary <PATH>     llama-server path (resolved absolute at startup; SEC-04)
 --llama-n-gpu-layers <INT>       GPU layers (default -1 = all)
 --llama-ctx-size <USIZE>         context window (default 8192)
+--llama-rpc-servers <ADDR,...>   loopback-only (`127.0.0.1:PORT`) `ggml-rpc-server` endpoints for Tier-1 layer slicing
+--llama-tensor-split <W0,W1,...> GPU layer split ratios (note: in llama.cpp, RPC0 precedes local MTL0)
+--shard-stage-bridge-port <U16>  loopback port (`127.0.0.1:PORT`) for opt-in `/phase/shard-stage/1.0.0` stage runner
 --mlx-server-binary <PATH>       pinned `mlx_lm.server` entry point (required with `--worker mlx`)
 --mlx-model-bundle <PATH>        read-only canonical MLX model bundle (required with `--worker mlx`)
 --mlx-model-alias <ALIAS>        canonical alias for MLX bundle (required with `--worker mlx`)
 --mlx-server-port <U16>          loopback port for `mlx_lm.server` (default 0 = ephemeral)
 --policy-config <PATH>           policy.toml override
+--node-config <PATH>             node.toml override
 --control-token-file <PATH>      private bearer-token file for `/api/lucid/*` local control endpoints
 --identity-path <PATH>           persistent libp2p identity (default ~/.config/phase/identity.key)
 --libp2p-port <U16>              listen port (default 0 = ephemeral; set e.g. 4001 for WAN)
@@ -115,10 +130,13 @@ Loaded models are advertised on the Kademlia DHT under `b"phase/model/" || model
 --no-bootstrap-relays            use only explicitly configured relay candidates
 --external-address <MULTIADDR>   public address (required in infrastructure mode)
 --evidence-store <PATH>          observer-local bounded execution-evidence store
+--pin-peer <PEER_ID>             locally pin a serving peer (repeatable)
+--block-peer <PEER_ID>           locally block a serving peer (repeatable)
 --redundant-verification-permille <U16>  deterministic spot-check rate (default 0)
 --dns-fallback                   opt into public DNS resolvers (default off, fail-closed)
 ```
 
+Subcommands: `lucidd probe`, `lucidd models`, `lucidd peers`, `lucidd invite`, `lucidd join <URI>`, `lucidd bench`, `lucidd cluster {status,inspect,plan}`.
 Env: `LUCIDD_PORT` (default 11434), `LUCIDD_HOST` (default 127.0.0.1).
 
 ---

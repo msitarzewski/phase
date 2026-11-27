@@ -1,7 +1,7 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-11-25
-**Version**: 0.7
+**Last Updated**: 2026-11-27
+**Version**: 0.8
 
 ---
 
@@ -229,10 +229,11 @@ What was accomplished
 
 ## Current Task Documentation (2026-11)
 
-**Status**: Self-configuring `lucidd`, Tauri v2 desktop app (`v0.2.0-rc3`), Ollama/multi-folder serving, P2P pull UI, `lucidd bench`, and Tier-1 `ShardWorker` planner + ADR completed on `feat/lucid-consumer-experience`
+**Status**: Physical 5-node fleet qualification (`v0.2.0-rc8` + `b97f93e`), WAN MLX (`71.3 tok/s` cellular+VPN, `98.0 tok/s` 2-Mac burst), and first real sliced 2-Mac LLM inference (`21.3 tok/s`, `120/120` verified Ed25519 receipts) completed on `feat/lucid-consumer-experience`; parallel [multi-agent sprint plan](./releases/lucid-v0.2/multi-agent-sprint-plan.md) ready for Tracks A, B, and C.
 
 | Task | Status | File |
 |---|---|---|
+| Physical 5-node fleet qualification (`v0.2.0-rc8`), WAN MLX, & real sliced 2-Mac LLM inference | ✅ Verified (`Runs #1–#12`, `120/120` receipts) | [261126_physical-fleet-qualification-and-real-sliced-inference.md](./tasks/2026-11/261126_physical-fleet-qualification-and-real-sliced-inference.md) |
 | Tier-1 `ShardWorker` libp2p transport (`/phase/shard-stage/1.0.0`), GGUF reader, & Cluster UI | ✅ Verified | [261125_shardworker-transport-and-cluster-ui.md](./tasks/2026-11/261125_shardworker-transport-and-cluster-ui.md) |
 | Ollama/multi-folder serving, HTTP tests, `lucidd bench`, & `ShardWorker` foundation | ✅ Verified (`b5bcee9`) | [261125_shardworker-foundation-and-bench.md](./tasks/2026-11/261125_shardworker-foundation-and-bench.md) |
 | Apple-simple self-configuring `lucidd` & cross-platform Tauri v2 desktop app | ✅ Verified (`v0.2.0-rc3`) | [261123_apple-simple-lucid-desktop.md](./tasks/2026-11/261123_apple-simple-lucid-desktop.md) |
@@ -277,6 +278,7 @@ What was accomplished
 - [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
 - [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
 - [Physical Fleet Progress Report](./releases/lucid-v0.2/fleet-progress-report.md)
+- [Multi-Agent Divide & Conquer Sprint Plan](./releases/lucid-v0.2/multi-agent-sprint-plan.md)
 
 ### Competitive research and next experiments
 

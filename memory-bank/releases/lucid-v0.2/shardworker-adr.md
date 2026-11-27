@@ -1,7 +1,7 @@
 # ADR Draft: ShardWorker Architecture & Partial-Compute Verification
 
-**Status:** Proposed — Foundation planner, pure-Rust GGUF header scanner (`crates/lucidd/src/shard_plan.rs`), workload-neutral `/phase/shard-stage/1.0.0` libp2p transport (`crates/phase-net`), Tier-1 Trusted-Circle `ShardWorker` coordinator/handler (`crates/lucidd/src/shard_worker.rs`), 3-node libp2p integration tests, `/api/lucid/cluster` + `lucidd cluster` CLI + Desktop Cluster modal implemented; real `llama.cpp` RPC stage backend awaits physical `lucidd bench` baseline and human ADR sign-off
-**Date:** 2026-11-25
+**Status:** Proposed — Foundation planner, GGUF header scanner (`crates/lucidd/src/shard_plan.rs`), `/phase/shard-stage/1.0.0` transport (`crates/phase-net`), Tier-1 `ShardWorker` (`crates/lucidd/src/shard_worker.rs`), `POST /api/lucid/cluster/{plan,execute}`, and strict loopback-only `--llama-rpc-servers` + `--llama-tensor-split` (`crates/lucidd/src/worker_llama/mod.rs`) are implemented and physically verified across 2 Macs (`Run #9` `51.5 ms` chained receipts; `Runs #11–#12` real sliced `6.98 GB` `gemma-4-12B` across `135.6 GiB` pooled Metal 4 at `5.7 → 16.4 → 21.3 tok/s`). Next: native libp2p `/phase/shard-rpc/1.0.0` Noise tunnel + human ADR sign-off; Tier-2 `UntrustedSpotChecked` stays strictly fail-closed.
+**Date:** 2026-11-27 (originally 2026-11-25)
 **Milestone:** [ShardWorker](./shardworker.md)
 **Depends on:** [Reputation and Redundant Verification](./reputation-and-redundant-verification.md), whole-model baseline (`crates/lucidd/src/bench.rs`)
 

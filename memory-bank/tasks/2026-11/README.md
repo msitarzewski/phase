@@ -2,6 +2,12 @@
 
 ## Tasks Completed
 
+### 2026-11-26 → 2026-11-27: Physical 5-Node Fleet Qualification (`v0.2.0-rc8`), WAN MLX (`71.3 tok/s`), & Real Sliced 2-Mac LLM Inference (`21.3 tok/s`)
+- Deployed `v0.2.0-rc8` (`3eec1de`) + catalog resilience (`a1849f0`) + loopback RPC slicing (`b97f93e`) across all 5 physical fleet nodes (**Cloud Relay**, **Ubuntu Desktop**, **Ubuntu Laptop**, **Mac M1 Max**, **Mac M5 Max**) with **`120/120` (100%) verified Ed25519 receipts** across Runs #1–#12.
+- Verified `10.18 GB` P2P pull + `172 MiB` interrupt & exact-offset resume, uninvited DCUtR peer default-deny, 2012 Ivy Bridge baseline `x86-64` fix (`0 SIGILL`), `2,194×` startup catalog restore speedup (`20.19s → 9.2 ms`), `ring` SHA-256 (`7.8×` faster), `model_peers_cache` (`123×` WAN MLX TTFT speedup: `10,458 → 85 ms`), WAN DHT enrollment `QUERY_DEADLINE` fix (`5s → 15s`), `98.0 tok/s` simultaneous 2-Mac burst (Cellular+ProtonVPN M5 Max MLX `71.3 tok/s` + Home M1 Max Metal `28.8 tok/s`), and **first real sliced 2-Mac LLM inference** (`6.98 GB` `gemma-4-12B` across `135.6 GiB` pooled Metal 4: `5.7 → 16.4 → 21.3 tok/s` across Cellular+VPN → 10G+VPN → Direct LAN).
+- Created the parallel [multi-agent sprint handoff plan](../../releases/lucid-v0.2/multi-agent-sprint-plan.md) for Tracks A, B, and C.
+- See: [261126_physical-fleet-qualification-and-real-sliced-inference.md](./261126_physical-fleet-qualification-and-real-sliced-inference.md).
+
 ### 2026-11-25 (Part 2): Tier-1 `ShardWorker` libp2p Transport (`/phase/shard-stage/1.0.0`), GGUF Reader, & Cluster UI
 - Added workload-neutral `/phase/shard-stage/1.0.0` opaque substream transport in `phase-net`, bounded pure-Rust GGUF v2/v3 layer-count scanner (`inspect_gguf_shard_metadata`), and Tier-1 Trusted-Circle `ShardWorker` coordinator + default-deny inbound stage handler (`crates/lucidd/src/shard_worker.rs`).
 - Added `cluster_enabled` opt-in (`node.toml`), `/api/lucid/cluster` + `/api/lucid/cluster/plan`, `lucidd cluster {status,inspect,plan}`, Desktop **Trusted-Circle Cluster** modal, and real 3-node libp2p integration test (`crates/lucidd/tests/shard_worker.rs`).

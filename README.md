@@ -8,21 +8,23 @@ See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale
 
 ## Status
 
-**Reviewed: 2026-11-22.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
+**Reviewed: 2026-11-27.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
 
 - **Phase Core** — **complete** (Nov 2025 → May 2026). The libp2p + Ed25519 substrate, extracted from the legacy `daemon/` tree into six publishable Apache-2.0 library crates plus the repositioned Plasm reference node.
-- **LUCID v0.1 / v0.1.1** — **shipped and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts. A public foundation relay was deployed in May; current fleet availability requires fresh operational evidence.
-- **LUCID v0.2** — **implemented checkpoint, unreleased.** Verified content pull/alias/provider records, live peer streams, relay/AutoNAT/DCUtR machinery, local reputation and bounded redundancy, an experimental MLX adapter, authenticated local enrollment control (`crates/lucidd/src/consumer.rs`), a native macOS SwiftUI consumer app (`apps/lucid-macos/`), and installable GitHub Release packaging (`.github/workflows/release.yml`, `scripts/install-lucid.sh`, `scripts/fleet-install.sh`) are implemented. Physical cross-network/NAT acceptance, real large-artifact resume, real MLX acceptance, independent correctness validation, and the remaining qualification matrix are open. [Authoritative tracker](memory-bank/releases/lucid-v0.2/README.md) · [Physical test runbook](memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22).
-- **Security hardening** — **shipped in May 2026** (PR #9) and refreshed in November 2026. Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate.
+- **LUCID v0.1 / v0.1.1** — **shipped and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts.
+- **LUCID v0.2** — **physical 5-node fleet qualification active (`v0.2.0-rc8` + `b97f93e`), unreleased.** Verified content pull/resume (`10.18 GB` physical transfer + interrupt/resume), live peer streams (`120/120` = `100%` verified Ed25519 receipts across Runs #1–#12), Cloud Relay + Porkbun DNS TXT zero-config bootstrap + DCUtR, local reputation routing, **real Apple Silicon MLX** (`71.3 tok/s` @ `124 ms` TTFT over Cellular Hotspot + ProtonVPN → Cloud Relay → Ubuntu Desktop; `98.0 tok/s` combined 2-Mac burst), **first real Tier-1 Trusted-Circle sliced 2-Mac LLM inference** (`6.98 GB` `gemma-4-12B` sliced across `135.6 GiB` pooled Metal 4: `5.7 → 16.4 → 21.3 tok/s` across Cellular+VPN → 10G+VPN → Direct LAN), self-configuring `lucidd` + sandboxed Tauri v2 desktop app (`apps/lucid-desktop/`, macOS `.dmg` + Ubuntu `.deb`), and automated SHA-256 GitHub Release bundles. Open release gates: RTX 5060 Ti CUDA run (awaiting host reboot for `NVRM Status 62`), native libp2p `/phase/shard-rpc/1.0.0` tunnel, public rendezvous admission quotas, independent correctness-evidence validator, Linux ARM64 VM qualification, and multi-site relay operations.
+  - [Authoritative v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md) · [Physical fleet progress report (Runs #1–#12)](memory-bank/releases/lucid-v0.2/fleet-progress-report.md) · [Multi-agent sprint handoff plan](memory-bank/releases/lucid-v0.2/multi-agent-sprint-plan.md)
+- **Security hardening** — **shipped in May 2026** (PR #9) and refreshed in November 2026 (`libp2p 0.57.1`, `wasmtime 36.0.23`, `hickory 0.26.3`). Signer authorization, DoS caps, receipt verify+bind, 0 reported RustSec vulnerabilities, and `cargo audit` / `cargo deny` CI gates.
 
-**Validated on real hardware:**
-- Two-node, DHT-routed inference demo — one machine loads a model, another `curl`s `localhost:11434/api/chat` and gets a signed result routed over libp2p.
-- Real embeddings on Apple Metal — `nomic-embed-text` via `/api/embed`, 768-dim vectors with correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
-- An authz-gate demo — default-deny rejects an unauthorized routed job; the operator escape hatch accepts it with `X-Lucid-Receipt-Verified: true`.
+**Validated on real physical 5-node hardware (Nov 2026, `v0.2.0-rc8+`):**
+- **Zero-config DNS bootstrap + Cloud Relay**: unprivileged `User=lucid` relay (`16.0 MiB` RSS, TCP `4001`), `bootstrap.phasebased.net` TXT discovery, permission-first `lucid://join/...` WAN DHT enrollment (`3–4s`), and default-deny rejection of uninvited DCUtR peers.
+- **10.18 GB P2P pull + interrupt & exact-offset resume**: pulled `qwen3.8-iq3xxs:latest` from Ubuntu Desktop → Mac M1 Max, interrupted at `172 MiB`, resumed at exact offset, SHA-256 verified, and hardlink-installed.
+- **Apple Silicon Metal & MLX over WAN / Cellular Hotspot + ProtonVPN**: Mac M1 Max Metal 4 (`28.8 tok/s` @ `606 ms` TTFT, `c=4`), Cellular Hotspot Mac M5 Max MLX (`71.3 tok/s` @ `124 ms` TTFT), and simultaneous 2-Mac burst into an Ubuntu Desktop consumer (`98.0 tok/s` combined, `100%` verified Ed25519 receipts).
+- **Tier-1 Trusted-Circle sliced 2-Mac LLM inference**: `gemma-4-12B-it-QAT-Q4_0` (`6.98 GB`) sliced by layers across `135.6 GiB` pooled Metal 4 (Mac M5 Max 90% + Mac M1 Max 10% via strict loopback `ggml-rpc-server -c`) streaming real tokens + verified receipts to Ubuntu Desktop (`5.7 tok/s` Cellular+VPN → `16.4 tok/s` 10G+VPN → `21.3 tok/s` / `25.0 tok/s` decode on Direct LAN, `5.4s` warm SSD cache reload).
+- **Cross-architecture Linux compatibility**: baseline `x86-64` Linux release build verified with zero `SIGILL` on 2012 Ivy Bridge hardware (`DCUtR` direct).
+- **Real embeddings on Apple Metal**: `nomic-embed-text` via `/api/embed` (768-dim vectors, `cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
 
-**Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md), not a claim of fresh qualification or a released v0.2.
-
-**November 2026 local QA (`feat/lucid-consumer-experience`):** after the November 9 CI/security repair and the November 22 workspace/runtime efficiency pass ([task record](memory-bank/tasks/2026-11/261122_workspace-and-runtime-efficiency.md)), macOS ARM64 passes **492 Rust tests (2 ignored)**, **11 macOS Swift tests (`-warnings-as-errors`)**, formatting, strict all-target Clippy, `cargo audit` (0 vulnerabilities; 4 allowed transitive unmaintained warnings), and `cargo deny`. Physical fleet qualification (Cloud Relay + behind-NAT Ubuntu Desktop/Ubuntu Laptop/Mac M1 Max + cellular Mac M5 Max), Linux x86_64/ARM64 reruns on current source, real MLX acceptance, and release gates remain open.
+**November 2026 CI & local QA (`feat/lucid-consumer-experience`):** GitHub Actions CI (Rust workspace fmt, strict Clippy `-D warnings`, tests, `cargo audit`, `cargo deny`, Tauri desktop `svelte-check` + Rust tests) and Release Bundles (`.tar.gz`, `.dmg`, `.deb`, `SHA256SUMS.txt`) pass green on `v0.2.0-rc8` (`3eec1de`) and subsequent fixes (`a1849f0`, `b97f93e`). See [fleet-progress-report.md](memory-bank/releases/lucid-v0.2/fleet-progress-report.md) for full benchmark evidence and [multi-agent-sprint-plan.md](memory-bank/releases/lucid-v0.2/multi-agent-sprint-plan.md) for next parallel workstreams.
 
 ---
 
@@ -80,10 +82,11 @@ The protocol remains workload-neutral. Implementation does not imply release acc
 phase/
 ├── Cargo.toml                 # Workspace root, resolver = 2, [workspace.dependencies]
 ├── apps/
+│   ├── lucid-desktop/         # Cross-platform Tauri v2 + Svelte 5 app (macOS .dmg + Ubuntu .deb)
 │   └── lucid-macos/           # Native SwiftUI macOS 14+ consumer app (AGPL-3.0-or-later)
 ├── crates/
 │   ├── phase-identity/        # Persistent Ed25519 node identity        Apache-2.0
-│   ├── phase-net/             # libp2p 0.56 / Kademlia / mDNS / Noise+QUIC + job-relay   Apache-2.0
+│   ├── phase-net/             # libp2p 0.57 / Kademlia / mDNS / Noise+QUIC + job-relay + shard-stage   Apache-2.0
 │   ├── phase-manifest/        # SignedManifest<T>, generic over payload  Apache-2.0
 │   ├── phase-receipt/         # SignedReceipt<T> + commitment accumulator Apache-2.0
 │   ├── phase-protocol/        # JobSpec {Wasm,Inference,Embedding} + Worker trait + JobStream  Apache-2.0

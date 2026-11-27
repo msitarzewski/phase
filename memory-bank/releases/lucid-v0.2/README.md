@@ -3,7 +3,7 @@
 **Status:** IMPLEMENTATION ACTIVE — 2026-08-09 checkpoint approved; 2026-08-10 external test topology approved; 2026-08-24 trust/scale sequencing approved; release acceptance incomplete
 **Release:** LUCID v0.2
 **Tracker role:** This README is the authoritative progress tracker for the build.
-**Last tracker update:** 2026-11-26
+**Last tracker update:** 2026-11-27
 
 LUCID v0.2 turns the v0.1 demonstration into a real public-network path: a fresh node can discover the network, resolve a human model name to verified content, pull that content, reach a serving peer through hostile NAT, receive tokens while they are generated, and verify the signed result. Trust, sharding, and Apple-native backends build on that vertical slice without obscuring it.
 
@@ -59,12 +59,16 @@ The release extends the workload-neutral Phase substrate. It must not move model
 - Landed `b5bcee9` ([261125 task record](../../tasks/2026-11/261125_shardworker-foundation-and-bench.md)): Ollama blob (`sha256-*`), LM Studio, and multi-folder GGUF hot-import + 1-click P2P pull UI; real-process `/api/lucid/*` boundary tests (`http_api.rs`); fixed intermittent `fake_llama_server` `AddrInUse` teardown flake (5/5 repeats pass); `lucidd bench` whole-model baseline harness; Tier-1 Trusted-Circle `ShardWorker` planner + chained stage-receipt verifier (`shard_plan.rs`, `UntrustedSpotChecked` fail-closed) + draft 7-question ADR ([shardworker-adr.md](./shardworker-adr.md)). All 6 GitHub Actions CI jobs pass (`run 45735251912`).
 - Tracker honesty unchanged until physical multi-network, MLX, baseline, and ADR gates pass: **0 complete, 7 in progress, 2 blocked, 1 not started**.
 
-### Physical 5-node fleet qualification & performance sprint (`v0.2.0-rc4` → `v0.2.0-rc7`) — 2026-11-26
+### Physical 5-node fleet qualification, WAN MLX, & real sliced 2-Mac inference (`v0.2.0-rc4` → `v0.2.0-rc8+`) — 2026-11-26 → 2026-11-27
 
-- Provisioned hardened **Cloud Relay** (`User=lucid`, TCP `4001`, `18.5 MiB` RSS) + live Porkbun DNS TXT (`bootstrap.phasebased.net`); verified zero-config bootstrap, permission-first `lucid://join/...` enrollment, and uninvited-peer default-deny rejection across all 5 physical nodes (see [fleet-progress-report.md](./fleet-progress-report.md)).
-- Verified physical `10.18 GB` P2P model pull + `172 MiB` interrupt & exact-offset resume + SHA-256 install (`Ubuntu Desktop → Mac M1 Max`), real `86.7 GB` `DeepSeek-V4-Flash` GGUF Tier-1 Cluster Plan, and `lucidd bench` scaling from `3.7 ch/s` (Run #1 CPU) → **`24.7 tok/s`** (`1,696 ms` TTFT p50, `-30%` TTFT, `6.7×` Run #1, `100%` verified Ed25519 receipts) on Mac M1 Max Metal 4 (`v0.2.0-rc7`).
-- Fixed 2012 Ivy Bridge BMI1 `SIGILL` (`andn`) via baseline `x86-64` Linux release flags (`Ubuntu Laptop` online via DCUtR), `:latest` human-name routing, `node.toml` `serve_model_content`, startup catalog double-hash (`20.19s → 9.2 ms`), inode triple-hash, hardware-accelerated `ring::digest::SHA256` (`~2.7 GB/s`, 7.8× faster), verified alias cache, multi-peer catalog refresh, in-flight load spreading, `--cache-reuse 256`, and `mlx-lm 0.32.x` `delta.reasoning` streaming.
-- Tracker milestones remain **0 complete, 7 in progress, 2 blocked, 1 not started** while RTX 5060 Ti CUDA re-run (awaiting host reboot to clear `NVRM Status 62`), public rendezvous quotas, correctness-evidence validator, ADR sign-off, and multi-site operations remain open.
+- Deployed **`v0.2.0-rc8`** (`3eec1de`, Release Bundles green in `25m56s`) across all 5 physical fleet nodes (**Cloud Relay** `16.0 MiB` RSS unprivileged `User=lucid`, **Ubuntu Desktop**, **Ubuntu Laptop** 2012 Ivy Bridge `0 SIGILL` via baseline `x86-64` build, **Mac M1 Max**, **Mac M5 Max**) + Porkbun DNS TXT (`bootstrap.phasebased.net`).
+- Verified **`120/120` (100%) Ed25519 receipts** across **Runs #1–#12** ([fleet-progress-report.md](./fleet-progress-report.md)):
+  - **10.18 GB P2P pull + interrupt (`172 MiB`) & exact-offset resume** (Ubuntu Desktop → Mac M1 Max) + uninvited DCUtR peer default-deny rejection.
+  - **Apple Silicon MLX local + WAN + Cellular/ProtonVPN**: `66.7 tok/s` (`72 ms` TTFT) local, `67.1 tok/s` (`85 ms` TTFT — **123× TTFT speedup** via `model_peers_cache` + `500 ms` catalog bound), **`71.3 tok/s` (`124 ms` TTFT)** from Cellular Hotspot + ProtonVPN Mac M5 Max → Cloud Relay → Ubuntu Desktop, and **`98.0 tok/s` combined** simultaneous 2-Mac burst (`69.2` MLX + `28.8` M1 Max Metal @ `606 ms` TTFT, `26.5×` Run #1).
+  - **Tier-1 Trusted-Circle `ShardWorker` (`Run #9` + `Runs #11–#12`)**: cross-machine `/phase/shard-stage/1.0.0` chained Ed25519 receipts via `POST /api/lucid/cluster/execute` (`51.5 ms`, fail-closed Tier-2 `403`, default-deny `cluster_enabled=false`, live zero-restart opt-in), **PLUS first real sliced 2-Mac LLM inference** (`6.98 GB` `gemma-4-12B-it-QAT-Q4_0` sliced across **`135.6 GiB` pooled Metal 4** via strict loopback `--llama-rpc-servers` + `ggml-rpc-server -c`): **`5.7 tok/s` Cellular+VPN → `16.4 tok/s` 10G+VPN → `21.3 tok/s` (`25.0 tok/s` decode, `431 ms` TTFT, `5.4s` warm SSD load) on Direct LAN**.
+- Fixed critical WAN production bugs discovered on live hardware: `consumer.rs` `QUERY_DEADLINE` `5s→15s` (fixes NATted/`--outbound-only` enrollment stalling in `pending`), `registry/mod.rs` catalog expiration on `StartProviding` timeout + concurrent `buffered(8)` publisher discovery (`a1849f0`), `SIGTERM`/`SIGINT` graceful child reaping, `mlx-lm 0.32.x` `delta.reasoning`, hardware `ring::digest::SHA256` (`7.8×` faster), and `release.yml` 60m macOS timeout + Tauri rust-cache.
+- Created the parallel [multi-agent sprint handoff plan](./multi-agent-sprint-plan.md) for the remaining v0.2 gates: native libp2p `/phase/shard-rpc/1.0.0` tunnel, public rendezvous admission quotas, independent correctness-evidence validator, Desktop Cluster execution UX, RTX 5060 Ti CUDA run (post-reboot), and Linux ARM64 VM qualification.
+- Tracker milestones remain **0 complete, 7 in progress, 2 blocked, 1 not started** until remaining acceptance gates close.
 
 ### Efficiency, native consumer app, and physical fleet test plan — 2026-11-22
 
