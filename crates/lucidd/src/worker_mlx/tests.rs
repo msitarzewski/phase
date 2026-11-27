@@ -145,6 +145,7 @@ async fn attach_fixture_server(worker: &MlxWorker, port: u16) {
     *worker.inner.server.lock().await = Some(Arc::new(MlxServer {
         port,
         failed,
+        abnormal: Arc::new(AtomicBool::new(false)),
         shutdown_tx,
         supervisor,
     }));
@@ -483,6 +484,67 @@ fn bundle_scan_enforces_recursive_count_depth_and_byte_limits() {
     thaw_for_cleanup(&crowded);
 }
 
+#[cfg(unix)]
+#[test]
+fn identity_only_reverification_accepts_unchanged_and_rejects_any_mutation() {
+    // Unchanged bundle: identity-only verification passes without hashing.
+    let directory = tempfile::tempdir().unwrap();
+    let bundle = create_immutable_bundle(directory.path());
+    let (_, snapshot) = scan_bundle(&bundle).unwrap();
+    assert_eq!(
+        verify_bundle_identity(&bundle, &snapshot).unwrap(),
+        bundle.canonicalize().unwrap()
+    );
+    thaw_for_cleanup(&bundle);
+
+    type Mutation = fn(&Path);
+    let mutations: [(&str, Mutation); 5] = [
+        ("same-length content rewrite", |bundle| {
+            let weights = bundle.join("model.safetensors");
+            set_mode(&weights, 0o644);
+            std::fs::write(&weights, b"FIXTURE").unwrap();
+            set_mode(&weights, 0o444);
+        }),
+        ("added file", |bundle| {
+            set_mode(bundle, 0o755);
+            std::fs::write(bundle.join("extra.safetensors"), b"x").unwrap();
+            set_mode(&bundle.join("extra.safetensors"), 0o444);
+            set_mode(bundle, 0o555);
+        }),
+        ("removed file", |bundle| {
+            let nested = bundle.join("weights");
+            set_mode(&nested, 0o755);
+            std::fs::remove_file(nested.join("model-00002.safetensors")).unwrap();
+            set_mode(&nested, 0o555);
+        }),
+        ("permission change", |bundle| {
+            set_mode(&bundle.join("tokenizer.json"), 0o440);
+        }),
+        ("inode swap", |bundle| {
+            set_mode(bundle, 0o755);
+            let target = bundle.join("tokenizer.json");
+            let staged = bundle.join("tokenizer.json.new");
+            std::fs::write(&staged, b"{}").unwrap();
+            set_mode(&staged, 0o444);
+            std::fs::rename(&staged, &target).unwrap();
+            set_mode(bundle, 0o555);
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = create_immutable_bundle(directory.path());
+        let (_, snapshot) = scan_bundle(&bundle).unwrap();
+        // Step past coarse filesystem timestamp granularity.
+        std::thread::sleep(Duration::from_millis(20));
+        mutate(&bundle);
+        assert!(
+            verify_bundle_identity(&bundle, &snapshot).is_err(),
+            "identity-only verification missed: {name}"
+        );
+        thaw_for_cleanup(&bundle);
+    }
+}
+
 #[test]
 fn request_forces_default_model_and_rejects_model_override() {
     let request = build_completion_request(&inference("cid:test"), 64).unwrap();
@@ -761,7 +823,11 @@ async fn success_uses_default_model_and_signs_streamed_output() {
     };
     assert_eq!(result.completion, Completion::Stop);
     assert_eq!(result.output_chunk_count, 1);
-    assert_eq!(result.metrics.extra["hardware_acceptance"], "unverified");
+    assert_eq!(
+        result.metrics.extra["hardware_acceptance"],
+        MLX_HARDWARE_ACCEPTANCE_LABEL
+    );
+    assert_eq!(result.metrics.extra["compute_proof"], MLX_COMPUTE_PROOF);
     assert_eq!(
         result.metrics.extra["bundle_root_algorithm"],
         MLX_BUNDLE_ROOT_ALGORITHM
@@ -821,6 +887,11 @@ async fn capacity_is_one_and_cancellation_kills_the_server() {
     ));
     let slot = worker.inner.server.lock().await;
     assert!(slot.as_ref().is_some_and(|server| server.is_failed()));
+    assert!(
+        slot.as_ref()
+            .is_some_and(|server| !server.ended_abnormally()),
+        "cancellation is a clean, Phase-initiated stop"
+    );
     drop(slot);
     fixture.abort();
     set_mode(&runtime, 0o755);
@@ -880,7 +951,73 @@ async fn hung_sse_hits_idle_deadline_and_invalidates_server() {
     ));
     let slot = worker.inner.server.lock().await;
     assert!(slot.as_ref().is_some_and(|server| server.is_failed()));
+    assert!(
+        slot.as_ref()
+            .is_some_and(|server| server.ended_abnormally()),
+        "an idle-deadline kill is a backend failure"
+    );
     drop(slot);
+    fixture.abort();
+    set_mode(&runtime, 0o755);
+    thaw_for_cleanup(&bundle);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn clean_cancellation_restart_skips_content_rehash_but_failures_require_it() {
+    // A5: after a cancelled request the next spawn only re-proves bundle
+    // identity; once a backend ends abnormally (here: readiness failure of
+    // the never-healthy fixture runtime) the next spawn re-hashes contents.
+    let (port, _, fixture) = start_fixture(FixtureMode::Hang).await;
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, bundle, mut config) = create_runtime_and_bundle(directory.path(), 0);
+    config.per_request_idle_timeout = Duration::from_secs(2);
+    config.model_load_timeout = Duration::from_millis(300);
+    let worker = MlxWorker::new(NodeIdentity::generate(), config).unwrap();
+    attach_fixture_server(&worker, port).await;
+    let model_cid = worker.model_cid().to_hex();
+    let (handle, mut stream) = worker
+        .execute(signed_job(JobSpec::Inference(inference(&model_cid))))
+        .await
+        .unwrap();
+    handle.cancel();
+    let _ = timeout(Duration::from_secs(1), stream.next()).await;
+    drop(stream);
+
+    // Restart after the clean stop: identity-only (no content re-hash). The
+    // fixture runtime never answers /health, so this restart fails...
+    assert!(worker.preload().await.is_err());
+    assert_eq!(worker.inner.content_rehash_count.load(Ordering::Acquire), 0);
+    // ...and that abnormal failure makes the next restart re-hash contents.
+    assert!(worker.preload().await.is_err());
+    assert_eq!(worker.inner.content_rehash_count.load(Ordering::Acquire), 1);
+
+    fixture.abort();
+    set_mode(&runtime, 0o755);
+    thaw_for_cleanup(&bundle);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn abnormal_backend_end_forces_content_rehash_on_next_spawn() {
+    let (port, _, fixture) = start_fixture(FixtureMode::Hang).await;
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, bundle, mut config) = create_runtime_and_bundle(directory.path(), 0);
+    config.model_load_timeout = Duration::from_millis(300);
+    let worker = MlxWorker::new(NodeIdentity::generate(), config).unwrap();
+    attach_fixture_server(&worker, port).await;
+    let model_cid = worker.model_cid().to_hex();
+    let (_handle, mut stream) = worker
+        .execute(signed_job(JobSpec::Inference(inference(&model_cid))))
+        .await
+        .unwrap();
+    // Hung SSE → idle deadline → backend failure.
+    let _ = timeout(Duration::from_secs(1), stream.next()).await;
+    drop(stream);
+
+    assert!(worker.preload().await.is_err());
+    assert_eq!(worker.inner.content_rehash_count.load(Ordering::Acquire), 1);
+
     fixture.abort();
     set_mode(&runtime, 0o755);
     thaw_for_cleanup(&bundle);

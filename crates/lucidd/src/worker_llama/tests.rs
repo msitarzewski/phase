@@ -4,6 +4,23 @@ use super::*;
 use phase_manifest::ManifestBuilder;
 use phase_protocol::{ChatMessage, ChatRole, SignedReceipt};
 
+/// A `LoadedModel` handle with no real child behind it. The kill switch and
+/// stop signal are inert unless a test drives them explicitly.
+fn test_loaded_model(port: u16, supervisor: tokio::task::JoinHandle<()>) -> Arc<LoadedModel> {
+    let (kill, _kill_rx) = watch::channel(false);
+    let (_stopped_tx, stopped) = watch::channel(false);
+    Arc::new(LoadedModel {
+        port,
+        api_key: LlamaApiKey::generate().expect("test API key"),
+        last_used: Mutex::new(Instant::now()),
+        failed: Arc::new(Notify::new()),
+        failed_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        kill,
+        stopped,
+        supervisor,
+    })
+}
+
 async fn exercise_raw_sse(body: &'static [u8]) -> (Vec<JobEvent>, SignedReceipt<JobResult>) {
     use tokio::io::AsyncWriteExt as _;
 
@@ -37,15 +54,7 @@ async fn exercise_raw_sse(body: &'static [u8]) -> (Vec<JobEvent>, SignedReceipt<
         socket.shutdown().await.expect("close response");
     });
 
-    let failed = Arc::new(Notify::new());
-    let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let model = Arc::new(LoadedModel {
-        port,
-        last_used: Mutex::new(Instant::now()),
-        failed,
-        failed_flag,
-        supervisor: tokio::spawn(std::future::pending::<()>()),
-    });
+    let model = test_loaded_model(port, tokio::spawn(std::future::pending::<()>()));
     let manifest_hash = [0x61; 32];
     let (handle, producer) = JobHandle::new(JobId(manifest_hash));
     let events = run_inference(
@@ -253,11 +262,8 @@ async fn occupied_loopback_port_is_never_reserved_for_llama() {
         },
     );
 
-    assert!(matches!(
-        worker.allocate_port().await,
-        Err(WorkerError::Capacity)
-    ));
-    assert!(worker.inner.ports_in_use.lock().await.is_empty());
+    assert!(matches!(worker.allocate_port(), Err(WorkerError::Capacity)));
+    assert!(worker.inner.ports_in_use.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -381,7 +387,7 @@ async fn concurrent_cold_loads_are_serialized_before_capacity_mutation() {
         worker.ensure_loaded("missing-model", false).await,
         Err(WorkerError::ArtifactUnavailable(_))
     ));
-    assert!(worker.inner.ports_in_use.lock().await.is_empty());
+    assert!(worker.inner.ports_in_use.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -590,13 +596,7 @@ fn find_double_newline_finds_first() {
 #[tokio::test]
 async fn ensure_loaded_warm_hit_does_not_block_on_load_gate() {
     let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
-    let loaded = Arc::new(LoadedModel {
-        port: 18080,
-        last_used: Mutex::new(Instant::now()),
-        failed: Arc::new(Notify::new()),
-        failed_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        supervisor: tokio::spawn(async {}),
-    });
+    let loaded = test_loaded_model(18080, tokio::spawn(async {}));
     worker
         .inner
         .loaded_models
@@ -752,4 +752,405 @@ fn chat_request_waits_for_loaded_model_template() {
     let request = build_completion_request(&spec).unwrap();
     assert_eq!(request.body["prompt"], "");
     assert_eq!(request.prompt_chars, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 1 Track A: loopback lockdown, lifecycle, and RPC guardrails
+// ---------------------------------------------------------------------------
+
+fn command_args(cmd: &Command) -> Vec<String> {
+    cmd.as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn command_env(cmd: &Command, key: &str) -> Option<String> {
+    cmd.as_std()
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+        .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+}
+
+#[test]
+fn api_keys_are_256_bit_hex_unique_and_redacted() {
+    let first = LlamaApiKey::generate().expect("key");
+    let second = LlamaApiKey::generate().expect("key");
+    assert_eq!(first.as_str().len(), 64);
+    assert!(first
+        .as_str()
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_ne!(first.as_str(), second.as_str());
+    let debug = format!("{first:?}");
+    assert!(!debug.contains(first.as_str()), "{debug}");
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+fn spawn_command_carries_key_in_env_only_and_hardening_flags() {
+    let key = LlamaApiKey::generate().expect("key");
+    // A configured `extra_env` entry must never be able to replace the key.
+    let extra_env = vec![(LLAMA_API_KEY_ENV.to_string(), "attacker-chosen".to_string())];
+    let cmd = llama_server_command(
+        Path::new("/opt/llama/llama-server"),
+        Path::new("/models/m.gguf"),
+        18080,
+        &key,
+        0,
+        2048,
+        &extra_env,
+        false,
+        &[],
+        None,
+    )
+    .expect("command builds");
+
+    assert_eq!(
+        command_env(&cmd, LLAMA_API_KEY_ENV).as_deref(),
+        Some(key.as_str())
+    );
+    let args = command_args(&cmd);
+    assert!(
+        args.iter().all(|arg| !arg.contains(key.as_str())),
+        "API key leaked into world-readable argv: {args:?}"
+    );
+    assert!(!args.iter().any(|arg| arg == "--api-key"), "{args:?}");
+    let joined = args.join(" ");
+    assert!(
+        joined.contains("--cors-origins localhost --no-cors-credentials --no-webui --no-slots"),
+        "{joined}"
+    );
+    assert!(joined.contains("--host 127.0.0.1"), "{joined}");
+    assert!(!joined.contains("--rpc"), "{joined}");
+}
+
+#[test]
+fn spawn_command_adds_rpc_layer_split_only_with_validated_loopback_peers() {
+    let key = LlamaApiKey::generate().expect("key");
+    let rpc = vec!["127.0.0.1:50052".to_string(), " [::1]:50053 ".to_string()];
+    let cmd = llama_server_command(
+        Path::new("/opt/llama/llama-server"),
+        Path::new("/models/m.gguf"),
+        18080,
+        &key,
+        i32::MAX,
+        2048,
+        &[],
+        false,
+        &rpc,
+        Some("30,70"),
+    )
+    .expect("command builds");
+    let joined = command_args(&cmd).join(" ");
+    assert!(
+        joined
+            .contains("--rpc 127.0.0.1:50052,[::1]:50053 --split-mode layer --tensor-split 30,70"),
+        "{joined}"
+    );
+
+    // Defense in depth: the spawn path re-validates even if startup
+    // validation was bypassed by a library caller.
+    for (servers, split) in [
+        (vec!["192.0.2.1:50052".to_string()], None),
+        (Vec::new(), Some("30,70")),
+    ] {
+        assert!(llama_server_command(
+            Path::new("/opt/llama/llama-server"),
+            Path::new("/models/m.gguf"),
+            18080,
+            &key,
+            0,
+            2048,
+            &[],
+            false,
+            &servers,
+            split,
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn rpc_offload_flags_require_rpc_servers_for_tensor_split() {
+    let rpc = ["127.0.0.1:50052".to_string()];
+    assert!(validate_rpc_offload_flags(&[], None).is_ok());
+    assert!(validate_rpc_offload_flags(&rpc, None).is_ok());
+    assert!(validate_rpc_offload_flags(&rpc, Some("30,70")).is_ok());
+    let error = validate_rpc_offload_flags(&[], Some("30,70")).unwrap_err();
+    assert!(
+        error.to_string().contains("requires --llama-rpc-servers"),
+        "{error}"
+    );
+    assert!(validate_rpc_offload_flags(&rpc, Some("0,0")).is_err());
+    assert!(validate_rpc_offload_flags(&["198.51.100.2:50052".to_string()], None).is_err());
+}
+
+#[test]
+fn port_guard_releases_reservation_exactly_on_drop() {
+    let worker = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_port_range: 30_000..60_000,
+            ..LlamaCppConfig::default()
+        },
+    );
+    let first = worker.allocate_port().expect("a free loopback port");
+    let second = worker.allocate_port().expect("a second free loopback port");
+    assert_ne!(first.port(), second.port());
+    {
+        let pool = worker.inner.ports_in_use.lock().unwrap();
+        assert!(pool.contains(&first.port()) && pool.contains(&second.port()));
+    }
+    let first_port = first.port();
+    drop(first);
+    {
+        let pool = worker.inner.ports_in_use.lock().unwrap();
+        assert!(!pool.contains(&first_port));
+        assert!(pool.contains(&second.port()));
+    }
+    drop(second);
+    assert!(worker.inner.ports_in_use.lock().unwrap().is_empty());
+}
+
+fn rpc_worker(gate: Option<RpcClusterGate>) -> LlamaCppWorker {
+    LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            rpc_servers: vec!["127.0.0.1:50052".to_string()],
+            rpc_cluster_gate: gate,
+            ..LlamaCppConfig::default()
+        },
+    )
+}
+
+fn inference_manifest(model: &str) -> SignedManifest<JobSpec> {
+    let mut spec = inference_with_sampling(&[], Some(8));
+    spec.model_cid = model.to_string();
+    ManifestBuilder::new(JobSpec::Inference(spec))
+        .sign_with(&NodeIdentity::generate())
+        .expect("sign")
+}
+
+#[test]
+fn execution_trust_label_reports_rpc_offload_honestly() {
+    let local = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+    assert!(!local.uses_rpc_layer_offload());
+    assert_eq!(local.execution_trust_label(), "local");
+
+    let sharded = rpc_worker(Some(RpcClusterGate::new(|| true)));
+    assert!(sharded.uses_rpc_layer_offload());
+    assert_eq!(sharded.execution_trust_label(), "trusted-circle-sharded");
+}
+
+#[tokio::test]
+async fn rpc_offload_without_gate_or_with_closed_gate_fails_closed_before_load() {
+    for gate in [None, Some(RpcClusterGate::new(|| false))] {
+        let worker = rpc_worker(gate);
+        let error = match worker.execute(inference_manifest("missing-model")).await {
+            Ok(_) => panic!("RPC offload must be refused while cluster_enabled is off"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cluster_enabled"), "{error}");
+        assert!(worker.inner.ports_in_use.lock().unwrap().is_empty());
+
+        let embedding = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+            model_cid: "missing-model".into(),
+            input: vec!["x".into()],
+        }))
+        .sign_with(&NodeIdentity::generate())
+        .unwrap();
+        let error = match worker.execute(embedding).await {
+            Ok(_) => panic!("RPC-backed embeddings must also be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cluster_enabled"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn open_rpc_gate_is_the_only_extra_barrier() {
+    let worker = rpc_worker(Some(RpcClusterGate::new(|| true)));
+    // Past the gate, the normal model-resolution boundary applies.
+    assert!(matches!(
+        worker.execute(inference_manifest("missing-model")).await,
+        Err(WorkerError::ArtifactUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn closing_rpc_gate_at_runtime_kills_resident_rpc_backed_children() {
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gate_state = open.clone();
+    let worker = rpc_worker(Some(RpcClusterGate::new(move || {
+        gate_state.load(std::sync::atomic::Ordering::SeqCst)
+    })));
+
+    let (kill, mut kill_rx) = watch::channel(false);
+    let (_stopped_tx, stopped) = watch::channel(false);
+    let resident = Arc::new(LoadedModel {
+        port: 18080,
+        api_key: LlamaApiKey::generate().unwrap(),
+        last_used: Mutex::new(Instant::now()),
+        failed: Arc::new(Notify::new()),
+        failed_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        kill,
+        stopped,
+        supervisor: tokio::spawn(std::future::pending::<()>()),
+    });
+    worker
+        .inner
+        .loaded_models
+        .insert("resident".into(), resident.clone());
+
+    open.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(worker
+        .execute(inference_manifest("resident"))
+        .await
+        .is_err());
+    assert!(worker.inner.loaded_models.is_empty());
+    assert!(resident.is_failed());
+    assert!(
+        *kill_rx.borrow_and_update(),
+        "supervisor must be told to kill"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_signals_supervisor_and_wait_stopped_observes_completion() {
+    let (kill, mut kill_rx) = watch::channel(false);
+    let (stopped_tx, stopped) = watch::channel(false);
+    let supervisor = tokio::spawn(async move {
+        let _ = kill_rx.wait_for(|requested| *requested).await;
+        stopped_tx.send_replace(true);
+    });
+    let model = LoadedModel {
+        port: 18080,
+        api_key: LlamaApiKey::generate().unwrap(),
+        last_used: Mutex::new(Instant::now()),
+        failed: Arc::new(Notify::new()),
+        failed_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        kill,
+        stopped,
+        supervisor,
+    };
+    assert!(!model.wait_stopped(Duration::from_millis(50)).await);
+    model.shutdown();
+    assert!(model.is_failed());
+    assert!(model.wait_stopped(Duration::from_secs(2)).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn supervisor_kills_reaps_and_releases_port_on_kill_signal() {
+    // A real long-lived child stands in for a wedged llama-server.
+    let worker = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_port_range: 30_000..60_000,
+            ..LlamaCppConfig::default()
+        },
+    );
+    let guard = worker.allocate_port().expect("port");
+    let port = guard.port();
+    let child = Command::new("/bin/sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stand-in child");
+    let pid = child.id().expect("child pid");
+
+    let (kill_tx, kill_rx) = watch::channel(false);
+    let (stopped_tx, mut stopped_rx) = watch::channel(false);
+    let failed = Arc::new(Notify::new());
+    let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(run_supervisor(
+        SupervisorInput {
+            model_id: "wedged".into(),
+            port_guard: guard,
+            api_key: LlamaApiKey::generate().unwrap(),
+            failed,
+            failed_flag: failed_flag.clone(),
+            kill: kill_rx,
+            stopped: stopped_tx,
+            client: worker.inner.client.clone(),
+            config: worker.inner.config.clone(),
+            model_path: PathBuf::from("/nonexistent.gguf"),
+            embeddings: false,
+        },
+        child,
+    ));
+
+    assert!(worker.inner.ports_in_use.lock().unwrap().contains(&port));
+    kill_tx.send_replace(true);
+    timeout(Duration::from_secs(5), stopped_rx.wait_for(|done| *done))
+        .await
+        .expect("supervisor stops promptly after kill")
+        .ok();
+    task.await.expect("supervisor task completes");
+
+    assert!(failed_flag.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !worker.inner.ports_in_use.lock().unwrap().contains(&port),
+        "port must return to the pool once the child is reaped"
+    );
+    // The child was reaped (not merely signalled): its PID no longer exists.
+    let alive = std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .expect("probe pid");
+    assert!(!alive.success(), "stand-in child {pid} survived the kill");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_the_loaded_model_handle_kills_the_supervised_child() {
+    let worker = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_port_range: 30_000..60_000,
+            ..LlamaCppConfig::default()
+        },
+    );
+    let guard = worker.allocate_port().expect("port");
+    let port = guard.port();
+    let child = Command::new("/bin/sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stand-in child");
+    let (kill_tx, kill_rx) = watch::channel(false);
+    let (stopped_tx, mut stopped_rx) = watch::channel(false);
+    let task = tokio::spawn(run_supervisor(
+        SupervisorInput {
+            model_id: "orphaned".into(),
+            port_guard: guard,
+            api_key: LlamaApiKey::generate().unwrap(),
+            failed: Arc::new(Notify::new()),
+            failed_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kill: kill_rx,
+            stopped: stopped_tx,
+            client: worker.inner.client.clone(),
+            config: worker.inner.config.clone(),
+            model_path: PathBuf::from("/nonexistent.gguf"),
+            embeddings: false,
+        },
+        child,
+    ));
+    // Losing every handle to the model is the same as an explicit kill.
+    drop(kill_tx);
+    timeout(Duration::from_secs(5), stopped_rx.wait_for(|done| *done))
+        .await
+        .expect("supervisor stops when the handle disappears")
+        .ok();
+    task.await.unwrap();
+    assert!(!worker.inner.ports_in_use.lock().unwrap().contains(&port));
 }

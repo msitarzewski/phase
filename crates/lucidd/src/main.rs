@@ -477,6 +477,18 @@ fn prepare_mlx_startup(cli: &Cli, platform_supported: bool) -> Result<PreparedMl
     })
 }
 
+/// Fail fast on an inconsistent Tier-1 RPC offload flag set: non-loopback or
+/// malformed `--llama-rpc-servers`, a malformed `--llama-tensor-split`, or a
+/// `--llama-tensor-split` without `--llama-rpc-servers` (which llama-server
+/// would otherwise silently ignore).
+fn validate_llama_rpc_cli(cli: &Cli) -> Result<(), String> {
+    lucidd::worker_llama::validate_rpc_offload_flags(
+        &cli.llama_rpc_servers,
+        cli.llama_tensor_split.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// SEC-09: validate one TXT-derived bootstrap string. Returns `Some` only
 /// for a multiaddr that (a) starts with `/` (multiaddr shape) and (b)
 /// pins a `/p2p/<peer-id>` component. The PeerID pin is what makes a
@@ -913,6 +925,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Tier-1 RPC offload flags fail fast, before any identity, DNS, libp2p,
+    // or HTTP listener is opened.
+    validate_llama_rpc_cli(&cli)?;
 
     // Persistent identity: libp2p peer-id + receipt signing key derive
     // from this. Default location: ~/.config/phase/identity.key (or the
@@ -1402,17 +1417,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 #[cfg(not(target_os = "linux"))]
                 let extra_env = Vec::new();
-                if !cli.llama_rpc_servers.is_empty() {
-                    lucidd::worker_llama::validate_loopback_rpc_servers(&cli.llama_rpc_servers)?;
-                }
-                if let Some(split) = cli.llama_tensor_split.as_deref() {
-                    lucidd::worker_llama::validate_tensor_split(split)?;
-                }
+                // Flags were validated by `validate_llama_rpc_cli` at startup;
+                // the worker re-validates them before every spawn.
                 let model_load_timeout = if cli.llama_rpc_servers.is_empty() {
                     LlamaCppConfig::default().model_load_timeout
                 } else {
                     std::time::Duration::from_secs(300)
                 };
+                if !cli.llama_rpc_servers.is_empty()
+                    && !node_config_store.snapshot().cluster_enabled
+                {
+                    tracing::warn!(
+                        rpc_servers = cli.llama_rpc_servers.len(),
+                        "--llama-rpc-servers is set but cluster_enabled = false: every llama-cpp job is refused until the trusted-circle opt-in is enabled in node.toml / settings"
+                    );
+                }
                 let config = LlamaCppConfig {
                     server_binary_path,
                     model_dir: verified_model_dir,
@@ -1422,6 +1441,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     extra_env,
                     rpc_servers: cli.llama_rpc_servers.clone(),
                     tensor_split: cli.llama_tensor_split.clone(),
+                    // Layer offload ships prompt-derived activations to RPC
+                    // peers, so it follows the live `cluster_enabled` opt-in.
+                    rpc_cluster_gate: Some(lucidd::worker_llama::RpcClusterGate::from_node_config(
+                        node_config_store.clone(),
+                    )),
                     ..Default::default()
                 };
                 tracing::info!(?config, "worker: llama-cpp");
@@ -2145,6 +2169,57 @@ mod tests {
         assert!(validate_http_bind_addr("[::1]:11434".parse().unwrap()).is_ok());
         assert!(validate_http_bind_addr("0.0.0.0:11434".parse().unwrap()).is_err());
         assert!(validate_http_bind_addr("192.0.2.10:11434".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn llama_tensor_split_without_rpc_servers_fails_fast() {
+        let cli = Cli::try_parse_from(["lucidd", "--llama-tensor-split", "30,70"])
+            .expect("flag parses before semantic validation");
+        let error = validate_llama_rpc_cli(&cli).unwrap_err();
+        assert!(
+            error.contains("--llama-tensor-split requires --llama-rpc-servers"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn llama_rpc_cli_rejects_non_loopback_and_malformed_offload_flags() {
+        for args in [
+            vec!["lucidd", "--llama-rpc-servers", "192.0.2.10:50052"],
+            vec!["lucidd", "--llama-rpc-servers", "127.0.0.1:0"],
+            vec![
+                "lucidd",
+                "--llama-rpc-servers",
+                "127.0.0.1:50052",
+                "--llama-tensor-split",
+                "0,0",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("flags parse");
+            assert!(validate_llama_rpc_cli(&cli).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn llama_rpc_cli_accepts_loopback_rpc_with_or_without_split_and_no_offload() {
+        for args in [
+            vec!["lucidd"],
+            vec![
+                "lucidd",
+                "--llama-rpc-servers",
+                "127.0.0.1:50052,[::1]:50053",
+            ],
+            vec![
+                "lucidd",
+                "--llama-rpc-servers",
+                "127.0.0.1:50052",
+                "--llama-tensor-split",
+                "30,70",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("flags parse");
+            assert!(validate_llama_rpc_cli(&cli).is_ok(), "{args:?}");
+        }
     }
 
     #[test]

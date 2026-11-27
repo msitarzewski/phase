@@ -102,10 +102,17 @@ fn fixture_launcher(dir: &Path) -> PathBuf {
         .unwrap_or_else(|| dir.to_path_buf());
     std::fs::create_dir_all(&diagnostics_dir).expect("create fixture diagnostics directory");
     let diagnostics_prefix = diagnostics_dir.join("fixture");
+    let records_prefix = dir.join("fixture");
     let script = format!(
         r#"#!/bin/sh
+records={records}
+argv_tmp="$records.argv.$$"
+for arg in "$@"; do
+    printf '%s\n' "$arg"
+done > "$argv_tmp"
 port=""
 host="127.0.0.1"
+model=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --port)
@@ -118,19 +125,28 @@ while [ "$#" -gt 0 ]; do
             host="$2"
             shift 2
             ;;
+        --model)
+            [ "$#" -ge 2 ] || exit 64
+            model="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
     esac
 done
 [ -n "$port" ] || exit 64
+mv "$argv_tmp" "$records.$port.argv"
+printf '%s\n' "$model" >> "$records.spawns"
 export PHASE_FAKE_LLAMA_SERVER_PROCESS=1
 export PHASE_FAKE_LLAMA_PORT="$port"
 export PHASE_FAKE_LLAMA_HOST="$host"
-exec {} --exact fixture_server_process_entrypoint --ignored --nocapture 2>> {}."$port".log
+export PHASE_FAKE_LLAMA_MODEL="$model"
+exec {exe} --exact fixture_server_process_entrypoint --ignored --nocapture 2>> {diag}."$port".log
 "#,
-        shell_quote(test_exe),
-        shell_quote(diagnostics_prefix.to_str().expect("UTF-8 fixture path"))
+        records = shell_quote(records_prefix.to_str().expect("UTF-8 fixture path")),
+        exe = shell_quote(test_exe),
+        diag = shell_quote(diagnostics_prefix.to_str().expect("UTF-8 fixture path"))
     );
     std::fs::write(&launcher, script).expect("write fixture subprocess launcher");
     #[cfg(unix)]
@@ -596,6 +612,376 @@ async fn embedding_streams_vectors_and_signs_receipt() {
 }
 
 // -----------------------------------------------------------------------
+// Wave 1 Track A: loopback lockdown, lifecycle, and RPC guardrails
+// -----------------------------------------------------------------------
+
+/// Direct loopback client standing in for a browser page or any other local
+/// process that did not spawn the child (no proxy, no redirects).
+fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("loopback client")
+}
+
+/// Every `--model` the fixture launcher has been asked to spawn, as file
+/// stems, in spawn order.
+fn spawned_models(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("fixture.spawns"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            Path::new(line)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The argv of the most recent fixture spawn on `port`.
+fn spawn_argv(dir: &Path, port: u16) -> Vec<String> {
+    std::fs::read_to_string(dir.join(format!("fixture.{port}.argv")))
+        .expect("fixture recorded argv")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Wait until nothing listens on `port` any more (the child was killed and
+/// the kernel closed its listener).
+async fn wait_port_bindable(port: u16, within: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < within {
+        if TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+struct FlexibleWorker {
+    dir: tempfile::TempDir,
+    worker: LlamaCppWorker,
+    ports: std::ops::Range<u16>,
+}
+
+fn flexible_worker(
+    model_ids: &[&str],
+    max_loaded_models: usize,
+    port_range_span: u16,
+    extra_env: &[(&str, &str)],
+    model_load_timeout: Duration,
+    customize: impl FnOnce(&mut LlamaCppConfig),
+) -> FlexibleWorker {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for id in model_ids {
+        std::fs::write(dir.path().join(format!("{id}.gguf")), b"fake").expect("touch model");
+    }
+    let ports = free_port_range(port_range_span);
+    let mut config = LlamaCppConfig {
+        server_binary_path: fixture_launcher(dir.path()),
+        model_dir: dir.path().to_path_buf(),
+        default_n_gpu_layers: 0,
+        default_context_size: 2048,
+        server_port_range: ports.clone(),
+        max_loaded_models,
+        model_load_timeout,
+        per_request_idle_timeout: Duration::from_secs(5),
+        extra_env: [("FAKE_LLAMA_TOKENS", "a,b"), ("FAKE_LLAMA_DELAY_MS", "1")]
+            .iter()
+            .chain(extra_env)
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    customize(&mut config);
+    FlexibleWorker {
+        dir,
+        worker: LlamaCppWorker::new(NodeIdentity::generate(), config),
+        ports,
+    }
+}
+
+#[tokio::test]
+async fn llama_server_rejects_unauthenticated_loopback_requests() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A1: the worker's own requests carry the per-spawn bearer key, while any
+    // other loopback caller (a DNS-rebound page, a local process) is refused.
+    let fx = flexible_worker(&["locked"], 1, 1, &[], Duration::from_secs(10), |_| {});
+    let (completion, error) = run_to_final(&fx.worker, "locked").await.expect("dispatch");
+    assert_eq!(
+        completion,
+        Completion::Stop,
+        "authenticated worker path: {error:?}"
+    );
+
+    let port = fx.ports.start;
+    let client = loopback_client();
+    let base = format!("http://127.0.0.1:{port}");
+    let unauthenticated = client
+        .post(format!("{base}/completion"))
+        .json(&serde_json::json!({"prompt": "exfiltrate", "n_predict": 8, "stream": false}))
+        .send()
+        .await
+        .expect("loopback request");
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong_key = client
+        .post(format!("{base}/completion"))
+        .bearer_auth("0".repeat(64))
+        .json(&serde_json::json!({"prompt": "exfiltrate"}))
+        .send()
+        .await
+        .expect("loopback request");
+    assert_eq!(wrong_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+    for path in ["/embedding", "/apply-template"] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("loopback request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+    let slots = client.get(format!("{base}/slots")).send().await.unwrap();
+    assert_eq!(slots.status(), reqwest::StatusCode::UNAUTHORIZED);
+    // Liveness stays public, exactly as in llama-server.
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert!(health.status().is_success());
+
+    // The key travelled through the environment: argv carries the hardening
+    // flags but no key material.
+    let argv = spawn_argv(fx.dir.path(), port);
+    let joined = argv.join(" ");
+    assert!(
+        joined.contains("--cors-origins localhost --no-cors-credentials --no-webui --no-slots"),
+        "{joined}"
+    );
+    assert!(!argv.iter().any(|arg| arg == "--api-key"), "{joined}");
+    assert!(
+        !argv
+            .iter()
+            .any(|arg| arg.len() == 64 && arg.bytes().all(|b| b.is_ascii_hexdigit())),
+        "key-shaped argument leaked into argv: {joined}"
+    );
+}
+
+#[tokio::test]
+async fn hang_detection_kills_child_and_releases_its_port() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A2: a single-port pool. If a hung child were merely flagged, its port
+    // would stay reserved and the reload below would fail with Capacity.
+    let fx = flexible_worker(
+        &["wedge"],
+        1,
+        1,
+        &[("FAKE_LLAMA_HANG_AFTER", "1")],
+        Duration::from_secs(10),
+        |config| config.per_request_idle_timeout = Duration::from_millis(800),
+    );
+    let port = fx.ports.start;
+    let (completion, error) = run_to_final(&fx.worker, "wedge").await.expect("dispatch");
+    assert_eq!(completion, Completion::Error);
+    assert!(error.unwrap_or_default().contains("hang"));
+
+    assert!(
+        wait_port_bindable(port, Duration::from_secs(5)).await,
+        "hung llama-server must be killed, not left holding port {port}"
+    );
+
+    // The port is back in the pool: the replacement cold-loads on it.
+    let (completion, _) = run_to_final(&fx.worker, "wedge")
+        .await
+        .expect("reload after hang must not hit Capacity");
+    assert_eq!(
+        completion,
+        Completion::Error,
+        "fixture still hangs by design"
+    );
+    assert_eq!(spawned_models(fx.dir.path()), ["wedge", "wedge"]);
+}
+
+#[tokio::test]
+async fn failed_cold_load_never_evicts_a_warm_model() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A2: cap = 1. Before the fix the broken load evicted `warm` first.
+    let fx = flexible_worker(
+        &["warm", "broken"],
+        1,
+        2,
+        &[("FAKE_LLAMA_FAIL_HEALTH_FOR_MODEL", "broken")],
+        Duration::from_millis(800),
+        |_| {},
+    );
+    let (completion, error) = run_to_final(&fx.worker, "warm").await.expect("load warm");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+
+    let failure = match fx.worker.execute(make_manifest("broken", "Hello.")).await {
+        Ok(_) => panic!("broken model must fail its health gate"),
+        Err(error) => error.to_string(),
+    };
+    assert!(failure.contains("health"), "{failure}");
+
+    let (completion, error) = run_to_final(&fx.worker, "warm").await.expect("warm hit");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    assert_eq!(
+        spawned_models(fx.dir.path()),
+        ["warm", "broken"],
+        "warm model must still be the original resident process"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_cold_load_never_evicts_warm_model_or_leaks_its_port() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A2: cap = 1 with exactly cap + 1 ports. A leaked port from the
+    // cancelled load would make the final load fail with Capacity.
+    let fx = flexible_worker(
+        &["warm", "cold", "third"],
+        1,
+        2,
+        &[("FAKE_LLAMA_WARMUP_MS", "1200")],
+        Duration::from_secs(10),
+        |_| {},
+    );
+    let (completion, error) = run_to_final(&fx.worker, "warm").await.expect("load warm");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+
+    // Drop the cold load mid-warmup, as a disconnecting client would.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        fx.worker.execute(make_manifest("cold", "Hello.")),
+    )
+    .await;
+    assert!(cancelled.is_err(), "cold load should still be warming up");
+
+    let started = std::time::Instant::now();
+    let (completion, error) = run_to_final(&fx.worker, "warm").await.expect("warm hit");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "warm model was reloaded instead of served warm"
+    );
+
+    // The cancelled child was killed with its future; once the kernel has
+    // closed its listener the port must be allocatable again.
+    for port in fx.ports.clone() {
+        if spawn_argv(fx.dir.path(), port)
+            .iter()
+            .any(|a| a.ends_with("cold.gguf"))
+        {
+            assert!(wait_port_bindable(port, Duration::from_secs(5)).await);
+        }
+    }
+    let (completion, error) = run_to_final(&fx.worker, "third")
+        .await
+        .expect("cancelled load must not leak its port reservation");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    assert_eq!(spawned_models(fx.dir.path()), ["warm", "cold", "third"]);
+}
+
+#[tokio::test]
+async fn rpc_offload_follows_live_cluster_gate() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A3: RPC layer offload runs only while cluster_enabled is on; turning it
+    // off refuses jobs and tears down the RPC-backed child.
+    let enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate_state = enabled.clone();
+    let fx = flexible_worker(&["sliced"], 1, 1, &[], Duration::from_secs(10), |config| {
+        config.rpc_servers = vec!["127.0.0.1:50052".to_string()];
+        config.tensor_split = Some("30,70".to_string());
+        config.rpc_cluster_gate = Some(lucidd::worker_llama::RpcClusterGate::new(move || {
+            gate_state.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+    });
+    assert_eq!(fx.worker.execution_trust_label(), "trusted-circle-sharded");
+
+    let refused = match fx.worker.execute(make_manifest("sliced", "Hello.")).await {
+        Ok(_) => panic!("RPC offload must be refused before opt-in"),
+        Err(error) => error.to_string(),
+    };
+    assert!(refused.contains("cluster_enabled"), "{refused}");
+    assert!(
+        spawned_models(fx.dir.path()).is_empty(),
+        "no child before opt-in"
+    );
+
+    enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (completion, error) = run_to_final(&fx.worker, "sliced").await.expect("dispatch");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    let port = fx.ports.start;
+    let joined = spawn_argv(fx.dir.path(), port).join(" ");
+    assert!(
+        joined.contains("--rpc 127.0.0.1:50052 --split-mode layer --tensor-split 30,70"),
+        "{joined}"
+    );
+
+    enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(fx
+        .worker
+        .execute(make_manifest("sliced", "Hello."))
+        .await
+        .is_err());
+    assert!(
+        wait_port_bindable(port, Duration::from_secs(5)).await,
+        "RPC-backed child must be torn down when cluster_enabled turns off"
+    );
+}
+
+#[tokio::test]
+async fn rpc_cold_load_is_refused_if_cluster_gate_closes_mid_load() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // A3: RPC cold loads can take minutes; withdrawing the opt-in while one is
+    // in flight must stop it from being admitted.
+    let enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gate_state = enabled.clone();
+    let fx = flexible_worker(
+        &["sliced"],
+        1,
+        1,
+        &[("FAKE_LLAMA_WARMUP_MS", "1000")],
+        Duration::from_secs(10),
+        |config| {
+            config.rpc_servers = vec!["127.0.0.1:50052".to_string()];
+            config.rpc_cluster_gate = Some(lucidd::worker_llama::RpcClusterGate::new(move || {
+                gate_state.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+        },
+    );
+    let worker = fx.worker.clone();
+    let load = tokio::spawn(async move {
+        worker
+            .execute(make_manifest("sliced", "Hello."))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+    let error = load
+        .await
+        .expect("load task")
+        .expect_err("admission must be refused once cluster_enabled turns off");
+    assert!(error.contains("cluster_enabled"), "{error}");
+    assert!(
+        wait_port_bindable(fx.ports.start, Duration::from_secs(5)).await,
+        "refused RPC child must be killed and its port released"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Optional: real llama-server integration test. Marked `#[ignore]` so
 // ordinary `cargo test` reports the external hardware gate without trying
 // it. An explicit run fails (rather than silently passing) unless both
@@ -655,4 +1041,111 @@ async fn real_llama_server_smoke_test_requires_explicit_hardware_env() {
     }
     assert!(got_token, "expected at least one token from real server");
     assert!(got_final, "expected Final from real server");
+}
+
+/// A1 against the real binary: with only `LLAMA_SERVER_PATH` and a small
+/// embedding GGUF in `LLAMA_TEST_EMBED_MODEL_PATH`, prove the pinned
+/// llama-server refuses unauthenticated loopback callers, keeps the web UI
+/// and `/slots` off, and rejects browser origins — while the worker's own
+/// authenticated job succeeds.
+#[tokio::test]
+#[ignore]
+async fn real_llama_server_rejects_unauthenticated_loopback_requests() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    let bin = std::env::var("LLAMA_SERVER_PATH").expect(
+        "real llama auth gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_EMBED_MODEL_PATH",
+    );
+    let model = std::env::var("LLAMA_TEST_EMBED_MODEL_PATH").expect(
+        "real llama auth gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_EMBED_MODEL_PATH",
+    );
+    let model_path = PathBuf::from(&model);
+    let model_dir = model_path.parent().expect("model dir").to_path_buf();
+    let model_id = model_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("model stem")
+        .to_string();
+    let port = free_port();
+    let worker = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_binary_path: PathBuf::from(bin),
+            model_dir,
+            default_n_gpu_layers: 0,
+            default_context_size: 512,
+            server_port_range: port..(port + 1),
+            max_loaded_models: 1,
+            model_load_timeout: Duration::from_secs(120),
+            per_request_idle_timeout: Duration::from_secs(60),
+            ..Default::default()
+        },
+    );
+    let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+        model_cid: model_id,
+        input: vec!["authenticated".to_string()],
+    }))
+    .sign_with(&NodeIdentity::generate())
+    .expect("sign");
+    let (_handle, mut stream) = worker.execute(manifest).await.expect("dispatch real");
+    let mut vectors = 0;
+    while let Some(event) = stream.next().await {
+        match event {
+            JobEvent::Output(_) => vectors += 1,
+            JobEvent::Final { result, error } => {
+                assert_eq!(result.completion, Completion::Stop, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(vectors, 1, "worker's authenticated embedding must succeed");
+
+    let client = loopback_client();
+    let base = format!("http://127.0.0.1:{port}");
+    for (path, body) in [
+        ("/embedding", serde_json::json!({"content": "exfiltrate"})),
+        ("/completion", serde_json::json!({"prompt": "exfiltrate"})),
+    ] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+        let wrong = client
+            .post(format!("{base}{path}"))
+            .bearer_auth("0".repeat(64))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let web_ui = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(
+        web_ui.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "--no-webui"
+    );
+    let slots = client.get(format!("{base}/slots")).send().await.unwrap();
+    assert_eq!(slots.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let browser = client
+        .get(format!("{base}/health"))
+        .header("Origin", "http://localhost:3000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        browser.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "browser origins must be refused even for public endpoints"
+    );
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert!(health.status().is_success());
 }
