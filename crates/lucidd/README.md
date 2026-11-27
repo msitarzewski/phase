@@ -151,3 +151,25 @@ Env: `LUCIDD_PORT` (default 11434), `LUCIDD_HOST` (default 127.0.0.1).
 - The experimental MLX adapter has not passed real-device acceptance; ShardWorker is research-blocked.
 
 See the [v0.2 release tracker](../../memory-bank/releases/lucid-v0.2/README.md), [physical test runbook](../../memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md), and [architectural record](../../memory-bank/decisions.md).
+
+---
+
+## Release Signing (Maintainers)
+
+No signing credentials, Apple IDs, Team IDs, or Azure identifiers live in this repository.
+
+- **Windows (`lucidd.exe`, Azure Artifact Signing — CI & local)**:
+  Configure secrets in the GitHub **`release`** environment (restricted to release tags / maintainer approval):
+  - `LUCID_AZURE_SIGN_ENDPOINT`, `LUCID_AZURE_SIGN_ACCOUNT`, `LUCID_AZURE_SIGN_PROFILE`
+  - Auth via GitHub OIDC (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` — no client secret) **or** Service Principal (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`).
+  - The same script runs locally in Windows with `az login`:
+    `pwsh -NoProfile -File scripts/sign-windows-binary.ps1 -Path target\x86_64-pc-windows-msvc\release\lucidd.exe`
+- **macOS (`lucidd` CLI, `LUCID.app`, `.dmg`, Apple Developer ID + notarization — local Keychain only)**:
+  CI intentionally holds zero Apple credentials. After a tagged release builds, sign, notarize, staple, verify, and republish from a Mac holding the Developer ID certificate and a `notarytool` Keychain profile:
+  ```bash
+  # Keep personal IDs outside the repo, e.g. in ~/.config/lucid/signing.env:
+  #   export LUCID_APPLE_TEAM_ID="<10-char-team-id>"
+  #   export LUCID_APPLE_NOTARY_PROFILE="<keychain-profile>"
+  scripts/sign-macos-release.sh --from-release vX.Y.Z --dry-run
+  scripts/sign-macos-release.sh --from-release vX.Y.Z --publish vX.Y.Z
+  ```

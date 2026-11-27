@@ -23,6 +23,11 @@ on:
         required: false
         default: true
         type: boolean
+      require_windows_signing:
+        description: "Fail Windows build if Azure Artifact Signing secrets are not configured"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -135,6 +140,10 @@ jobs:
             npm ci
             npm run check
             npx tauri build --bundles app,dmg
+            # CI intentionally holds zero Apple signing credentials. Ad-hoc sign
+            # here for unsigned CI artifacts; maintainers sign, notarize, and
+            # staple release builds locally with macOS Keychain via:
+            #   scripts/sign-macos-release.sh --from-release <tag> --publish <tag>
             codesign --force --deep --sign - --timestamp=none src-tauri/target/release/bundle/macos/LUCID.app
             codesign --verify --deep --strict src-tauri/target/release/bundle/macos/LUCID.app
             ditto -c -k --sequesterRsrc --keepParent \
@@ -155,6 +164,10 @@ jobs:
   build-windows-x86_64:
     name: Build Windows x86_64 (CLI)
     runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -170,12 +183,82 @@ jobs:
         with:
           workspaces: . -> target
 
-      - name: Build and package Windows CLI
+      - name: Build Windows CLI
         shell: pwsh
         run: |
           cargo fetch --locked
           cargo build --release --locked --bin lucidd --target x86_64-pc-windows-msvc
 
+      - name: Check Windows signing configuration
+        id: sign_cfg
+        shell: pwsh
+        env:
+          SIGN_ENDPOINT: ${{ secrets.LUCID_AZURE_SIGN_ENDPOINT }}
+          SIGN_ACCOUNT: ${{ secrets.LUCID_AZURE_SIGN_ACCOUNT }}
+          SIGN_PROFILE: ${{ secrets.LUCID_AZURE_SIGN_PROFILE }}
+          AZ_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZ_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZ_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZ_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          REQUIRE_SIGNING: ${{ inputs.require_windows_signing }}
+        run: |
+          $signVars = @($env:SIGN_ENDPOINT, $env:SIGN_ACCOUNT, $env:SIGN_PROFILE) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          if ($signVars.Count -eq 0) {
+            if ($env:REQUIRE_SIGNING -eq 'true') {
+              throw "require_windows_signing=true, but LUCID_AZURE_SIGN_* secrets are not configured in the 'release' environment."
+            }
+            Write-Host "Windows signing skipped: LUCID_AZURE_SIGN_* secrets not configured."
+            "mode=skip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          if ($signVars.Count -ne 3) {
+            throw "Partial Azure Artifact Signing configuration detected ($($signVars.Count)/3 LUCID_AZURE_SIGN_* secrets set). Configure all three or none."
+          }
+          $hasClient = -not [string]::IsNullOrWhiteSpace($env:AZ_CLIENT_ID)
+          $hasTenant = -not [string]::IsNullOrWhiteSpace($env:AZ_TENANT_ID)
+          $hasSecret = -not [string]::IsNullOrWhiteSpace($env:AZ_CLIENT_SECRET)
+          $hasSub    = -not [string]::IsNullOrWhiteSpace($env:AZ_SUBSCRIPTION_ID)
+          if ($hasClient -and $hasTenant -and $hasSecret) {
+            Write-Host "Windows signing enabled (Azure Artifact Signing via Service Principal)."
+            "mode=sp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } elseif ($hasClient -and $hasTenant -and $hasSub) {
+            Write-Host "Windows signing enabled (Azure Artifact Signing via GitHub OIDC)."
+            "mode=oidc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            throw "LUCID_AZURE_SIGN_* secrets are set, but Azure auth is incomplete. Provide AZURE_CLIENT_ID + AZURE_TENANT_ID + (AZURE_SUBSCRIPTION_ID for OIDC or AZURE_CLIENT_SECRET for Service Principal)."
+          }
+
+      - name: Azure Login (OIDC)
+        if: steps.sign_cfg.outputs.mode == 'oidc'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Sign and verify lucidd.exe (Azure Artifact Signing)
+        if: steps.sign_cfg.outputs.mode != 'skip'
+        shell: pwsh
+        env:
+          LUCID_AZURE_SIGN_ENDPOINT: ${{ secrets.LUCID_AZURE_SIGN_ENDPOINT }}
+          LUCID_AZURE_SIGN_ACCOUNT: ${{ secrets.LUCID_AZURE_SIGN_ACCOUNT }}
+          LUCID_AZURE_SIGN_PROFILE: ${{ secrets.LUCID_AZURE_SIGN_PROFILE }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          pwsh -NoProfile -File scripts/sign-windows-binary.ps1 `
+            -Path "target\x86_64-pc-windows-msvc\release\lucidd.exe"
+
+      - name: Azure Logout (OIDC)
+        if: always() && steps.sign_cfg.outputs.mode == 'oidc'
+        shell: pwsh
+        run: az logout 2>$null; exit 0
+
+      - name: Package Windows CLI
+        shell: pwsh
+        run: |
           $versionMatch = Select-String `
             -Path crates/lucidd/Cargo.toml `
             -Pattern '^version = "([^"]+)"' `

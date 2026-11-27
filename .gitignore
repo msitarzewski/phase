@@ -46,6 +46,15 @@ identity.key
 *.key
 !keys/*.pub.placeholder
 
+# Code signing certificates, Apple API keys, provisioning profiles, and temp signing metadata.
+*.p12
+*.pfx
+*.p8
+*.cer
+*.mobileprovision
+*.provisionprofile
+artifact-signing.json
+
 # Local daemon control credentials and one-use enrollment invitations.
 *.control-token
 control-*.token
