@@ -106,7 +106,7 @@ async fn send_chat_message_inner(
             "messages": messages,
             "stream": false,
         }))
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(300));
     if local_only {
         request = request.header("X-Lucid-Local-Only", "true");
     }

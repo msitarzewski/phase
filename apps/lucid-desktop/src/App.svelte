@@ -18,6 +18,7 @@
     sourceLabel,
     statusPillText,
   } from "./lib/format";
+  import ChatPanel from "./lib/ChatPanel.svelte";
 
   let overview = $state<OverviewPayload | null>(null);
   let loading = $state(true);
@@ -46,6 +47,13 @@
   let clusterMemory = $derived(formatBytes(clusterStatus?.local_node?.available_memory_bytes ?? 0, true));
   let deviceEnrollment = $derived(enrollmentLabel(overview?.status.enrollment?.state));
   let showSettingsModal = $state(false);
+  let showChatModal = $state(false);
+  let chatInitialModel = $state<string | null>(null);
+  let chatModels = $derived(
+    (overview?.models ?? [])
+      .filter((m) => m.can_request || m.providing || m.on_device)
+      .map((m) => m.name),
+  );
 
   // Permission-first modal before enabling providing or installing runtime
   let pendingProvideModel = $state<ModelEntry | null>(null);
@@ -544,8 +552,17 @@
 
           <div class="cta-row">
             {#if selectedModel.can_request || selectedModel.providing}
-              <button class="primary" onclick={() => selectedModel && handleOpenChat(selectedModel)}>
-                Chat in Open WebUI ↗
+              <button
+                class="primary"
+                onclick={() => {
+                  chatInitialModel = selectedModel?.name ?? null;
+                  showChatModal = true;
+                }}
+              >
+                Chat
+              </button>
+              <button onclick={() => selectedModel && handleOpenChat(selectedModel)}>
+                Open WebUI ↗
               </button>
             {:else if !selectedModel.on_device}
               <button class="primary" onclick={() => (showJoinModal = true)}>
@@ -910,6 +927,18 @@
           <button onclick={loadClusterStatus}>Retry</button>
         {/if}
         <button class="primary" onclick={handleCloseCluster}>Done</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Built-in Local Chat Modal -->
+{#if showChatModal}
+  <div class="backdrop">
+    <div class="modal wide">
+      <ChatPanel models={chatModels} initialModel={chatInitialModel} />
+      <div class="modal-actions">
+        <button onclick={() => (showChatModal = false)}>Close</button>
       </div>
     </div>
   </div>
