@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 use lucidd::content::{ContentPlane, ContentPlaneConfig, LocalGgufActivation};
 use lucidd::echo::EchoWorker;
-use lucidd::ollama::{router as ollama_router, AppState};
+use lucidd::ollama::{AppState, ResidentModel, ResidentModelsProvider};
 use lucidd::registry::DhtTransport;
 use lucidd::reputation::{
     EvidenceRuntime, OperatorOverride, DEFAULT_EVIDENCE_RETENTION, MAX_OPERATOR_OVERRIDES,
@@ -1869,7 +1869,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: tokio::time::Instant::now(),
         shard_stage_bridge_port: cli.shard_stage_bridge_port,
     };
-    let app = ollama_router(state, addr.ip().to_canonical().is_loopback());
+    let resident_models_for_ps = resident_models.clone();
+    let registry_for_ps = registry.clone();
+    let resident_models_provider: ResidentModelsProvider = Arc::new(move || {
+        let resident_models = resident_models_for_ps.clone();
+        let registry = registry_for_ps.clone();
+        Box::pin(async move {
+            let local_caps = registry.local_models_async().await;
+            resident_models
+                .snapshot()
+                .into_iter()
+                .map(|info| {
+                    let matched = local_caps.iter().find(|caps| {
+                        caps.model_cid.to_hex() == info.model_id || caps.model_id == info.model_id
+                    });
+                    let name = matched
+                        .map(|caps| caps.model_id.clone())
+                        .unwrap_or_else(|| info.model_id.clone());
+                    let digest = matched.map(|caps| caps.model_cid.to_hex()).or_else(|| {
+                        lucidd::ModelCid::from_hex(&info.model_id)
+                            .ok()
+                            .map(|cid| cid.to_hex())
+                    });
+                    ResidentModel {
+                        name: name.clone(),
+                        model: name,
+                        digest,
+                        size: None,
+                        size_vram: None,
+                        expires_at: None,
+                    }
+                })
+                .collect()
+        })
+    });
+    let app = state.router_with_resident_models_provider(
+        addr.ip().to_canonical().is_loopback(),
+        resident_models_provider,
+    );
 
     tracing::info!(
         %addr,

@@ -211,8 +211,32 @@ impl AppController {
     async fn stop_daemon(&self) {
         let mut guard = self.daemon.lock().await;
         if let Some(mut d) = guard.take() {
-            let _ = d.child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(3), d.child.wait()).await;
+            // Try graceful SIGTERM first on Unix so lucidd's shutdown handler
+            // reaps child llama-server / mlx_lm.server / ggml-rpc-server
+            // processes cleanly and frees GPU VRAM before falling back to SIGKILL.
+            #[cfg(unix)]
+            let exited_gracefully = if let Some(pid) = d.child.id() {
+                let _ = tokio::process::Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(3), d.child.wait()).await,
+                    Ok(Ok(_))
+                )
+            } else {
+                false
+            };
+            #[cfg(not(unix))]
+            let exited_gracefully = false;
+
+            if !exited_gracefully {
+                let _ = d.child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), d.child.wait()).await;
+            }
             let _ = fs::remove_file(&d.token_path);
             let _ = d.daemon_sha256; // retained for diagnostics
         }

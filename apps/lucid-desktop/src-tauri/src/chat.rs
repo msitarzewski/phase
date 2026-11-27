@@ -428,7 +428,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-lucid-routed-via", HeaderValue::from_static("peer"));
         headers.insert("x-lucid-trust-label", HeaderValue::from_static("local"));
-        assert_eq!(response_routed_via(&headers).as_deref(), Some("peer"));
+        assert_eq!(response_routed_via(&headers), Some("peer"));
         assert_eq!(response_trust_label(&headers), Some("local"));
 
         headers.append("x-lucid-routed-via", HeaderValue::from_static("local"));
