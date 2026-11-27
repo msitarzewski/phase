@@ -14,6 +14,8 @@
 
 #![deny(unsafe_code)]
 
+mod chat;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -837,6 +839,7 @@ pub fn run() {
             create_invite,
             join_invite,
             open_chat,
+            chat::send_chat_message,
             restart_daemon,
             get_cluster_status,
             preview_cluster_plan,
