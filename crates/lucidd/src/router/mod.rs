@@ -54,6 +54,7 @@ use phase_protocol::{
     CommitmentAccumulator, Completion, DynWorker, JobEvent, JobHandle, JobId, JobMetrics,
     JobResult, JobSpec, JobStream, ProgressUpdate, SignedManifest, SignedReceipt, WorkerError,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
@@ -76,6 +77,7 @@ use crate::policy::{PauseReason, PolicyDecision, PolicyEngine};
 use crate::registry::{normalize_model_alias, ModelCapabilities, ModelCid, ModelRegistry};
 use crate::reputation::{
     compare_assessments, AssessmentClass, EvidenceContext, EvidenceOutcome, EvidenceRuntime,
+    SpotCheckEvidence, SPOT_CHECK_METHOD,
 };
 
 /// How long the requesting side will wait for a relay response. CBOR is
@@ -87,6 +89,11 @@ const EVIDENCE_PROTOCOL_BATCH: &str = "/phase/job-relay/1.0.0";
 const EVIDENCE_PROTOCOL_REDUNDANT: &str = "/phase/redundant-check/1.0.0";
 const EVIDENCE_SOFTWARE_VERSION: &str = concat!("lucidd/", env!("CARGO_PKG_VERSION"));
 const REDUNDANT_SAMPLE_DOMAIN: &[u8] = b"lucid-redundant-sample:v1\0";
+const SPOT_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_SPOT_CHECK_TOKENS: u32 = 1_024;
+const MAX_SPOT_CHECK_INPUT_BYTES: usize = 16 * 1_024;
+const MAX_SPOT_CHECK_OUTPUT_BYTES: usize = 64 * 1_024;
+const MAX_SPOT_CHECK_OUTPUT_CHUNKS: u64 = 4_096;
 
 // ---------------------------------------------------------------------------
 // Public API types
@@ -156,6 +163,27 @@ pub enum RedundantCheckResult {
         duplicate_commitment: [u8; 32],
     },
     Incomparable,
+}
+
+type RoutedExecution = (JobHandle, JobStream, ReceiptVerification);
+pub(crate) type SpotCheckResult = oneshot::Receiver<RedundantCheckResult>;
+
+#[derive(Clone, Copy)]
+struct SpotCheckPair {
+    primary: PeerId,
+    validator: PeerId,
+}
+
+#[derive(Clone, Copy)]
+struct SpotCheckOutput {
+    commitment: [u8; 32],
+    text_digest: [u8; 32],
+}
+
+struct SpotCheckComparison {
+    primary: SpotCheckOutput,
+    validator: SpotCheckOutput,
+    capability_digest: [u8; 32],
 }
 
 /// SEC-05: receipt verification status for a dispatched job, surfaced to the
@@ -498,7 +526,9 @@ impl Router {
         let advertised = peers.len();
         let peers: Vec<_> = peers
             .into_iter()
-            .filter(|(peer, _)| self.remote_peer_allowed(peer, &authorized_issuers))
+            .filter(|(peer, _)| {
+                self.remote_peer_allowed(peer, &authorized_issuers, self.allow_open_peers)
+            })
             .collect();
         let filtered = advertised > peers.len();
         let (peers, ranking_explanation) = self.rank_remote_candidates(peers).await;
@@ -550,7 +580,12 @@ impl Router {
             .collect()
     }
 
-    fn remote_peer_allowed(&self, peer: &PeerId, authorized_issuers: &HashSet<PeerId>) -> bool {
+    fn remote_peer_allowed(
+        &self,
+        peer: &PeerId,
+        authorized_issuers: &HashSet<PeerId>,
+        allow_open_peers: bool,
+    ) -> bool {
         let operator = match &self.evidence {
             Some(runtime) => match runtime.operator_override(peer) {
                 Ok(operator) => operator,
@@ -562,7 +597,7 @@ impl Router {
             None => Default::default(),
         };
         !operator.blocked
-            && (operator.pinned || self.allow_open_peers || authorized_issuers.contains(peer))
+            && (operator.pinned || allow_open_peers || authorized_issuers.contains(peer))
     }
 
     async fn rank_remote_candidates(
@@ -654,7 +689,16 @@ impl Router {
         &self,
         decision: &RouteDecision,
         job: SignedManifest<JobSpec>,
-    ) -> Result<(JobHandle, JobStream, ReceiptVerification), RouterError> {
+    ) -> Result<RoutedExecution, RouterError> {
+        let (execution, _) = self.execute_with_spot_check(decision, job).await?;
+        Ok(execution)
+    }
+
+    pub(crate) async fn execute_with_spot_check(
+        &self,
+        decision: &RouteDecision,
+        job: SignedManifest<JobSpec>,
+    ) -> Result<(RoutedExecution, Option<SpotCheckResult>), RouterError> {
         match &decision.via {
             RouteVia::Refused { reason } => Err(RouterError::Refused {
                 reason: reason.clone(),
@@ -666,7 +710,7 @@ impl Router {
                     .ok_or(RouterError::NoLocalWorker)?
                     .clone();
                 let (handle, stream) = worker.execute_boxed(job).await?;
-                Ok((handle, stream, ReceiptVerification::Local))
+                Ok(((handle, stream, ReceiptVerification::Local), None))
             }
             // Multi-peer failover: try the primary peer first; if its relay
             // fails, walk `decision.fallback_peers` in ranking order. The
@@ -734,76 +778,69 @@ impl Router {
         primary_peer: PeerId,
         duplicate_peer: Option<PeerId>,
         job: SignedManifest<JobSpec>,
-        execution: (JobHandle, JobStream, ReceiptVerification),
-    ) -> (JobHandle, JobStream, ReceiptVerification) {
+        execution: RoutedExecution,
+    ) -> (RoutedExecution, Option<SpotCheckResult>) {
         let Some(duplicate_peer) = duplicate_peer else {
-            return execution;
+            return (execution, None);
         };
         let Some(permit) = self.try_begin_redundant_probe(&job, primary_peer, duplicate_peer)
         else {
-            return execution;
+            return (execution, None);
         };
 
         let (handle, mut primary_stream, verification) = execution;
+        if !matches!(
+            verification,
+            ReceiptVerification::Verified | ReceiptVerification::Pending
+        ) {
+            return ((handle, primary_stream, verification), None);
+        }
+        let pair = SpotCheckPair {
+            primary: primary_peer,
+            validator: duplicate_peer,
+        };
         let (primary_tx, primary_rx) = oneshot::channel();
+        let (verdict_tx, verdict_rx) = oneshot::channel();
         let observed_primary: JobStream = Box::pin(stream! {
-            let mut primary_tx = Some(primary_tx);
+            let mut transcript = SpotCheckTranscript::default();
             while let Some(event) = futures::StreamExt::next(&mut primary_stream).await {
-                if matches!(event, JobEvent::Final { .. }) {
-                    let commitment = match &event {
-                        JobEvent::Final { result, error }
-                            if error.is_none()
-                                && matches!(result.completion, Completion::Stop | Completion::Length) =>
-                        {
-                            Some(result.output_commitment)
-                        }
-                        _ => None,
-                    };
-                    if let Some(tx) = primary_tx.take() {
-                        let _ = tx.send(commitment);
-                    }
-                }
+                transcript.observe(&event);
                 yield event;
             }
-            if let Some(tx) = primary_tx.take() {
-                let _ = tx.send(None);
-            }
+            // The verified live and batch relays only deliver a successful
+            // terminal after verifying the signed receipt for this exact peer.
+            let _ = primary_tx.send(transcript.finish());
         });
 
         let router = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if !router
-                .redundant_peers_are_backend_equivalent(primary_peer, duplicate_peer, &job)
-                .await
-            {
-                router
-                    .record_redundant_result(
-                        primary_peer,
-                        duplicate_peer,
-                        &job,
-                        &RedundantCheckResult::Incomparable,
-                    )
-                    .await;
-                return;
-            }
-            let duplicate_commitment =
-                match router.execute_via_peer(duplicate_peer, job.clone()).await {
-                    Ok((
-                        _handle,
-                        stream,
-                        ReceiptVerification::Verified | ReceiptVerification::Pending,
-                    )) => verified_terminal_commitment(stream).await,
-                    Ok(_) | Err(_) => None,
-                };
-            let primary_commitment = primary_rx.await.unwrap_or(None);
-            let result = compare_redundant_commitments(primary_commitment, duplicate_commitment);
-            router
-                .record_redundant_result(primary_peer, duplicate_peer, &job, &result)
-                .await;
+            let comparison = timeout(SPOT_CHECK_TIMEOUT, async {
+                let (primary, (validator, capability_digest)) =
+                    tokio::try_join!(async { primary_rx.await.ok().flatten().ok_or(()) }, async {
+                        let capability_digest =
+                            router.spot_check_capabilities(pair, &job).await.ok_or(())?;
+                        let validator = router
+                            .spot_check_peer_output(pair.validator, &job)
+                            .await
+                            .ok_or(())?;
+                        Ok((validator, capability_digest))
+                    })
+                    .ok()?;
+                Some(SpotCheckComparison {
+                    primary,
+                    validator,
+                    capability_digest,
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            let result = router.record_spot_check(pair, &job, comparison).await;
+            let _ = verdict_tx.send(result);
         });
 
-        (handle, observed_primary, verification)
+        ((handle, observed_primary, verification), Some(verdict_rx))
     }
 
     /// Compare only peers whose current signed advertisements attest the same
@@ -812,32 +849,32 @@ impl Router {
     /// signer→PeerId binding. Missing, expired, or semantically different
     /// capabilities are incomparable and must never generate negative
     /// reputation evidence from output disagreement.
-    async fn redundant_peers_are_backend_equivalent(
+    async fn spot_check_capabilities(
         &self,
-        primary_peer: PeerId,
-        duplicate_peer: PeerId,
+        pair: SpotCheckPair,
         job: &SignedManifest<JobSpec>,
-    ) -> bool {
+    ) -> Option<[u8; 32]> {
         let JobSpec::Inference(spec) = &job.payload else {
-            return false;
+            return None;
         };
-        let Ok(model_cid) = ModelCid::from_hex(&spec.model_cid) else {
-            return false;
-        };
-        let Ok(peers) = self.registry.find_peers_for_model(&model_cid).await else {
-            return false;
-        };
+        let model_cid = ModelCid::from_hex(&spec.model_cid).ok()?;
+        let peers = self.registry.find_peers_for_model(&model_cid).await.ok()?;
         let primary = peers
             .iter()
-            .find_map(|(peer, caps)| (*peer == primary_peer).then_some(caps));
+            .find_map(|(peer, caps)| (*peer == pair.primary).then_some(caps))?;
         let duplicate = peers
             .iter()
-            .find_map(|(peer, caps)| (*peer == duplicate_peer).then_some(caps));
-        matches!(
-            (primary, duplicate),
-            (Some(primary), Some(duplicate))
-                if capabilities_are_redundancy_equivalent(primary, duplicate)
-        )
+            .find_map(|(peer, caps)| (*peer == pair.validator).then_some(caps))?;
+        if !capabilities_are_redundancy_equivalent(primary, duplicate) {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"lucid-spot-check-capabilities:v1\0");
+        hasher.update(primary.backend.as_bytes());
+        hasher.update([0]);
+        hasher.update(primary.quantization.as_bytes());
+        hasher.update(primary.context_length.to_be_bytes());
+        Some(hasher.finalize().into())
     }
 
     fn try_begin_redundant_probe(
@@ -848,7 +885,6 @@ impl Router {
     ) -> Option<OwnedSemaphorePermit> {
         if !self.redundant_config.enabled
             || self.evidence.is_none()
-            || primary_peer == duplicate_peer
             || validate_redundant_job_eligibility(&job.payload).is_err()
         {
             return None;
@@ -861,7 +897,57 @@ impl Router {
         ) {
             return None;
         }
+        if !self.spot_check_peers_allowed(SpotCheckPair {
+            primary: primary_peer,
+            validator: duplicate_peer,
+        }) {
+            return None;
+        }
         Arc::clone(&self.redundant_gate).try_acquire_owned().ok()
+    }
+
+    fn spot_check_peers_allowed(&self, pair: SpotCheckPair) -> bool {
+        let observer = node_identity_peer_id(&self.identity);
+        if pair.primary == pair.validator || pair.primary == observer || pair.validator == observer
+        {
+            return false;
+        }
+        let issuers = self.authorized_issuers();
+        self.remote_peer_allowed(&pair.primary, &issuers, false)
+            && self.remote_peer_allowed(&pair.validator, &issuers, false)
+    }
+
+    async fn spot_check_peer_output(
+        &self,
+        peer: PeerId,
+        job: &SignedManifest<JobSpec>,
+    ) -> Option<SpotCheckOutput> {
+        if !self.remote_peer_allowed(&peer, &self.authorized_issuers(), false) {
+            return None;
+        }
+        // The live relay carries the check deadline to the server and cancels
+        // when dropped. A batch fallback cannot cancel in-flight work.
+        let (handle, mut stream, verification) = self
+            .execute_via_peer_live(peer, job.clone(), SPOT_CHECK_TIMEOUT)
+            .await
+            .ok()?;
+        if !matches!(
+            verification,
+            ReceiptVerification::Verified | ReceiptVerification::Pending
+        ) {
+            return None;
+        }
+        let mut transcript = SpotCheckTranscript::default();
+        while let Some(event) = futures::StreamExt::next(&mut stream).await {
+            transcript.observe(&event);
+            if transcript.invalid {
+                handle.cancel();
+                return None;
+            }
+        }
+        let output = transcript.finish()?;
+        let receipt = handle.finish().await.ok()?;
+        (receipt.result.output_commitment == output.commitment).then_some(output)
     }
 
     /// Prefer the real v2 bidirectional stream. A v1 batch fallback is
@@ -872,12 +958,15 @@ impl Router {
         peer_id: PeerId,
         job: SignedManifest<JobSpec>,
     ) -> Result<(JobHandle, JobStream, ReceiptVerification), RouterError> {
-        if !self.remote_peer_allowed(&peer_id, &self.authorized_issuers()) {
+        if !self.remote_peer_allowed(&peer_id, &self.authorized_issuers(), self.allow_open_peers) {
             return Err(RouterError::Refused {
                 reason: "serving peer is no longer authorized for remote requests".to_string(),
             });
         }
-        match self.execute_via_peer_live(peer_id, job.clone()).await {
+        match self
+            .execute_via_peer_live(peer_id, job.clone(), RELAY_TIMEOUT)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(RouterError::Relay(reason))
                 if reason.contains("remote does not support")
@@ -951,6 +1040,7 @@ impl Router {
         &self,
         peer_id: PeerId,
         job: SignedManifest<JobSpec>,
+        job_timeout: Duration,
     ) -> Result<(JobHandle, JobStream, ReceiptVerification), RouterError> {
         let manifest_hash = job
             .manifest_hash()
@@ -973,7 +1063,7 @@ impl Router {
         });
         let payload = serde_json::to_vec(&job)
             .map_err(|e| RouterError::Relay(format!("encode SignedManifest: {e}")))?;
-        let deadline_unix_ms = unix_time_ms().saturating_add(RELAY_TIMEOUT.as_millis() as u64);
+        let deadline_unix_ms = unix_time_ms().saturating_add(job_timeout.as_millis() as u64);
         let mut remote = self
             .phase_net
             .open_job_relay_stream(
@@ -1366,10 +1456,7 @@ impl Router {
         Ok((handle, stream, ReceiptVerification::Verified))
     }
 
-    /// Explicitly run one bounded redundant check. This API never participates
-    /// in the requester-visible stream: it performs exactly two independent
-    /// verified batch executions on distinct peers, drains them separately, and
-    /// compares only their terminal commitments.
+    /// Run a bounded check without exposing either execution's output to a caller.
     pub async fn check_redundant_execution(
         &self,
         job: SignedManifest<JobSpec>,
@@ -1377,13 +1464,17 @@ impl Router {
         duplicate_peer: PeerId,
         _eligibility: DeterministicVerificationEligibility,
     ) -> Result<RedundantCheckResult, RouterError> {
-        if !self.redundant_config.enabled {
+        if !self.redundant_config.enabled || self.evidence.is_none() {
             return Ok(RedundantCheckResult::SkippedDisabled);
         }
-        if primary_peer == duplicate_peer {
-            return Err(RouterError::Relay(
-                "redundant verification requires two distinct peers".to_string(),
-            ));
+        let pair = SpotCheckPair {
+            primary: primary_peer,
+            validator: duplicate_peer,
+        };
+        if !self.spot_check_peers_allowed(pair) {
+            return Err(RouterError::Refused {
+                reason: "spot checks require two distinct authorized remote peers".to_string(),
+            });
         }
         validate_redundant_job_eligibility(&job.payload)?;
         let manifest_hash = job
@@ -1400,106 +1491,65 @@ impl Router {
             return Ok(RedundantCheckResult::SkippedBusy);
         };
 
-        if !self
-            .redundant_peers_are_backend_equivalent(primary_peer, duplicate_peer, &job)
-            .await
-        {
-            let result = RedundantCheckResult::Incomparable;
-            self.record_redundant_result(primary_peer, duplicate_peer, &job, &result)
-                .await;
-            return Ok(result);
-        }
-
-        let primary = self.execute_via_peer_batch(primary_peer, job.clone());
-        let duplicate = self.execute_via_peer_batch(duplicate_peer, job.clone());
-        let (primary_result, duplicate_result) = tokio::join!(primary, duplicate);
-        let primary_commitment = match primary_result {
-            Ok((_handle, stream, ReceiptVerification::Verified)) => {
-                verified_terminal_commitment(stream).await
-            }
-            Ok(_) => None,
-            Err(error) => {
-                self.record_remote_outcome(
-                    primary_peer,
-                    &job,
-                    EVIDENCE_PROTOCOL_BATCH,
-                    classify_relay_failure(&error, false),
-                    None,
-                )
-                .await;
-                None
-            }
-        };
-        let duplicate_commitment = match duplicate_result {
-            Ok((_handle, stream, ReceiptVerification::Verified)) => {
-                verified_terminal_commitment(stream).await
-            }
-            Ok(_) => None,
-            Err(error) => {
-                self.record_remote_outcome(
-                    duplicate_peer,
-                    &job,
-                    EVIDENCE_PROTOCOL_BATCH,
-                    classify_relay_failure(&error, false),
-                    None,
-                )
-                .await;
-                None
-            }
-        };
-
-        let result = compare_redundant_commitments(primary_commitment, duplicate_commitment);
-        self.record_redundant_result(primary_peer, duplicate_peer, &job, &result)
-            .await;
-        Ok(result)
+        let comparison = timeout(SPOT_CHECK_TIMEOUT, async {
+            let capability_digest = self.spot_check_capabilities(pair, &job).await?;
+            let job = &job;
+            let checked_output =
+                |peer| async move { self.spot_check_peer_output(peer, job).await.ok_or(()) };
+            let (primary, validator) =
+                tokio::try_join!(checked_output(pair.primary), checked_output(pair.validator))
+                    .ok()?;
+            Some(SpotCheckComparison {
+                primary,
+                validator,
+                capability_digest,
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        Ok(self.record_spot_check(pair, &job, comparison).await)
     }
 
-    async fn record_redundant_result(
+    async fn record_spot_check(
         &self,
-        primary_peer: PeerId,
-        duplicate_peer: PeerId,
+        pair: SpotCheckPair,
         job: &SignedManifest<JobSpec>,
-        result: &RedundantCheckResult,
-    ) {
-        let (outcome, primary_evidence, duplicate_evidence) = match result {
-            RedundantCheckResult::Agreement { commitment } => (
-                EvidenceOutcome::RedundantExecutionAgreement,
-                Some(*commitment),
-                Some(*commitment),
-            ),
-            RedundantCheckResult::Disagreement {
-                primary_commitment,
-                duplicate_commitment,
-            } => (
-                EvidenceOutcome::RedundantExecutionDisagreement,
-                Some(*primary_commitment),
-                Some(*duplicate_commitment),
-            ),
-            RedundantCheckResult::Incomparable => (
+        comparison: Option<SpotCheckComparison>,
+    ) -> RedundantCheckResult {
+        let Some(evidence) = &self.evidence else {
+            return RedundantCheckResult::Incomparable;
+        };
+        let Some(comparison) = comparison else {
+            self.record_remote_outcome(
+                pair.primary,
+                job,
+                EVIDENCE_PROTOCOL_REDUNDANT,
                 EvidenceOutcome::RedundantExecutionIncomparableResult,
                 None,
-                None,
-            ),
-            RedundantCheckResult::SkippedDisabled
-            | RedundantCheckResult::SkippedSampling
-            | RedundantCheckResult::SkippedBusy => return,
+            )
+            .await;
+            return RedundantCheckResult::Incomparable;
         };
-        self.record_remote_outcome(
-            primary_peer,
+        let Ok(context) = evidence_context(
+            evidence.observer_peer_id(),
+            pair.primary,
             job,
-            EVIDENCE_PROTOCOL_REDUNDANT,
-            outcome,
-            primary_evidence,
-        )
-        .await;
-        self.record_remote_outcome(
-            duplicate_peer,
-            job,
-            EVIDENCE_PROTOCOL_REDUNDANT,
-            outcome,
-            duplicate_evidence,
-        )
-        .await;
+            SPOT_CHECK_METHOD,
+        ) else {
+            return RedundantCheckResult::Incomparable;
+        };
+        let (outcome, result) = compare_spot_check(pair.validator, &comparison);
+        match evidence
+            .record(context, outcome, Some(comparison.primary.commitment))
+            .await
+        {
+            Ok(_) => result,
+            Err(error) => {
+                warn!(%error, "could not persist verified spot-check evidence");
+                RedundantCheckResult::Incomparable
+            }
+        }
     }
 }
 
@@ -1511,17 +1561,24 @@ fn validate_redundant_job_eligibility(job: &JobSpec) -> Result<(), RouterError> 
     match job {
         JobSpec::Inference(spec)
             if spec.resume_from.is_none()
+                && matches!(spec.max_tokens, Some(1..=MAX_SPOT_CHECK_TOKENS))
+                && spec.sampling.params.get("temperature").and_then(|value| value.parse::<f64>().ok()) == Some(0.0)
                 && spec
                     .sampling
                     .params
                     .get("seed")
-                    .is_some_and(|seed| seed.parse::<u64>().is_ok())
-                && ModelCid::from_hex(&spec.model_cid).is_ok() =>
+                    .is_some_and(|seed| seed.parse::<u32>().is_ok())
+                && ModelCid::from_hex(&spec.model_cid).is_ok()
+                && spec.messages.iter().all(|message| message.images.is_empty())
+                && spec.messages.iter().fold(
+                    spec.prompt.as_ref().map_or(0, String::len),
+                    |bytes, message| bytes.saturating_add(message.content.len())
+                ) <= MAX_SPOT_CHECK_INPUT_BYTES =>
         {
             Ok(())
         }
         JobSpec::Inference(_) => Err(RouterError::Relay(
-            "redundant verification requires an exact model CID and a non-negative seed on non-resumed inference".to_string(),
+            "spot checks require bounded, non-resumed text inference with an exact model CID, a fixed seed, and zero temperature".to_string(),
         )),
         JobSpec::Embedding(_) => Err(RouterError::Relay(
             "embedding redundancy is disabled until an approved numeric-tolerance and backend-equivalence contract exists; byte commitments are not a cross-backend correctness metric".to_string(),
@@ -1550,45 +1607,93 @@ fn redundant_sample_selected(
     material.extend_from_slice(REDUNDANT_SAMPLE_DOMAIN);
     material.extend_from_slice(&manifest_hash);
     let keyed_sample = identity.sign(&material).to_bytes();
-    u16::from_be_bytes([keyed_sample[0], keyed_sample[1]]) % 1_000 < sample_cap_permille
+    let draw = u64::from_be_bytes(keyed_sample[..8].try_into().expect("signature is 64 bytes"));
+    let threshold = (u128::from(u64::MAX) + 1) * u128::from(sample_cap_permille) / 1_000;
+    u128::from(draw) < threshold
 }
 
-async fn verified_terminal_commitment(mut stream: JobStream) -> Option<[u8; 32]> {
-    let mut terminal_commitment = None;
-    while let Some(event) = futures::StreamExt::next(&mut stream).await {
+/// Hash canonical text bytes without storing text or depending on chunk boundaries.
+#[derive(Default)]
+struct SpotCheckTranscript {
+    digest: Sha256,
+    bytes: usize,
+    chunks: u64,
+    terminal: Option<[u8; 32]>,
+    invalid: bool,
+}
+
+impl SpotCheckTranscript {
+    fn observe(&mut self, event: &JobEvent) {
+        if self.invalid || self.terminal.is_some() {
+            self.invalid = true;
+            return;
+        }
         match event {
-            JobEvent::Final { result, error }
-                if terminal_commitment.is_none()
-                    && error.is_none()
-                    && matches!(result.completion, Completion::Stop | Completion::Length) =>
+            JobEvent::Output(chunk)
+                if chunk.kind == "token"
+                    && chunk.seq == self.chunks
+                    && std::str::from_utf8(&chunk.data).is_ok() =>
             {
-                terminal_commitment = Some(result.output_commitment);
+                self.bytes = self.bytes.saturating_add(chunk.data.len());
+                self.chunks += 1;
+                if self.bytes > MAX_SPOT_CHECK_OUTPUT_BYTES
+                    || self.chunks > MAX_SPOT_CHECK_OUTPUT_CHUNKS
+                {
+                    self.invalid = true;
+                } else {
+                    self.digest.update(&chunk.data);
+                }
             }
-            JobEvent::Final { .. } => return None,
-            JobEvent::Output(_) | JobEvent::Progress(_) if terminal_commitment.is_none() => {}
-            _ => return None,
+            JobEvent::Progress(_) => {}
+            JobEvent::Final { result, error }
+                if error.is_none()
+                    && matches!(result.completion, Completion::Stop | Completion::Length)
+                    && result.output_chunk_count == self.chunks
+                    && self.bytes > 0 =>
+            {
+                self.terminal = Some(result.output_commitment);
+            }
+            _ => self.invalid = true,
         }
     }
-    terminal_commitment
+
+    fn finish(self) -> Option<SpotCheckOutput> {
+        if self.invalid {
+            return None;
+        }
+        Some(SpotCheckOutput {
+            commitment: self.terminal?,
+            text_digest: self.digest.finalize().into(),
+        })
+    }
 }
 
-fn compare_redundant_commitments(
-    primary_commitment: Option<[u8; 32]>,
-    duplicate_commitment: Option<[u8; 32]>,
-) -> RedundantCheckResult {
-    match (primary_commitment, duplicate_commitment) {
-        (Some(primary), Some(duplicate)) if primary == duplicate => {
+fn compare_spot_check(
+    validator_peer: PeerId,
+    comparison: &SpotCheckComparison,
+) -> (EvidenceOutcome, RedundantCheckResult) {
+    let evidence = SpotCheckEvidence {
+        validator_peer,
+        validator_commitment: comparison.validator.commitment,
+        primary_text_digest: comparison.primary.text_digest,
+        validator_text_digest: comparison.validator.text_digest,
+        capability_digest: comparison.capability_digest,
+    };
+    if evidence.primary_text_digest == evidence.validator_text_digest {
+        (
+            EvidenceOutcome::VerifiedSpotCheckAgreement(evidence),
             RedundantCheckResult::Agreement {
-                commitment: primary,
-            }
-        }
-        (Some(primary_commitment), Some(duplicate_commitment)) => {
+                commitment: comparison.primary.commitment,
+            },
+        )
+    } else {
+        (
+            EvidenceOutcome::VerifiedSpotCheckDisagreement(evidence),
             RedundantCheckResult::Disagreement {
-                primary_commitment,
-                duplicate_commitment,
-            }
-        }
-        _ => RedundantCheckResult::Incomparable,
+                primary_commitment: comparison.primary.commitment,
+                duplicate_commitment: comparison.validator.commitment,
+            },
+        )
     }
 }
 
@@ -1599,6 +1704,7 @@ fn capabilities_are_redundancy_equivalent(
     primary.model_cid == duplicate.model_cid
         && primary.backend == duplicate.backend
         && primary.quantization == duplicate.quantization
+        && primary.context_length == duplicate.context_length
 }
 
 fn evidence_context(

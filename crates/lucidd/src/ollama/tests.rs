@@ -312,6 +312,78 @@ fn stream_terminal_carries_final_verification_or_error() {
     assert!(verified_error.get("x_phase_commitment").is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn remote_trust_label_requires_a_matching_and_completed_spot_check() {
+    let mut terminal = HttpTerminal::default();
+    terminal.observe(Completion::Stop, None);
+    let receipt = FinishedReceipt {
+        verification: ReceiptVerification::Verified,
+        commitment: Some([7; 32]),
+    };
+    let initial = inference_stream_response(
+        futures::stream::empty(),
+        Some("peer"),
+        "test route",
+        ReceiptVerification::Pending,
+    );
+    assert_eq!(initial.headers()[HEADER_TRUST_LABEL], "remote-pending");
+    assert_eq!(initial.headers()[header::TRAILER], HEADER_TRUST_LABEL);
+
+    for (result, expected) in [
+        (
+            RedundantCheckResult::Agreement {
+                commitment: [7; 32],
+            },
+            TrustLabel::RemoteSpotChecked,
+        ),
+        (
+            RedundantCheckResult::Agreement {
+                commitment: [8; 32],
+            },
+            TrustLabel::RemoteReceiptVerified,
+        ),
+        (
+            RedundantCheckResult::Disagreement {
+                primary_commitment: [7; 32],
+                duplicate_commitment: [8; 32],
+            },
+            TrustLabel::RemoteReceiptVerified,
+        ),
+    ] {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(result).unwrap();
+        let mut payload = serde_json::json!({"done": true});
+        assert_eq!(
+            stream_terminal_trust_label(&mut payload, &terminal, &receipt, Some(rx)).await,
+            Some(expected)
+        );
+        assert_eq!(payload[TERMINAL_TRUST_LABEL], expected.as_str());
+        let trailer = trust_label_trailer(expected).into_trailers().unwrap();
+        assert_eq!(trailer[HEADER_TRUST_LABEL], expected.as_str());
+    }
+
+    let (_tx, slow_check) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        completed_trust_label(&receipt, Some(slow_check)).await,
+        Some(TrustLabel::RemoteReceiptVerified)
+    );
+    let invalid = FinishedReceipt {
+        verification: ReceiptVerification::Failed,
+        commitment: None,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(RedundantCheckResult::Agreement {
+        commitment: [7; 32],
+    })
+    .unwrap();
+    let mut payload = serde_json::json!({"done": true});
+    assert_eq!(
+        stream_terminal_trust_label(&mut payload, &terminal, &invalid, Some(rx)).await,
+        None
+    );
+    assert!(payload.get(TERMINAL_TRUST_LABEL).is_none());
+}
+
 #[test]
 fn sanitize_strips_crlf_and_ansi() {
     // SEC-10: CRLF (log forging) and ESC/CSI (ANSI abuse) are dropped,
