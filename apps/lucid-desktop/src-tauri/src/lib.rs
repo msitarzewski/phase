@@ -37,6 +37,22 @@ const DEFAULT_API_PORT: u16 = 11435;
 const DEFAULT_CHAT_URL: &str = "http://localhost:3000";
 const MAX_INVITATION_LEN: usize = 16 * 1024;
 
+fn response_trust_label(headers: &reqwest::header::HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all("x-lucid-trust-label").iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    match value {
+        "local" => Some("local"),
+        "remote-pending" => Some("remote-pending"),
+        "remote-receipt-verified" => Some("remote-receipt-verified"),
+        "remote-spot-checked" => Some("remote-spot-checked"),
+        "trusted-circle-sharded" => Some("trusted-circle-sharded"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopPrefs {
     api_port: u16,
@@ -195,6 +211,16 @@ impl AppController {
     }
 
     async fn api_get(&self, app: &AppHandle, path: &str) -> Result<serde_json::Value> {
+        self.api_get_with_trust_label(app, path)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    async fn api_get_with_trust_label(
+        &self,
+        app: &AppHandle,
+        path: &str,
+    ) -> Result<(serde_json::Value, Option<&'static str>)> {
         let (port, token) = self.ensure_started(app).await?;
         let url = format!("http://127.0.0.1:{port}{path}");
         let resp = self
@@ -205,6 +231,7 @@ impl AppController {
             .await
             .with_context(|| format!("local control GET {path} failed"))?;
         let status = resp.status();
+        let trust_label = response_trust_label(resp.headers());
         let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
         if !status.is_success() {
             let msg = body
@@ -213,7 +240,7 @@ impl AppController {
                 .unwrap_or("Local LUCID control request failed");
             bail!("{msg}");
         }
-        Ok(body)
+        Ok((body, trust_label))
     }
 
     async fn api_post(
@@ -297,7 +324,7 @@ async fn build_overview(app: &AppHandle, ctrl: &AppController) -> Result<serde_j
         "probe": probe_res.ok(),
         "models": models_json.get("models").cloned().unwrap_or_else(|| serde_json::json!([])),
         "model_dirs": models_json.get("model_dirs").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "peers": peers_json.get("peers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "peers": peers_json.get("peers").and_then(serde_json::Value::as_array),
     }))
 }
 
@@ -512,9 +539,14 @@ async fn get_cluster_status(
     app: AppHandle,
     ctrl: State<'_, Arc<AppController>>,
 ) -> Result<serde_json::Value, String> {
-    ctrl.api_get(&app, "/api/lucid/cluster")
+    let (status, trust_label) = ctrl
+        .api_get_with_trust_label(&app, "/api/lucid/cluster")
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "status": status,
+        "response_trust_label": trust_label,
+    }))
 }
 
 #[tauri::command]
@@ -822,6 +854,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_label_requires_one_recognized_header_value() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(response_trust_label(&headers), None);
+        headers.insert("x-lucid-trust-label", HeaderValue::from_static("unknown"));
+        assert_eq!(response_trust_label(&headers), None);
+        headers.insert(
+            "x-lucid-trust-label",
+            HeaderValue::from_static("trusted-circle-sharded"),
+        );
+        assert_eq!(
+            response_trust_label(&headers),
+            Some("trusted-circle-sharded")
+        );
+        headers.append("x-lucid-trust-label", HeaderValue::from_static("local"));
+        assert_eq!(response_trust_label(&headers), None);
+    }
 
     #[test]
     fn chat_url_validation_rejects_remote_http_and_non_http_schemes() {

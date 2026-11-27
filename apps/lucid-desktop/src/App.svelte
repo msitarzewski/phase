@@ -7,10 +7,17 @@
     type OverviewPayload,
     type ModelEntry,
     type InviteResponse,
-    type ClusterStatus,
-    type ClusterPlanPreview,
+    type ClusterStatusResponse,
+    type PeerEntry,
   } from "./lib/api";
-  import { formatBytes, sourceLabel, statusPillText } from "./lib/format";
+  import {
+    connectionPathLabel,
+    enrollmentLabel,
+    formatBytes,
+    shortPeerId,
+    sourceLabel,
+    statusPillText,
+  } from "./lib/format";
 
   let overview = $state<OverviewPayload | null>(null);
   let loading = $state(true);
@@ -31,8 +38,13 @@
   let activeInvite = $state<InviteResponse | null>(null);
   let showPeersModal = $state(false);
   let showClusterModal = $state(false);
-  let clusterStatus = $state<ClusterStatus | null>(null);
-  let clusterPlan = $state<ClusterPlanPreview | null>(null);
+  let clusterResponse = $state<ClusterStatusResponse | null>(null);
+  let clusterLoading = $state(false);
+  let clusterError = $state<string | null>(null);
+  let clusterRequest = 0;
+  let clusterStatus = $derived(clusterResponse?.status ?? null);
+  let clusterMemory = $derived(formatBytes(clusterStatus?.local_node?.available_memory_bytes ?? 0, true));
+  let deviceEnrollment = $derived(enrollmentLabel(overview?.status.enrollment?.state));
   let showSettingsModal = $state(false);
 
   // Permission-first modal before enabling providing or installing runtime
@@ -302,74 +314,44 @@
     }
   }
 
-  async function handleOpenCluster() {
+  function handleOpenCluster() {
     showClusterModal = true;
-    clusterPlan = null;
+    void loadClusterStatus();
+  }
+
+  function handleCloseCluster() {
+    showClusterModal = false;
+    clusterRequest += 1;
+  }
+
+  async function loadClusterStatus() {
+    const request = ++clusterRequest;
+    clusterResponse = null;
+    clusterError = null;
+    clusterLoading = true;
     try {
-      clusterStatus = await lucidApi.getClusterStatus();
-    } catch (err) {
-      errorBanner = err instanceof Error ? err.message : String(err);
+      const response = await lucidApi.getClusterStatus();
+      if (request === clusterRequest) clusterResponse = response;
+    } catch {
+      if (request === clusterRequest) clusterError = "Cluster status could not be loaded.";
+    } finally {
+      if (request === clusterRequest) clusterLoading = false;
     }
   }
 
   async function handleToggleCluster() {
-    if (!clusterStatus) return;
+    const enabled = clusterStatus?.cluster_enabled;
+    if (typeof enabled !== "boolean") return;
     try {
       busy = true;
-      const next = !clusterStatus.cluster_enabled;
+      clusterError = null;
+      const next = !enabled;
       await lucidApi.updateSettings({ cluster_enabled: next });
-      clusterStatus = await lucidApi.getClusterStatus();
+      if (showClusterModal) await loadClusterStatus();
       await refresh();
       showToast(next ? "Trusted-Circle cluster enabled" : "Trusted-Circle cluster disabled");
-    } catch (err) {
-      errorBanner = err instanceof Error ? err.message : String(err);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function handlePreviewClusterSplit() {
-    if (!clusterStatus) return;
-    try {
-      busy = true;
-      errorBanner = null;
-      const GIB = 1024 * 1024 * 1024;
-      const localMem = Math.max(clusterStatus.local_node.available_memory_bytes, 16 * GIB);
-      const localKey = clusterStatus.local_node.verifying_key_hex;
-      // Combine this device with connected peers (or a reference partner node
-      // if no peer is online yet) so the user can inspect exact layer splits.
-      const peers = [
-        {
-          peer_id: `${clusterStatus.local_node.peer_id.slice(0, 12)} (this device)`,
-          verifying_key_hex: localKey,
-          available_memory_bytes: localMem,
-          backend: clusterStatus.local_node.backend,
-        },
-        ...(clusterStatus.connected_peers.length > 0
-          ? clusterStatus.connected_peers.slice(0, 3).map((p) => ({
-              peer_id: p.peer_id,
-              verifying_key_hex: localKey,
-              available_memory_bytes: 24 * GIB,
-              backend: "metal",
-            }))
-          : [
-              {
-                peer_id: "trusted-partner-16gb (preview)",
-                verifying_key_hex: localKey,
-                available_memory_bytes: 16 * GIB,
-                backend: "cuda",
-              },
-            ]),
-      ];
-      clusterPlan = await lucidApi.previewClusterPlan({
-        model_name: selectedModel?.name ?? "llama3.3:70b-q4_k_m",
-        model_path: selectedModel?.local_path ?? null,
-        total_layers: 80,
-        size_bytes: Math.max(selectedModel?.size_bytes ?? 0, 42 * GIB),
-        peers,
-      });
-    } catch (err) {
-      errorBanner = err instanceof Error ? err.message : String(err);
+    } catch {
+      if (showClusterModal) clusterError = "The cluster setting could not be changed.";
     } finally {
       busy = false;
     }
@@ -416,7 +398,7 @@
         Cluster
       </button>
       <button class="ghost" onclick={() => (showPeersModal = true)} disabled={!overview}>
-        Peers ({overview?.peers.length ?? 0})
+        Peers{#if overview?.peers} ({overview.peers.length}){/if}
       </button>
       <button onclick={() => (showJoinModal = true)} disabled={!overview}>Join Invite</button>
       <button class="primary" onclick={handleCreateInvite} disabled={busy || !overview}>
@@ -786,26 +768,39 @@
   </div>
 {/if}
 
+{#snippet connectionList(peers: PeerEntry[] | null | undefined)}
+  {#if !peers}
+    <p class="row-help">Connection details unavailable.</p>
+  {:else if peers.length === 0}
+    <p class="row-help">No connected peers reported.</p>
+  {:else}
+    <ul class="peer-list connection-list">
+      {#each peers as peer (peer.peer_id)}
+        <li class="peer-row">
+          <span class="mono">{shortPeerId(peer.peer_id)}</span>
+          <span class="chip">{connectionPathLabel(peer.path)}</span>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+{/snippet}
+
 <!-- Peers Modal -->
 {#if showPeersModal && overview}
   <div class="backdrop">
-    <div class="modal">
-      <h2>Connected Peers</h2>
-      <p class="subtitle">
-        Network path: <strong>{overview.status.active_path}</strong> · {overview.peers.length} connected
-      </p>
-      {#if overview.peers.length === 0}
-        <p class="row-help">No peers connected yet. Share or join an invite once your relay is online.</p>
-      {:else}
-        <div class="peer-list">
-          {#each overview.peers as peer (peer.peer_id)}
-            <div class="peer-row">
-              <span class="mono">{peer.peer_id.slice(0, 18)}…{peer.peer_id.slice(-6)}</span>
-              <span class="chip">{peer.path}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
+    <div class="modal peers-modal" role="dialog" aria-modal="true" aria-labelledby="peers-title">
+      <h2 id="peers-title">Peers</h2>
+      <section class="card compact">
+        <h3 class="row-label">Network enrollment</h3>
+        <p class="row-help">{deviceEnrollment}. Circle membership is unavailable for individual peers.</p>
+      </section>
+      <section class="connection-section">
+        <h3 class="row-label">
+          Network connections{#if overview.peers} ({overview.peers.length}){/if}
+        </h3>
+        <p class="row-help">Active network path · {connectionPathLabel(overview.status.active_path)}</p>
+        {@render connectionList(overview.peers)}
+      </section>
       <div class="modal-actions">
         <button class="primary" onclick={() => (showPeersModal = false)}>Close</button>
       </div>
@@ -814,66 +809,93 @@
 {/if}
 
 <!-- Trusted-Circle Cluster Modal -->
-{#if showClusterModal && clusterStatus}
+{#if showClusterModal}
   <div class="backdrop">
-    <div class="modal wide">
-      <h2>Trusted-Circle Cluster</h2>
+    <div class="modal wide cluster-modal" role="dialog" aria-modal="true" aria-labelledby="cluster-title">
+      <h2 id="cluster-title">Trusted-Circle Cluster</h2>
       <p class="subtitle">
-        Pool memory across your invited devices for models larger than one machine.
-        <span class="chip">{clusterStatus.trust_label}</span>
+        Tier 1 shares model activations with enrolled circle devices so they can run a model together.
+        Everyone operating those devices must be fully trusted with the activations. Open-network
+        sharding is disabled.
       </p>
 
-      <div class="card compact">
-        <div class="toggle-row">
-          <div>
-            <div class="row-label">Participate in Trusted-Circle sharding</div>
-            <div class="row-help">
-              Off by default · Accepts slices only from your invited circle with signed layer plans &amp; handoff hashes
-            </div>
-          </div>
-          <button
-            class:primary={!clusterStatus.cluster_enabled}
-            disabled={busy}
-            onclick={handleToggleCluster}
-          >
-            {clusterStatus.cluster_enabled ? "Disable" : "Enable"}
-          </button>
-        </div>
-        <div class="divider"></div>
-        <div class="row-help">
-          <strong>This device:</strong> {clusterStatus.local_node.summary} ·
-          {formatBytes(clusterStatus.local_node.available_memory_bytes)} available ({clusterStatus.local_node.backend}) ·
-          {clusterStatus.connected_peers.length} peer{clusterStatus.connected_peers.length === 1 ? "" : "s"} online
-        </div>
-      </div>
+      {#if clusterError}
+        <p class="row-help" role="alert">{clusterError}</p>
+      {/if}
 
-      {#if clusterPlan}
-        <div class="card compact">
-          <div class="row-label">
-            Signed Layer Split · {clusterPlan.signed_plan.plan.model_alias} ({clusterPlan.signed_plan.plan.total_layers} layers)
+      {#if clusterLoading}
+        <p class="row-help" role="status">Loading cluster status…</p>
+      {:else if clusterStatus}
+        <section class="card compact">
+          <div class="toggle-row">
+            <div>
+              <h3 class="row-label">Participate in Tier 1</h3>
+              <p class="row-help">
+                {#if clusterStatus.cluster_enabled === true}Enabled.{:else if clusterStatus.cluster_enabled === false}Disabled.{/if}
+                {deviceEnrollment}.
+              </p>
+            </div>
+            {#if typeof clusterStatus.cluster_enabled === "boolean"}
+              <button
+                class:primary={!clusterStatus.cluster_enabled}
+                disabled={busy}
+                onclick={handleToggleCluster}
+              >
+                {clusterStatus.cluster_enabled ? "Disable" : "Enable"}
+              </button>
+            {:else}
+              <span class="chip">Setting unavailable</span>
+            {/if}
           </div>
-          <div class="peer-list" style="margin-top: 8px;">
-            {#each clusterPlan.signed_plan.plan.stages as st (st.stage_index)}
-              <div class="peer-row">
-                <span class="mono">Stage {st.stage_index}: {st.peer_id}</span>
-                <span class="chip">
-                  layers {st.start_layer}..{st.end_layer} ({formatBytes(st.estimated_memory_bytes)})
-                </span>
-              </div>
-            {/each}
-          </div>
-          <p class="row-help" style="margin-top: 8px;">
-            Coordinator signature verified ({clusterPlan.signed_plan.coordinator_signature_hex.slice(0, 16)}…).
-            Untrusted open-network sharding remains disabled until verification ADR approval.
+
+          {#if clusterStatus.trust_label === "trusted-circle-sharded" || clusterResponse?.response_trust_label}
+            <div class="cluster-labels">
+              {#if clusterStatus.trust_label === "trusted-circle-sharded"}
+                <span>Cluster mode <span class="chip">{clusterStatus.trust_label}</span></span>
+              {/if}
+              {#if clusterResponse?.response_trust_label}
+                <span>API response <span class="chip">{clusterResponse.response_trust_label}</span></span>
+              {/if}
+            </div>
+          {/if}
+        </section>
+
+        <section class="card compact" aria-labelledby="cluster-memory-title">
+          <h3 class="row-label" id="cluster-memory-title">Available memory</h3>
+          <dl class="cluster-memory">
+            <div>
+              <dt>This device · reported capacity</dt>
+              <dd>
+                {clusterMemory === "—" ? "Unavailable" : clusterMemory}
+                {#if clusterMemory !== "—" && clusterStatus.local_node?.backend}
+                  <span class="chip">{clusterStatus.local_node.backend}</span>
+                {/if}
+              </dd>
+            </div>
+            <div>
+              <dt>Pool across eligible devices</dt>
+              <dd>Unavailable</dd>
+            </div>
+          </dl>
+          <p class="row-help" id="cluster-preview-unavailable">
+            Layer split preview needs verified peer identities and memory. This daemon does not
+            report which connected devices are eligible or how much memory they can contribute.
           </p>
-        </div>
+        </section>
+
+        <section class="connection-section">
+          <h3 class="row-label">Network connections</h3>
+          {@render connectionList(clusterStatus.connected_peers)}
+        </section>
       {/if}
 
       <div class="modal-actions">
-        <button onclick={handlePreviewClusterSplit} disabled={busy}>
-          Preview Layer Split
-        </button>
-        <button class="primary" onclick={() => (showClusterModal = false)}>Done</button>
+        {#if clusterStatus}
+          <button disabled aria-describedby="cluster-preview-unavailable">Preview Layer Split</button>
+        {:else if !clusterLoading}
+          <button onclick={loadClusterStatus}>Retry</button>
+        {/if}
+        <button class="primary" onclick={handleCloseCluster}>Done</button>
       </div>
     </div>
   </div>
@@ -1331,6 +1353,60 @@
 
   .modal.wide {
     max-width: 560px;
+  }
+
+  .cluster-modal,
+  .peers-modal {
+    max-height: 100%;
+    overflow-y: auto;
+  }
+
+  .cluster-modal h3,
+  .peers-modal h3,
+  .cluster-modal .row-help,
+  .peers-modal .row-help {
+    margin: 0;
+  }
+
+  .connection-section,
+  .cluster-labels,
+  .cluster-memory {
+    display: grid;
+    gap: 8px;
+  }
+
+  .cluster-labels,
+  .cluster-memory dt {
+    color: var(--text-secondary);
+    font-size: 12.5px;
+  }
+
+  .cluster-labels {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  }
+
+  .cluster-labels > span,
+  .cluster-memory > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+
+  .cluster-memory,
+  .cluster-memory dd,
+  .connection-list {
+    margin: 0;
+  }
+
+  .cluster-memory dd {
+    font-weight: 600;
+  }
+
+  .connection-list {
+    list-style: none;
+    padding: 0;
   }
 
   .modal-actions {

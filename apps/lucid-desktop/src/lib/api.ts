@@ -2,8 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface EnrollmentStatus {
   state: string;
-  title: string;
-  detail: string;
+  message: string;
 }
 
 export interface PolicySummary {
@@ -95,7 +94,7 @@ export interface ModelEntry {
 
 export interface PeerEntry {
   peer_id: string;
-  path: string;
+  path?: string | null;
 }
 
 export interface OverviewPayload {
@@ -103,7 +102,7 @@ export interface OverviewPayload {
   probe: SystemProbe | null;
   models: ModelEntry[];
   model_dirs: string[];
-  peers: PeerEntry[];
+  peers: PeerEntry[] | null;
 }
 
 export interface ProvideResponse {
@@ -120,57 +119,27 @@ export interface InviteResponse {
 }
 
 export interface ClusterNodeInfo {
-  peer_id: string;
-  verifying_key_hex: string;
-  available_memory_bytes: number;
-  backend: string;
-  summary: string;
-}
-
-export interface ClusterModelInfo {
-  name: string;
-  path: string;
-  size_bytes: number;
-  source: string;
-  fits_local: boolean;
-  architecture: string | null;
-  total_layers: number | null;
+  available_memory_bytes?: number | null;
+  backend?: string | null;
 }
 
 export interface ClusterStatus {
-  cluster_enabled: boolean;
-  trust_tier: string;
-  trust_label: string;
-  untrusted_sharding_allowed: boolean;
-  local_node: ClusterNodeInfo;
-  connected_peers: PeerEntry[];
-  models: ClusterModelInfo[];
+  cluster_enabled?: boolean | null;
+  trust_label?: string | null;
+  local_node?: ClusterNodeInfo | null;
+  connected_peers?: PeerEntry[] | null;
 }
 
-export interface ShardStageAssignment {
-  stage_index: number;
-  peer_id: string;
-  verifying_key_hex: string;
-  start_layer: number;
-  end_layer: number;
-  includes_embedding: boolean;
-  includes_lm_head: boolean;
-  estimated_memory_bytes: number;
-}
+export type TrustLabel =
+  | "local"
+  | "remote-pending"
+  | "remote-receipt-verified"
+  | "remote-spot-checked"
+  | "trusted-circle-sharded";
 
-export interface ClusterPlanPreview {
-  verified: boolean;
-  required_memory_bytes: number;
-  signed_plan: {
-    plan: {
-      plan_id: string;
-      model_alias: string;
-      total_layers: number;
-      trust_label: string;
-      stages: ShardStageAssignment[];
-    };
-    coordinator_signature_hex: string;
-  };
+export interface ClusterStatusResponse {
+  status: ClusterStatus;
+  response_trust_label: TrustLabel | null;
 }
 
 export const lucidApi = {
@@ -214,17 +183,5 @@ export const lucidApi = {
   joinInvite: (invitation: string) => invoke<EnrollmentStatus>("join_invite", { invitation }),
   openChat: (modelId: string) => invoke<void>("open_chat", { modelId }),
   restartDaemon: () => invoke<OverviewPayload>("restart_daemon"),
-  getClusterStatus: () => invoke<ClusterStatus>("get_cluster_status"),
-  previewClusterPlan: (payload: {
-    model_name: string;
-    model_path?: string | null;
-    total_layers?: number;
-    size_bytes?: number;
-    peers: Array<{
-      peer_id: string;
-      verifying_key_hex: string;
-      available_memory_bytes: number;
-      backend: string;
-    }>;
-  }) => invoke<ClusterPlanPreview>("preview_cluster_plan", { payload }),
+  getClusterStatus: () => invoke<ClusterStatusResponse>("get_cluster_status"),
 };
