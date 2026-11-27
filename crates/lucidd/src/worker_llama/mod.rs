@@ -1176,11 +1176,18 @@ fn llama_server_command(
     // the per-spawn key. Environment, not argv: argv is world-readable.
     cmd.env(LLAMA_API_KEY_ENV, api_key.as_str());
     cmd.args(LLAMA_SERVER_HARDENING_ARGS);
-    // `--jinja` enables modern chat templates + tool calling. `--cache-reuse 256`
-    // enables KV-cache prompt-prefix shifting reuse across multi-turn chats and
-    // concurrent batch slots.
+    // `--jinja` enables modern chat templates + tool calling.
+    // Cross-tenant KV-cache isolation: one `llama-server` instance serves all
+    // callers for a model. On pinned `b12651`, `--cache-reuse` and the default
+    // 8 GiB `--cache-ram` prompt cache create a ~15 ms vs ~800 ms prompt-
+    // confirmation timing side channel visible in `total_duration_ms`, and a
+    // per-request `cache_prompt: false` alone does not prevent reuse unless
+    // every request sets `cache_prompt: false` alongside `--no-cache-prompt`,
+    // `--cache-ram 0`, and `--cache-reuse 0`.
     cmd.arg("--jinja");
-    cmd.arg("--cache-reuse").arg("256");
+    cmd.arg("--no-cache-prompt");
+    cmd.arg("--cache-ram").arg("0");
+    cmd.arg("--cache-reuse").arg("0");
     validate_rpc_offload_flags(rpc_servers, tensor_split)?;
     if !rpc_servers.is_empty() {
         let normalized: Vec<String> = rpc_servers.iter().map(|s| s.trim().to_string()).collect();
@@ -1674,7 +1681,9 @@ fn build_completion_request(inference: &InferenceJobSpec) -> Result<CompletionRe
 
     body.insert("prompt".to_string(), serde_json::Value::String(prompt));
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
-    body.insert("cache_prompt".to_string(), serde_json::Value::Bool(true));
+    // Server-owned cross-tenant KV-cache isolation: callers cannot re-enable
+    // prompt caching on a shared `llama-server` instance.
+    body.insert("cache_prompt".to_string(), serde_json::Value::Bool(false));
 
     // Never omit `n_predict`: llama.cpp may interpret omission as unlimited.
     // Clamp here as defense in depth for callers that invoke the worker
@@ -1816,31 +1825,27 @@ fn run_inference(
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 let status = r.status();
-                let body = match read_limited_body(r, MAX_BACKEND_ERROR_BODY_BYTES).await {
-                    Ok(body) => sanitize_bounded_log_text(
-                        &body,
-                        MAX_BACKEND_ERROR_TEXT_CHARS,
-                        false,
-                    ),
-                    Err(error) => {
-                        if matches!(error, BackendBodyReadError::TooLarge { .. }) {
-                            // A backend that violates its response envelope is
-                            // not safe to reuse. Dropping the response cancels
-                            // the request; shutdown also terminates the child.
-                            model.shutdown();
-                        }
-                        yield emit_final_error(
-                            &mut producer,
-                            &identity,
-                            manifest_hash,
-                            prompt_chars,
-                            0,
-                            started_at,
-                            format!("llama-server returned {status}; {error}"),
-                        );
-                        return;
+                if let Err(error) = read_limited_body(r, MAX_BACKEND_ERROR_BODY_BYTES).await {
+                    if matches!(error, BackendBodyReadError::TooLarge { .. }) {
+                        // A backend that violates its response envelope is
+                        // not safe to reuse. Dropping the response cancels
+                        // the request; shutdown also terminates the child.
+                        model.shutdown();
                     }
-                };
+                    yield emit_final_error(
+                        &mut producer,
+                        &identity,
+                        manifest_hash,
+                        prompt_chars,
+                        0,
+                        started_at,
+                        format!("llama-server returned {status}; {error}"),
+                    );
+                    return;
+                }
+                // Do not echo raw backend error text into signed receipts or
+                // remote error responses: backend messages may quote prompt
+                // fragments or internal paths.
                 yield emit_final_error(
                     &mut producer,
                     &identity,
@@ -1848,7 +1853,7 @@ fn run_inference(
                     prompt_chars,
                     0,
                     started_at,
-                    format!("llama-server returned {status}: {body}"),
+                    format!("llama-server returned {status}"),
                 );
                 return;
             }

@@ -421,7 +421,7 @@ fn completion_request_forwards_only_validated_sampling() {
 
     assert_eq!(body["prompt"], serde_json::json!("trusted prompt"));
     assert_eq!(body["stream"], serde_json::json!(true));
-    assert_eq!(body["cache_prompt"], serde_json::json!(true));
+    assert_eq!(body["cache_prompt"], serde_json::json!(false));
     assert_eq!(body["n_predict"], serde_json::json!(64));
     assert_eq!(body["temperature"], serde_json::json!(0.7));
     assert_eq!(body["top_p"], serde_json::json!(0.9));
@@ -820,6 +820,10 @@ fn spawn_command_carries_key_in_env_only_and_hardening_flags() {
     assert!(
         joined.contains("--cors-origins localhost --no-cors-credentials --no-webui --no-slots"),
         "{joined}"
+    );
+    assert!(
+        joined.contains("--no-cache-prompt --cache-ram 0 --cache-reuse 0"),
+        "expected cross-tenant KV-cache isolation flags in argv: {joined}"
     );
     assert!(joined.contains("--host 127.0.0.1"), "{joined}");
     assert!(!joined.contains("--rpc"), "{joined}");
