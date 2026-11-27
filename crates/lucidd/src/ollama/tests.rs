@@ -354,7 +354,8 @@ async fn remote_trust_label_requires_a_matching_and_completed_spot_check() {
         tx.send(result).unwrap();
         let mut payload = serde_json::json!({"done": true});
         assert_eq!(
-            stream_terminal_trust_label(&mut payload, &terminal, &receipt, Some(rx)).await,
+            stream_terminal_trust_label(Some("peer"), &mut payload, &terminal, &receipt, Some(rx))
+                .await,
             Some(expected)
         );
         assert_eq!(payload[TERMINAL_TRUST_LABEL], expected.as_str());
@@ -364,8 +365,20 @@ async fn remote_trust_label_requires_a_matching_and_completed_spot_check() {
 
     let (_tx, slow_check) = tokio::sync::oneshot::channel();
     assert_eq!(
-        completed_trust_label(&receipt, Some(slow_check)).await,
+        completed_trust_label(Some("peer"), &receipt, Some(slow_check)).await,
         Some(TrustLabel::RemoteReceiptVerified)
+    );
+    let local_sharded = FinishedReceipt {
+        verification: ReceiptVerification::Local,
+        commitment: Some([9; 32]),
+    };
+    assert_eq!(
+        completed_trust_label(Some("trusted-circle-sharded"), &local_sharded, None).await,
+        Some(TrustLabel::TrustedCircleSharded)
+    );
+    assert_eq!(
+        completed_trust_label(Some("local"), &local_sharded, None).await,
+        Some(TrustLabel::Local)
     );
     let invalid = FinishedReceipt {
         verification: ReceiptVerification::Failed,
@@ -378,7 +391,8 @@ async fn remote_trust_label_requires_a_matching_and_completed_spot_check() {
     .unwrap();
     let mut payload = serde_json::json!({"done": true});
     assert_eq!(
-        stream_terminal_trust_label(&mut payload, &terminal, &invalid, Some(rx)).await,
+        stream_terminal_trust_label(Some("peer"), &mut payload, &terminal, &invalid, Some(rx))
+            .await,
         None
     );
     assert!(payload.get(TERMINAL_TRUST_LABEL).is_none());

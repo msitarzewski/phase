@@ -2484,7 +2484,9 @@ async fn handle_generate(
             finished_receipt.verification,
             Some(&route_explanation),
         );
-        if let Some(label) = completed_trust_label(&finished_receipt, spot_check).await {
+        if let Some(label) =
+            completed_trust_label(routed_via.as_deref(), &finished_receipt, spot_check).await
+        {
             set_trust_label(&mut resp, label);
         }
         tracing::info!(%job_id, "non-streaming generate complete");
@@ -2492,6 +2494,7 @@ async fn handle_generate(
     }
 
     let model_for_body = model.clone();
+    let routed_via_for_stream = routed_via.clone();
     let ndjson = stream! {
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
@@ -2554,8 +2557,13 @@ async fn handle_generate(
             "eval_duration": total_duration,
         });
         let trust_label = stream_terminal_trust_label(
-            &mut final_value, &terminal, &finished_receipt, spot_check,
-        ).await;
+            routed_via_for_stream.as_deref(),
+            &mut final_value,
+            &terminal,
+            &finished_receipt,
+            spot_check,
+        )
+        .await;
         if let Ok(mut bytes) = serde_json::to_vec(&final_value) {
             bytes.push(b'\n');
             yield Ok(Frame::data(Bytes::from(bytes)));
@@ -2716,7 +2724,9 @@ async fn handle_chat(
             finished_receipt.verification,
             Some(&route_explanation),
         );
-        if let Some(label) = completed_trust_label(&finished_receipt, spot_check).await {
+        if let Some(label) =
+            completed_trust_label(routed_via.as_deref(), &finished_receipt, spot_check).await
+        {
             set_trust_label(&mut resp, label);
         }
         tracing::info!(%job_id, "non-streaming chat complete");
@@ -2725,6 +2735,7 @@ async fn handle_chat(
 
     // ----- streaming path: NDJSON body driven by the JobStream -----------
     let model_for_body = model.clone();
+    let routed_via_for_stream = routed_via.clone();
     let ndjson = stream! {
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
@@ -2797,8 +2808,13 @@ async fn handle_chat(
         };
         let mut final_value = serde_json::to_value(&final_payload).unwrap_or(serde_json::json!({}));
         let trust_label = stream_terminal_trust_label(
-            &mut final_value, &terminal, &finished_receipt, spot_check,
-        ).await;
+            routed_via_for_stream.as_deref(),
+            &mut final_value,
+            &terminal,
+            &finished_receipt,
+            spot_check,
+        )
+        .await;
         if let Ok(mut bytes) = serde_json::to_vec(&final_value) {
             bytes.push(b'\n');
             yield Ok(Frame::data(Bytes::from(bytes)));
@@ -3667,10 +3683,16 @@ fn execution_failure_response(
 }
 
 async fn completed_trust_label(
+    routed_via: Option<&str>,
     receipt: &FinishedReceipt,
     spot_check: Option<SpotCheckResult>,
 ) -> Option<TrustLabel> {
     match receipt.verification {
+        ReceiptVerification::Local
+            if routed_via == Some(TrustLabel::TrustedCircleSharded.as_str()) =>
+        {
+            Some(TrustLabel::TrustedCircleSharded)
+        }
         ReceiptVerification::Local => Some(TrustLabel::Local),
         ReceiptVerification::Verified => {
             // Keep a slow validator from delaying completion indefinitely.
@@ -3734,7 +3756,9 @@ fn inference_stream_response(
         header::TRAILER,
         HeaderValue::from_static(HEADER_TRUST_LABEL),
     );
-    let label = if verification == ReceiptVerification::Local {
+    let label = if routed_via == Some(TrustLabel::TrustedCircleSharded.as_str()) {
+        TrustLabel::TrustedCircleSharded
+    } else if verification == ReceiptVerification::Local {
         TrustLabel::Local
     } else {
         TrustLabel::RemotePending
@@ -3750,6 +3774,7 @@ fn inference_stream_response(
 }
 
 async fn stream_terminal_trust_label(
+    routed_via: Option<&str>,
     value: &mut serde_json::Value,
     terminal: &HttpTerminal,
     receipt: &FinishedReceipt,
@@ -3758,7 +3783,7 @@ async fn stream_terminal_trust_label(
     if !annotate_stream_terminal(value, terminal, receipt) {
         return None;
     }
-    let label = completed_trust_label(receipt, spot_check).await?;
+    let label = completed_trust_label(routed_via, receipt, spot_check).await?;
     value[TERMINAL_TRUST_LABEL] = serde_json::Value::String(label.as_str().to_string());
     Some(label)
 }
