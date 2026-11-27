@@ -70,6 +70,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use futures::stream::{self, StreamExt};
 use phase_artifact_server::{ArtifactStore, BlobId};
 use phase_identity::NodeIdentity;
 use phase_net::PeerId;
@@ -1153,9 +1154,23 @@ async fn publish_model_catalog(
     let _publication = publication.lock().await;
     // Opt-out is explicit for legacy/test transports and happens before any
     // catalog record is written. Production transport always implements this.
-    transport
+    // On WAN Kademlia fleets with NATted peers, `start_providing_key` can hit
+    // its 10s query deadline while waiting for unreachable k-bucket peers even
+    // though reachable relays already accepted ADD_PROVIDER; continue signing
+    // and publishing the fresh catalog record so serving nodes never expire.
+    match transport
         .start_providing_key(CATALOG_SERVICE_KEY.to_vec())
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(error) if error.is::<ProviderDiscoveryUnsupported>() => return Err(error),
+        Err(error) => {
+            warn!(
+                %error,
+                "catalog start_providing_key did not complete cleanly; continuing to publish signed catalog record"
+            );
+        }
+    }
     let loaded = loaded.read().await;
     let installed = installed.read().await;
     let now = unix_ms_now();
@@ -1414,15 +1429,32 @@ impl ModelRegistry {
         let mut total_bytes = 0usize;
         let mut models = Vec::new();
         let now = unix_ms_now();
-        for publisher in publishers {
-            let records = match self
-                .transport
-                .get_record(catalog_publisher_key(&publisher))
-                .await
-            {
-                Ok(records) => records,
-                Err(error) => {
+        // Query bounded publisher catalogs concurrently (preserving sorted
+        // PeerId order via `buffered`) so stale or unreachable publishers
+        // never starve live serving nodes within `CATALOG_QUERY_TIMEOUT`.
+        let transport = self.transport.clone();
+        let mut fetches = stream::iter(publishers)
+            .map(move |publisher| {
+                let transport = transport.clone();
+                async move {
+                    let res = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        transport.get_record(catalog_publisher_key(&publisher)),
+                    )
+                    .await;
+                    (publisher, res)
+                }
+            })
+            .buffered(8);
+        while let Some((publisher, fetched)) = fetches.next().await {
+            let records = match fetched {
+                Ok(Ok(records)) => records,
+                Ok(Err(error)) => {
                     debug!(%error, "catalog publisher lookup failed");
+                    continue;
+                }
+                Err(_) => {
+                    debug!(%publisher, "catalog publisher lookup timed out");
                     continue;
                 }
             };
@@ -2674,7 +2706,7 @@ impl ModelRegistry {
         // unreachable peer never stalls live `/api/chat` routing for 8 seconds.
         if needs_catalog_refresh {
             let _ =
-                tokio::time::timeout(Duration::from_millis(500), self.discover_network_models())
+                tokio::time::timeout(Duration::from_millis(1500), self.discover_network_models())
                     .await;
             let cache = self.network_catalog.read().await;
             let candidates = lookup_cached(&cache);
