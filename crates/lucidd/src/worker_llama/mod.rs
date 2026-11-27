@@ -71,7 +71,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_stream::stream;
 use bytes::{Bytes, BytesMut};
@@ -257,6 +257,84 @@ impl std::fmt::Debug for RpcClusterGate {
     }
 }
 
+/// Backend label reported for models held by [`LlamaCppWorker`]; matches the
+/// `backend` of the `ModelCapabilities` this node advertises for them.
+pub const LLAMA_CPP_BACKEND: &str = "llama.cpp";
+
+/// What a resident backend instance serves. One `model_id` can be resident
+/// twice: llama.cpp needs a separate `--embeddings` process for embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResidentModelKind {
+    /// Text generation (completion and chat).
+    Generation,
+    /// Embedding vectors (`llama-server --embeddings`).
+    Embedding,
+}
+
+/// One model a worker currently holds in a running backend process that has
+/// passed its readiness check. Every field is observed by the worker's own
+/// process supervision; nothing is estimated. In particular there are no
+/// memory or VRAM figures: no backend here reports them reliably, and a
+/// guess would be fabricated telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentModelInfo {
+    /// Identifier the model was loaded under: the job's `model_cid`, which in
+    /// production is the lowercase-hex content address of the verified model.
+    pub model_id: String,
+    /// Backend holding the model ([`LLAMA_CPP_BACKEND`] or
+    /// [`crate::worker_mlx::MLX_BACKEND`]).
+    pub backend: &'static str,
+    pub kind: ResidentModelKind,
+    /// `true` when the process runs with Tier-1 trusted-circle `ggml-rpc`
+    /// devices (`--rpc`), so prompt-derived activations may leave this host.
+    /// Enrolled-peer devices (`--llama-rpc-peers`) are verified attached: a
+    /// load or respawn that fails to attach one is refused. Operator loopback
+    /// `--llama-rpc-servers` cannot be observed from here, and the pinned
+    /// `llama-server` drops an unreachable one and runs its layers locally,
+    /// so for those `true` can overstate where layers ran but never
+    /// understate it.
+    pub trusted_circle_sharded: bool,
+    /// Wall-clock time the backend process now serving the model passed its
+    /// readiness check. A crashed process that was respawned reports the
+    /// respawn's time.
+    pub loaded_since: SystemTime,
+}
+
+/// Cloneable, backend-neutral source of a worker's [`ResidentModelInfo`]
+/// list, for `/api/ps`. Worker-backed sources hold only a weak reference, so
+/// they never keep a dropped worker, or its child processes, alive.
+#[derive(Clone)]
+pub struct ResidentModels(Arc<dyn Fn() -> Vec<ResidentModelInfo> + Send + Sync>);
+
+impl ResidentModels {
+    pub fn new(source: impl Fn() -> Vec<ResidentModelInfo> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(source))
+    }
+
+    /// Source for a node whose worker holds no model processes (echo,
+    /// consume-only): always empty, which is the truthful answer there.
+    pub fn none() -> Self {
+        Self::new(Vec::new)
+    }
+
+    /// Models resident right now, ordered by `(model_id, kind)`.
+    pub fn snapshot(&self) -> Vec<ResidentModelInfo> {
+        (self.0)()
+    }
+}
+
+impl Default for ResidentModels {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl std::fmt::Debug for ResidentModels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResidentModels(..)")
+    }
+}
+
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self {
@@ -280,6 +358,32 @@ impl Default for LlamaCppConfig {
 /// Upper bound on `--rpc` endpoints (explicit loopback servers plus enrolled
 /// peer proxies) handed to one `llama-server`.
 pub const MAX_RPC_ENDPOINTS: usize = 16;
+
+/// Enrolled peers whose RPC device the current `llama-server` child did not
+/// attach (empty without peer offload). The pinned `b12651` build does not
+/// fail a load on an unreachable `--rpc` device: it drops the device and
+/// runs those layers locally, which must not pass as trusted-circle work.
+fn unattached_rpc_peers(proxies: Option<&rpc_peers::RpcPeerProxySet>) -> Vec<String> {
+    proxies
+        .map(|proxies| {
+            proxies
+                .unattached_peers()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Caller-facing refusal for a load whose peer devices did not all attach.
+/// Peer ids go to the log only: the caller may be a remote requester, and
+/// circle membership is not theirs to learn.
+fn rpc_peers_not_attached() -> WorkerError {
+    WorkerError::Other(
+        "trusted-circle RPC layer offload did not attach every enrolled peer (unreachable, refused, or assigned no layers); refusing to run those layers on this host instead"
+            .into(),
+    )
+}
 
 fn rpc_offload_refused() -> WorkerError {
     WorkerError::Other(
@@ -458,6 +562,97 @@ struct LoadedModel {
     /// Join handle for the supervisor task. Held so `Drop` of the worker can
     /// abort it (`kill_on_drop(true)` then terminates the child).
     supervisor: tokio::task::JoinHandle<()>,
+    /// What this instance is and whether its child is healthy right now;
+    /// shared with the supervisor, which keeps it current.
+    residency: Arc<Residency>,
+}
+
+/// Residency record of one loaded `llama-server` instance: fixed facts about
+/// the instance plus the health state its supervisor observes.
+#[derive(Debug)]
+struct Residency {
+    /// Bare model id (the job's `model_cid`), without the embedding suffix of
+    /// the `loaded_models` key.
+    model_id: String,
+    kind: ResidentModelKind,
+    /// Spawned with at least one `--rpc` endpoint (see
+    /// [`ResidentModelInfo::trusted_circle_sharded`]).
+    rpc_layer_offload: bool,
+    state: std::sync::Mutex<ResidencyState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidencyState {
+    /// The current child passed `/health` at `since` and has passed every
+    /// periodic probe since.
+    Healthy { since: SystemTime },
+    /// The current child is still running, but its latest periodic `/health`
+    /// probe failed.
+    Degraded { since: SystemTime },
+    /// No healthy child: it exited, is being respawned, or was stopped.
+    Down,
+}
+
+impl Residency {
+    /// Record for a child that passed its `/health` gate at `since`.
+    fn healthy(
+        model_id: &str,
+        embeddings: bool,
+        rpc_layer_offload: bool,
+        since: SystemTime,
+    ) -> Self {
+        Self {
+            model_id: model_id.to_string(),
+            kind: if embeddings {
+                ResidentModelKind::Embedding
+            } else {
+                ResidentModelKind::Generation
+            },
+            rpc_layer_offload,
+            state: std::sync::Mutex::new(ResidencyState::Healthy { since }),
+        }
+    }
+
+    fn update(&self, next: impl FnOnce(ResidencyState) -> ResidencyState) {
+        // A poisoned lock only means a panic elsewhere mid-update; the state
+        // is a plain `Copy` value and stays meaningful.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = next(*state);
+    }
+
+    /// A (re)spawned child passed its `/health` gate.
+    fn mark_healthy_now(&self) {
+        self.update(|_| ResidencyState::Healthy {
+            since: SystemTime::now(),
+        });
+    }
+
+    fn record_probe(&self, ok: bool) {
+        self.update(|state| match (state, ok) {
+            (ResidencyState::Degraded { since }, true) => ResidencyState::Healthy { since },
+            (ResidencyState::Healthy { since }, false) => ResidencyState::Degraded { since },
+            (unchanged, _) => unchanged,
+        });
+    }
+
+    fn mark_down(&self) {
+        self.update(|_| ResidencyState::Down);
+    }
+
+    /// `Some(since)` only while the current child is healthy.
+    fn healthy_since(&self) -> Option<SystemTime> {
+        match *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ResidencyState::Healthy { since } => Some(since),
+            ResidencyState::Degraded { .. } | ResidencyState::Down => None,
+        }
+    }
 }
 
 impl LoadedModel {
@@ -516,6 +711,29 @@ struct Inner {
     ports_in_use: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
 }
 
+fn resident_models_of(inner: &Inner) -> Vec<ResidentModelInfo> {
+    let mut resident: Vec<ResidentModelInfo> = inner
+        .loaded_models
+        .iter()
+        .filter_map(|entry| {
+            let model = entry.value();
+            if model.is_failed() {
+                return None;
+            }
+            let residency = &model.residency;
+            Some(ResidentModelInfo {
+                model_id: residency.model_id.clone(),
+                backend: LLAMA_CPP_BACKEND,
+                kind: residency.kind,
+                trusted_circle_sharded: residency.rpc_layer_offload,
+                loaded_since: residency.healthy_since()?,
+            })
+        })
+        .collect();
+    resident.sort_by(|a, b| (&a.model_id, a.kind).cmp(&(&b.model_id, b.kind)));
+    resident
+}
+
 impl LlamaCppWorker {
     /// Construct a fresh worker. No subprocesses are spawned until the
     /// first inference request for a given model.
@@ -565,6 +783,25 @@ impl LlamaCppWorker {
     /// host — routing and privacy decisions must treat it accordingly.
     pub fn uses_rpc_layer_offload(&self) -> bool {
         !self.inner.config.rpc_servers.is_empty() || self.inner.config.rpc_peer_offload.is_some()
+    }
+
+    /// Models resident right now: every loaded instance whose current
+    /// `llama-server` child has passed `/health` and every periodic probe
+    /// since, and has not been retired. Instances that are loading,
+    /// crashed, respawning, failing probes, or shutting down are omitted.
+    pub fn resident_models(&self) -> Vec<ResidentModelInfo> {
+        resident_models_of(&self.inner)
+    }
+
+    /// [`ResidentModels`] source for this worker that does not keep it alive.
+    pub fn resident_models_handle(&self) -> ResidentModels {
+        let inner = Arc::downgrade(&self.inner);
+        ResidentModels::new(move || {
+            inner
+                .upgrade()
+                .map(|inner| resident_models_of(&inner))
+                .unwrap_or_default()
+        })
     }
 
     /// Honest execution label for jobs served by this worker:
@@ -748,12 +985,22 @@ impl LlamaCppWorker {
         )
         .await
         .map_err(|e| WorkerError::Other(format!("llama-server health check: {e}")))?;
+        let healthy_since = SystemTime::now();
 
         // An RPC cold load can take minutes; if the operator withdrew the
         // trusted-circle opt-in meanwhile, refuse admission (dropping `child`
         // kills it and `port_guard` releases its port).
         if !self.rpc_offload_permitted() {
             return Err(rpc_offload_refused());
+        }
+        let unattached = unattached_rpc_peers(rpc_peer_proxies.as_ref());
+        if !unattached.is_empty() {
+            tracing::warn!(
+                model = %model_id,
+                peers = ?unattached,
+                "llama-server passed /health without attaching every trusted-circle RPC peer; refusing the load"
+            );
+            return Err(rpc_peers_not_attached());
         }
 
         // Admission is committed: the replacement is spawned and healthy.
@@ -768,6 +1015,12 @@ impl LlamaCppWorker {
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (kill_tx, kill_rx) = watch::channel(false);
         let (stopped_tx, stopped_rx) = watch::channel(false);
+        let residency = Arc::new(Residency::healthy(
+            model_id,
+            embeddings,
+            !rpc_endpoints.is_empty(),
+            healthy_since,
+        ));
 
         // The map entry is keyed by the composite `load_key`, but the
         // `model_id` carried into telemetry stays the bare alias so logs
@@ -789,6 +1042,7 @@ impl LlamaCppWorker {
             embeddings,
             rpc_endpoints,
             rpc_peer_proxies,
+            residency: residency.clone(),
         };
 
         // The supervisor task owns the child and its port for the model's
@@ -805,6 +1059,7 @@ impl LlamaCppWorker {
             kill: kill_tx,
             stopped: stopped_rx,
             supervisor,
+            residency,
         });
         // `load_gate` makes this insert a single-flight commit. Keep the
         // replacement guard as defense in depth if the synchronization model
@@ -1299,6 +1554,8 @@ struct SupervisorInput {
     /// This model's enrolled-peer proxies, if any. Dropped only after the
     /// last child is reaped, which closes every tunnel it carried.
     rpc_peer_proxies: Option<rpc_peers::RpcPeerProxySet>,
+    /// Kept current with what supervision observes about the child.
+    residency: Arc<Residency>,
 }
 
 /// Long-running task: watch the child, restart on crash up to 3 times in
@@ -1324,6 +1581,7 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
         embeddings,
         rpc_endpoints,
         rpc_peer_proxies,
+        residency,
     } = input;
     let port = port_guard.port();
     let mut slot = Some(initial_child);
@@ -1355,8 +1613,11 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
             &model_path,
             embeddings,
             &rpc_endpoints,
+            rpc_peer_proxies.as_ref(),
+            &residency,
         ) => false,
     };
+    residency.mark_down();
 
     if let Some(mut child) = slot.take() {
         if killed {
@@ -1401,6 +1662,8 @@ async fn supervise(
     model_path: &Path,
     embeddings: bool,
     rpc_endpoints: &[String],
+    rpc_peer_proxies: Option<&rpc_peers::RpcPeerProxySet>,
+    residency: &Residency,
 ) {
     // Sliding window of recent crash timestamps. If we accumulate three
     // entries inside a 60 s window, give up.
@@ -1444,8 +1707,10 @@ async fn supervise(
                     match client.get(&health_url).timeout(Duration::from_secs(5)).send().await {
                         Ok(r) if r.status().is_success() => {
                             consecutive_health_fail = 0;
+                            residency.record_probe(true);
                         }
                         _ => {
+                            residency.record_probe(false);
                             consecutive_health_fail += 1;
                             if consecutive_health_fail >= 5 {
                                 tracing::warn!(
@@ -1462,6 +1727,7 @@ async fn supervise(
         };
         // The child has exited (or was killed and reaped) either way.
         *slot = None;
+        residency.mark_down();
 
         match exit_kind {
             ChildExit::CleanExit => {
@@ -1501,6 +1767,11 @@ async fn supervise(
                     );
                     return;
                 }
+                // Tunnels of the crashed child may linger while closing; only
+                // the respawn's own count as attached.
+                if let Some(proxies) = rpc_peer_proxies {
+                    proxies.begin_respawn();
+                }
                 match llama_server_command(
                     &config.server_binary_path,
                     model_path,
@@ -1534,6 +1805,16 @@ async fn supervise(
                             // `slot`.
                             return;
                         }
+                        let unattached = unattached_rpc_peers(rpc_peer_proxies);
+                        if !unattached.is_empty() {
+                            tracing::warn!(
+                                model = %model_id,
+                                peers = ?unattached,
+                                "respawned llama-server did not attach every trusted-circle RPC peer; retiring it"
+                            );
+                            return;
+                        }
+                        residency.mark_healthy_now();
                     }
                     Err(e) => {
                         tracing::error!(model = %model_id, error = %e, "failed to respawn");

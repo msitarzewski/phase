@@ -215,19 +215,116 @@ async fn start_fixture(
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let state = FixtureState {
+    let app = fixture_router(FixtureState {
         mode,
         bodies: bodies.clone(),
-    };
-    let app = Router::new()
-        .route("/health", get(fixture_health))
-        .route("/v1/completions", post(fixture_completion))
-        .route("/v1/chat/completions", post(fixture_completion))
-        .with_state(state);
+    });
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     (port, bodies, task)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fixture_router(state: FixtureState) -> Router {
+    Router::new()
+        .route("/health", get(fixture_health))
+        .route("/v1/completions", post(fixture_completion))
+        .route("/v1/chat/completions", post(fixture_completion))
+        .with_state(state)
+}
+
+/// Internal subprocess entrypoint: a minimal `mlx_lm.server` stand-in that
+/// serves the fixture router on the `--port` the worker chose, so a test can
+/// drive the worker's real spawn, readiness, and crash supervision. Ignored
+/// in ordinary runs; only `serving_runtime` re-enters it, with its marker.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "internal mlx_lm.server fixture subprocess entrypoint"]
+fn fixture_mlx_server_process_entrypoint() {
+    if std::env::var_os("PHASE_FAKE_MLX_SERVER_PROCESS").is_none() {
+        eprintln!("internal fixture entrypoint unavailable outside its launcher");
+        return;
+    }
+    let port: u16 = std::env::var("PHASE_FAKE_MLX_PORT")
+        .expect("launcher sets PHASE_FAKE_MLX_PORT")
+        .parse()
+        .expect("fixture port is a u16");
+    let exit_after = std::env::var("PHASE_FAKE_MLX_EXIT_AFTER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fixture runtime");
+    runtime.block_on(async move {
+        if let Some(ms) = exit_after {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                std::process::exit(3);
+            });
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("fixture binds the worker-chosen port");
+        let app = fixture_router(FixtureState {
+            mode: FixtureMode::Success,
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        });
+        axum::serve(listener, app).await.expect("fixture serves");
+    });
+}
+
+/// Pinned-runtime stand-in that re-enters this test executable as a real
+/// HTTP backend on the port the worker passes, optionally exiting on its own
+/// after `exit_after_ms` to simulate a crash.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn serving_runtime(root: &Path, exit_after_ms: Option<u64>) -> PathBuf {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let test_exe = std::env::current_exe().expect("test executable");
+    let test_exe = test_exe.to_str().expect("UTF-8 test executable path");
+    let exit_after = exit_after_ms.map(|ms| ms.to_string()).unwrap_or_default();
+    let script = format!(
+        r#"#!/bin/sh
+port=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --port)
+            [ "$#" -ge 2 ] || exit 64
+            port="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+[ -n "$port" ] || exit 64
+export PHASE_FAKE_MLX_SERVER_PROCESS=1
+export PHASE_FAKE_MLX_PORT="$port"
+export PHASE_FAKE_MLX_EXIT_AFTER_MS={exit_after}
+exec {exe} --exact worker_mlx::tests::fixture_mlx_server_process_entrypoint --ignored --nocapture
+"#,
+        exit_after = quote(&exit_after),
+        exe = quote(test_exe),
+    );
+    let runtime = root.join("serving-mlx-lm-server");
+    std::fs::write(&runtime, script).expect("write serving fixture runtime");
+    set_mode(&runtime, 0o555);
+    runtime
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn serving_worker(root: &Path, exit_after_ms: Option<u64>) -> (MlxWorker, PathBuf, PathBuf) {
+    let runtime = serving_runtime(root, exit_after_ms);
+    let bundle = create_immutable_bundle(root);
+    let metadata = inspect_mlx_bundle(&bundle).unwrap();
+    let mut config = MlxConfig::new(runtime.clone(), bundle.clone(), metadata.model_cid, 0);
+    config.model_load_timeout = Duration::from_secs(20);
+    config.shutdown_timeout = Duration::from_millis(500);
+    config.max_start_retries = 0;
+    let worker = MlxWorker::new(NodeIdentity::generate(), config).unwrap();
+    (worker, runtime, bundle)
 }
 
 #[cfg(unix)]
@@ -1019,6 +1116,96 @@ async fn abnormal_backend_end_forces_content_rehash_on_next_spawn() {
     assert_eq!(worker.inner.content_rehash_count.load(Ordering::Acquire), 1);
 
     fixture.abort();
+    set_mode(&runtime, 0o755);
+    thaw_for_cleanup(&bundle);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_models_report_only_a_ready_running_backend() {
+    // Serialize with the other re-exec'd fixture processes of this binary.
+    let _gate = crate::shard_worker::shard_rpc_test_support::two_node_gate().await;
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runtime, bundle) = serving_worker(directory.path(), None);
+    let handle = worker.resident_models_handle();
+    assert!(worker.resident_models().is_empty(), "nothing is loaded yet");
+    assert!(handle.snapshot().is_empty());
+
+    let before = SystemTime::now();
+    worker
+        .preload()
+        .await
+        .expect("fixture backend becomes ready");
+    let after = SystemTime::now();
+    let resident = worker.resident_models();
+    assert_eq!(resident.len(), 1, "{resident:?}");
+    let model = &resident[0];
+    assert_eq!(model.model_id, worker.model_cid().to_hex());
+    assert_eq!(model.backend, MLX_BACKEND);
+    assert_eq!(model.kind, ResidentModelKind::Generation);
+    assert!(!model.trusted_circle_sharded);
+    assert!(before <= model.loaded_since && model.loaded_since <= after);
+    assert_eq!(handle.snapshot(), resident);
+
+    // Residency is read without the async slot lock that a cold load holds
+    // for its whole duration, so it never stalls or flickers behind one.
+    let slot = worker.inner.server.lock().await;
+    assert_eq!(worker.resident_models(), resident);
+    // A Phase-initiated stop retires the backend at once.
+    slot.as_ref()
+        .expect("ready backend in slot")
+        .shutdown(Duration::from_secs(2))
+        .await;
+    assert!(worker.resident_models().is_empty());
+    drop(slot);
+
+    // Reloading reports the new backend's own readiness time.
+    worker.preload().await.expect("backend reloads");
+    let reloaded = worker.resident_models();
+    assert_eq!(reloaded.len(), 1);
+    assert!(reloaded[0].loaded_since >= model.loaded_since);
+
+    // The handle holds the worker weakly: once it is gone, nothing is resident.
+    drop(worker);
+    assert!(handle.snapshot().is_empty());
+    set_mode(&runtime, 0o755);
+    thaw_for_cleanup(&bundle);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crashed_backend_drops_out_of_resident_models() {
+    let _gate = crate::shard_worker::shard_rpc_test_support::two_node_gate().await;
+    let directory = tempfile::tempdir().unwrap();
+    let (worker, runtime, bundle) = serving_worker(directory.path(), Some(3_000));
+    worker
+        .preload()
+        .await
+        .expect("fixture backend becomes ready");
+    assert_eq!(worker.resident_models().len(), 1);
+
+    // The backend exits on its own; supervision notices without any request.
+    let started = Instant::now();
+    while !worker.resident_models().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a dead backend must not stay reported as resident"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    set_mode(&runtime, 0o755);
+    thaw_for_cleanup(&bundle);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn failed_readiness_never_reports_a_resident_model() {
+    let directory = tempfile::tempdir().unwrap();
+    // The idle stand-in runtime never answers `/health`.
+    let (runtime, bundle, config) = create_runtime_and_bundle(directory.path(), 0);
+    let worker = MlxWorker::new(NodeIdentity::generate(), config).unwrap();
+    assert!(worker.preload().await.is_err());
+    assert!(worker.resident_models().is_empty());
     set_mode(&runtime, 0o755);
     thaw_for_cleanup(&bundle);
 }

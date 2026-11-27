@@ -28,7 +28,16 @@
 //! - belongs to exactly one spawned model: a tunnel that ends from the remote
 //!   side (provider revoked, idle/session bound, peer lost) retires *that*
 //!   model only, whose `llama-server` would otherwise abort on the next use of
-//!   its dead `ggml-rpc` socket. Other resident models are unaffected.
+//!   its dead `ggml-rpc` socket. Other resident models are unaffected;
+//! - reports whether its peer's device is attached. The pinned `b12651`
+//!   `llama-server` does not fail a load whose `--rpc` device it cannot reach:
+//!   it logs `Failed to connect`, drops the device, and runs those layers
+//!   locally. The worker therefore refuses any load (or respawn) after which
+//!   a peer holds no tunnel established for that spawn, rather than serving
+//!   it under a trusted-circle label it did not earn. Tunnels left from a
+//!   crashed child never count for its respawn. A local process that speaks
+//!   `ggml-rpc` to the proxy port itself could still make an unattached
+//!   device look attached (a mislabel only: its layers would run here).
 //!
 //! Residual exposure: a proxy port is still reachable by local processes that
 //! speak `ggml-rpc` themselves. They reach only the enrolled provider's
@@ -42,7 +51,7 @@
 //! serves one tunnel at a time; further connections wait in its backlog.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,10 +221,12 @@ impl RpcPeerOffload {
         let (losses_tx, remote_losses) = watch::channel(0_u64);
         let losses_tx = Arc::new(losses_tx);
         let live = Arc::new(AtomicUsize::new(0));
+        let spawn_generation = Arc::new(AtomicU64::new(0));
         let mut proxies = Vec::with_capacity(self.peers.len());
         for &peer in &self.peers {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
             let endpoint = listener.local_addr()?;
+            let attached = Arc::new(std::sync::Mutex::new(Attachment::default()));
             let accept_task = tokio::spawn(run_rpc_peer_proxy(
                 listener,
                 ProxyContext {
@@ -225,6 +236,8 @@ impl RpcPeerOffload {
                     config: self.tunnel.clone(),
                     losses: losses_tx.clone(),
                     live: live.clone(),
+                    attached: attached.clone(),
+                    spawn_generation: spawn_generation.clone(),
                     pending: Arc::new(Semaphore::new(MAX_PENDING_RPC_HANDSHAKES)),
                     tunnel_slots: Arc::new(Semaphore::new(self.tunnel.max_connections_per_peer)),
                 },
@@ -232,12 +245,15 @@ impl RpcPeerOffload {
             tracing::debug!(%peer, %endpoint, "bound trusted-circle RPC peer proxy");
             proxies.push(RpcPeerProxy {
                 endpoint,
+                peer,
+                attached,
                 accept_task,
             });
         }
         Ok(RpcPeerProxySet {
             proxies,
             remote_losses,
+            spawn_generation,
             #[cfg(test)]
             live,
         })
@@ -258,6 +274,9 @@ impl std::fmt::Debug for RpcPeerOffload {
 pub(crate) struct RpcPeerProxySet {
     proxies: Vec<RpcPeerProxy>,
     remote_losses: watch::Receiver<u64>,
+    /// Bumped before every respawn of the owning model, so only tunnels the
+    /// current child established count as attached.
+    spawn_generation: Arc<AtomicU64>,
     #[cfg(test)]
     live: Arc<AtomicUsize>,
 }
@@ -277,6 +296,32 @@ impl RpcPeerProxySet {
         self.remote_losses.clone()
     }
 
+    /// Peers, in order, that hold no tunnel established for the current
+    /// spawn. After a healthy load every peer must hold one: `llama-server`
+    /// keeps its `ggml-rpc` socket for the life of the device, and drops
+    /// (and runs locally) any device it could not attach.
+    pub(crate) fn unattached_peers(&self) -> Vec<PeerId> {
+        let generation = self.spawn_generation.load(Ordering::SeqCst);
+        self.proxies
+            .iter()
+            .filter(|proxy| {
+                let attachment = proxy
+                    .attached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                attachment.generation != generation || attachment.tunnels == 0
+            })
+            .map(|proxy| proxy.peer)
+            .collect()
+    }
+
+    /// Start a new spawn generation before respawning the owning model:
+    /// tunnels of the previous child (which may linger while closing) no
+    /// longer count as attached.
+    pub(crate) fn begin_respawn(&self) {
+        self.spawn_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Connections currently being handled (handshaking or tunnelled).
     #[cfg(test)]
     pub(crate) fn live_connections(&self) -> usize {
@@ -286,7 +331,62 @@ impl RpcPeerProxySet {
 
 struct RpcPeerProxy {
     endpoint: SocketAddr,
+    peer: PeerId,
+    /// Tunnels to `peer` established through this proxy and still live.
+    attached: Arc<std::sync::Mutex<Attachment>>,
     accept_task: JoinHandle<()>,
+}
+
+/// Live tunnels a proxy established during one spawn generation.
+#[derive(Debug, Default)]
+struct Attachment {
+    generation: u64,
+    tunnels: usize,
+}
+
+/// Counts one established tunnel, in the spawn generation its connection
+/// arrived in, for as long as it lives. A tunnel of an older generation
+/// (the connection of a child that has since crashed) never counts and
+/// never disturbs a newer generation's count.
+struct AttachedTunnel {
+    attachment: Arc<std::sync::Mutex<Attachment>>,
+    generation: u64,
+    counted: bool,
+}
+
+impl AttachedTunnel {
+    fn new(attachment: &Arc<std::sync::Mutex<Attachment>>, generation: u64) -> Self {
+        let mut current = attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generation > current.generation {
+            *current = Attachment {
+                generation,
+                tunnels: 0,
+            };
+        }
+        let counted = generation == current.generation;
+        if counted {
+            current.tunnels += 1;
+        }
+        Self {
+            attachment: attachment.clone(),
+            generation,
+            counted,
+        }
+    }
+}
+
+impl Drop for AttachedTunnel {
+    fn drop(&mut self) {
+        let mut current = self
+            .attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.counted && current.generation == self.generation {
+            current.tunnels = current.tunnels.saturating_sub(1);
+        }
+    }
 }
 
 impl Drop for RpcPeerProxy {
@@ -305,6 +405,9 @@ struct ProxyContext {
     config: RpcPeerTunnelConfig,
     losses: Arc<watch::Sender<u64>>,
     live: Arc<AtomicUsize>,
+    /// Established tunnels of this proxy (see [`AttachedTunnel`]).
+    attached: Arc<std::sync::Mutex<Attachment>>,
+    spawn_generation: Arc<AtomicU64>,
     /// Connections still waiting for their HELLO.
     pending: Arc<Semaphore>,
     /// Established tunnels (past HELLO), capped per peer and model.
@@ -340,8 +443,11 @@ async fn run_rpc_peer_proxy(listener: TcpListener, context: ProxyContext) {
                 while tunnels.try_join_next().is_some() {}
                 context.live.fetch_add(1, Ordering::SeqCst);
                 let context = context.clone();
+                // A connection belongs to the spawn generation it arrived in,
+                // however long its tunnel takes to open.
+                let generation = context.spawn_generation.load(Ordering::SeqCst);
                 tunnels.spawn(async move {
-                    serve_rpc_peer_connection(&context, local, pending).await;
+                    serve_rpc_peer_connection(&context, local, pending, generation).await;
                     context.live.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -360,6 +466,7 @@ async fn serve_rpc_peer_connection(
     context: &ProxyContext,
     mut local: TcpStream,
     pending: tokio::sync::OwnedSemaphorePermit,
+    generation: u64,
 ) {
     let peer = context.peer;
     // `ggml-rpc` issues one small command per graph step; never batch them.
@@ -403,8 +510,9 @@ async fn serve_rpc_peer_connection(
     let tunnel = match context.discovery.open_shard_rpc_tunnel(peer, open).await {
         Ok(tunnel) => tunnel,
         Err(error) => {
-            // Dropping `local` fails `llama-server`'s RPC handshake, so the
-            // load fails instead of silently running elsewhere.
+            // Dropping `local` fails `llama-server`'s RPC handshake. It then
+            // drops this device and loads its layers locally, which the
+            // worker refuses (`unattached_peers`).
             tracing::warn!(%peer, error = %format!("{error:#}"), "trusted-circle RPC tunnel was not established");
             return;
         }
@@ -414,6 +522,9 @@ async fn serve_rpc_peer_connection(
         tracing::warn!(%peer, "cluster_enabled turned off during tunnel setup; dropping it");
         return;
     }
+    // Counted before the HELLO is relayed, so `llama-server` cannot finish
+    // attaching this device (and pass `/health`) before it shows here.
+    let _attached = AttachedTunnel::new(&context.attached, generation);
 
     // Replay the HELLO header we consumed, then splice the rest.
     let (reader, writer) = local.into_split();
@@ -681,7 +792,12 @@ mod tests {
             .expect("proxy endpoints satisfy the Wave 1 loopback rule");
 
         // What llama-server does: connect to the --rpc endpoint and speak.
+        assert_eq!(proxies.unattached_peers(), [pair.provider_peer]);
         let rpc = rpc_client(endpoint).await;
+        assert!(
+            proxies.unattached_peers().is_empty(),
+            "an established tunnel attaches the peer's device"
+        );
         let payload = pattern(3 * 1024 * 1024 + 1, 0x77);
         let expected = payload.clone();
         let (mut reader, mut writer) = rpc.into_split();
@@ -708,6 +824,42 @@ mod tests {
         assert!(pair.backend.wait_live(0, Duration::from_secs(5)).await);
         assert!(wait_until(Duration::from_secs(5), || proxies.live_connections() == 0).await);
         assert_eq!(*losses.borrow(), 0);
+        assert_eq!(proxies.unattached_peers(), [pair.provider_peer]);
+
+        // Generations only move forward: a tunnel whose connection arrived
+        // in an older generation never counts and never resets a newer one.
+        {
+            let attachment = Arc::new(std::sync::Mutex::new(Attachment::default()));
+            let current = AttachedTunnel::new(&attachment, 2);
+            let stale = AttachedTunnel::new(&attachment, 1);
+            assert_eq!(attachment.lock().unwrap().tunnels, 1);
+            drop(stale);
+            assert_eq!(attachment.lock().unwrap().tunnels, 1);
+            drop(current);
+            assert_eq!(attachment.lock().unwrap().tunnels, 0);
+        }
+
+        // A respawn counts only its own tunnels: one still open from the
+        // previous child no longer attaches the device.
+        let previous_child = rpc_client(endpoint).await;
+        assert!(proxies.unattached_peers().is_empty());
+        proxies.begin_respawn();
+        assert_eq!(
+            proxies.unattached_peers(),
+            [pair.provider_peer],
+            "a lingering tunnel of the crashed child must not count for its respawn"
+        );
+        let respawned_child = rpc_client(endpoint).await;
+        assert!(proxies.unattached_peers().is_empty());
+        drop(previous_child);
+        assert!(wait_until(Duration::from_secs(5), || proxies.live_connections() == 1).await);
+        assert!(
+            proxies.unattached_peers().is_empty(),
+            "the old tunnel closing does not detach the respawn's device"
+        );
+        drop(respawned_child);
+        assert!(wait_until(Duration::from_secs(5), || proxies.live_connections() == 0).await);
+        assert_eq!(proxies.unattached_peers(), [pair.provider_peer]);
 
         // Dropping the proxy set closes the listener.
         drop(proxies);
@@ -800,6 +952,11 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || proxies.live_connections() == 0).await);
         assert_eq!(pair.backend.accepted.load(Ordering::SeqCst), 0);
         assert_eq!(*proxies.remote_losses().borrow(), 0);
+        assert_eq!(
+            proxies.unattached_peers(),
+            [pair.provider_peer],
+            "a refused tunnel never counts as an attached device"
+        );
 
         // Per-peer connection cap.
         let pair = provider_and_coordinator(true).await;

@@ -22,9 +22,10 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
+use lucidd::worker_llama::ResidentModelKind;
 use lucidd::{LlamaCppConfig, LlamaCppWorker};
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
@@ -612,6 +613,155 @@ async fn embedding_streams_vectors_and_signs_receipt() {
 }
 
 // -----------------------------------------------------------------------
+// Wave 3: honest resident-model reporting
+// -----------------------------------------------------------------------
+
+/// `(model_id, kind, trusted_circle_sharded)` of every resident model.
+fn resident_summary(worker: &LlamaCppWorker) -> Vec<(String, ResidentModelKind, bool)> {
+    worker
+        .resident_models()
+        .into_iter()
+        .map(|model| (model.model_id, model.kind, model.trusted_circle_sharded))
+        .collect()
+}
+
+/// Poll until `predicate` holds for the worker's resident models.
+async fn wait_resident(
+    worker: &LlamaCppWorker,
+    within: Duration,
+    predicate: impl Fn(&[lucidd::worker_llama::ResidentModelInfo]) -> bool,
+) -> Vec<lucidd::worker_llama::ResidentModelInfo> {
+    let started = std::time::Instant::now();
+    loop {
+        let resident = worker.resident_models();
+        if predicate(&resident) {
+            return resident;
+        }
+        assert!(
+            started.elapsed() < within,
+            "resident models never reached the expected state: {resident:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn run_embedding_to_final(worker: &LlamaCppWorker, model_id: &str) -> Completion {
+    let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+        model_cid: model_id.to_string(),
+        input: vec!["resident".to_string()],
+    }))
+    .sign_with(&NodeIdentity::generate())
+    .expect("sign embedding manifest");
+    let (_handle, mut stream) = worker.execute(manifest).await.expect("dispatch embedding");
+    while let Some(event) = stream.next().await {
+        if let JobEvent::Final { result, error } = event {
+            assert!(error.is_none(), "{error:?}");
+            return result.completion;
+        }
+    }
+    panic!("embedding stream ended without Final");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_models_list_only_healthy_instances_by_kind() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // The fixture answers `/health` with 503 for its first 1.5 s: a cold load
+    // in progress is not resident yet.
+    let fx = flexible_worker(
+        &["alpha"],
+        2,
+        3,
+        &[("FAKE_LLAMA_WARMUP_MS", "1500")],
+        Duration::from_secs(10),
+        |_| {},
+    );
+    let handle = fx.worker.resident_models_handle();
+    assert!(handle.snapshot().is_empty(), "nothing is loaded yet");
+
+    let before = SystemTime::now();
+    let loading = tokio::spawn({
+        let worker = fx.worker.clone();
+        async move { run_to_final(&worker, "alpha").await }
+    });
+    // Wait until the child exists, then sample residency while it warms up.
+    let started = std::time::Instant::now();
+    while spawned_models(fx.dir.path()).is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(5), "no spawn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for _ in 0..10 {
+        assert!(
+            fx.worker.resident_models().is_empty(),
+            "a loading child must not be reported resident"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (completion, error) = loading.await.unwrap().expect("dispatch alpha");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    assert_eq!(
+        run_embedding_to_final(&fx.worker, "alpha").await,
+        Completion::Stop
+    );
+    let after = SystemTime::now();
+
+    // Chat and embedding flavours are separate processes, reported apart.
+    let resident = fx.worker.resident_models();
+    assert_eq!(
+        resident_summary(&fx.worker),
+        [
+            ("alpha".to_string(), ResidentModelKind::Generation, false),
+            ("alpha".to_string(), ResidentModelKind::Embedding, false),
+        ]
+    );
+    for model in &resident {
+        assert_eq!(model.backend, lucidd::worker_llama::LLAMA_CPP_BACKEND);
+        assert!(before <= model.loaded_since && model.loaded_since <= after);
+    }
+    assert_eq!(handle.snapshot(), resident);
+
+    // The handle never keeps a dropped worker (or its children) alive.
+    let FlexibleWorker {
+        dir: _dir, worker, ..
+    } = fx;
+    drop(worker);
+    assert!(handle.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn crashed_child_leaves_resident_models_until_its_respawn_is_healthy() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    // Every fixture child exits on its own 1.5 s after it starts.
+    let fx = flexible_worker(
+        &["flaky"],
+        1,
+        1,
+        &[("FAKE_LLAMA_CRASH_AFTER_MS", "1500")],
+        Duration::from_secs(10),
+        |_| {},
+    );
+    let (completion, error) = run_to_final(&fx.worker, "flaky").await.expect("dispatch");
+    assert_eq!(completion, Completion::Stop, "{error:?}");
+    let first = fx.worker.resident_models();
+    assert_eq!(first.len(), 1, "{first:?}");
+
+    // The crash is noticed by supervision alone, with no request in flight.
+    wait_resident(&fx.worker, Duration::from_secs(5), <[_]>::is_empty).await;
+    // The respawned child is reported again once it passes `/health`, with
+    // its own readiness time.
+    let respawned = wait_resident(&fx.worker, Duration::from_secs(10), |models| {
+        !models.is_empty()
+    })
+    .await;
+    assert_eq!(respawned[0].model_id, "flaky");
+    assert!(
+        respawned[0].loaded_since > first[0].loaded_since,
+        "{respawned:?} vs {first:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Wave 1 Track A: loopback lockdown, lifecycle, and RPC guardrails
 // -----------------------------------------------------------------------
 
@@ -926,6 +1076,11 @@ async fn rpc_offload_follows_live_cluster_gate() {
         joined.contains("--rpc 127.0.0.1:50052 --split-mode layer --tensor-split 30,70"),
         "{joined}"
     );
+    assert_eq!(
+        resident_summary(&fx.worker),
+        [("sliced".to_string(), ResidentModelKind::Generation, true)],
+        "an RPC-backed child is reported as trusted-circle sharded"
+    );
 
     enabled.store(false, std::sync::atomic::Ordering::SeqCst);
     assert!(fx
@@ -1219,12 +1374,10 @@ mod shard_rpc_tunnel {
         _policy_dir: tempfile::TempDir,
     }
 
-    pub(super) async fn provider_enrolling(
+    /// Provider policy that explicitly enrolls exactly `coordinator`.
+    pub(super) async fn policy_enrolling(
         coordinator: &NodeIdentity,
-        bridge_port: u16,
-    ) -> Provider {
-        let identity = NodeIdentity::generate();
-        let discovery = discovery_for(&identity);
+    ) -> (Arc<PolicyEngine>, tempfile::TempDir) {
         let policy_dir = tempfile::tempdir().unwrap();
         let policy = Arc::new(
             PolicyEngine::load_or_default(Some(policy_dir.path().join("policy.toml")))
@@ -1235,6 +1388,16 @@ mod shard_rpc_tunnel {
         policy
             .update_config(|config| config.authorized_submitters = vec![coordinator_key])
             .unwrap();
+        (policy, policy_dir)
+    }
+
+    pub(super) async fn provider_enrolling(
+        coordinator: &NodeIdentity,
+        bridge_port: u16,
+    ) -> Provider {
+        let identity = NodeIdentity::generate();
+        let discovery = discovery_for(&identity);
+        let (policy, policy_dir) = policy_enrolling(coordinator).await;
         let node_config = NodeConfigStore::in_memory(NodeConfig {
             cluster_enabled: true,
             ..NodeConfig::default()
@@ -1391,7 +1554,12 @@ mod shard_rpc_tunnel {
 
 /// The `--rpc` endpoint the fixture launcher recorded for the child serving
 /// `model` (searching `ports`), with that child's port.
-fn rpc_endpoint_for(dir: &Path, ports: std::ops::Range<u16>, model: &str) -> (u16, String) {
+/// The port and `--rpc` endpoint of the spawn recorded for `model`, if any.
+fn try_rpc_endpoint_for(
+    dir: &Path,
+    ports: std::ops::Range<u16>,
+    model: &str,
+) -> Option<(u16, String)> {
     for port in ports {
         let Ok(raw) = std::fs::read_to_string(dir.join(format!("fixture.{port}.argv"))) else {
             continue;
@@ -1405,10 +1573,46 @@ fn rpc_endpoint_for(dir: &Path, ports: std::ops::Range<u16>, model: &str) -> (u1
                 .iter()
                 .position(|arg| *arg == "--rpc")
                 .expect("llama-server receives --rpc");
-            return (port, argv[index + 1].to_string());
+            return Some((port, argv[index + 1].to_string()));
         }
     }
-    panic!("no spawn recorded for {model}");
+    None
+}
+
+/// Cold-load `model` with enrolled-peer offload the way the real
+/// `llama-server` attaches its RPC device: while the fixture is still
+/// warming up (`FAKE_LLAMA_WARMUP_MS`), connect to the spawn's `--rpc` proxy
+/// and complete a HELLO round trip through the tunnel. Returns the model's
+/// port, its proxy endpoint, and the attached link.
+async fn load_attaching_rpc_peer(
+    fx: &FlexibleWorker,
+    model: &str,
+    previous_endpoint: Option<&str>,
+) -> (u16, String, tokio::net::TcpStream) {
+    let loading = tokio::spawn({
+        let worker = fx.worker.clone();
+        let model = model.to_string();
+        async move { run_to_final(&worker, &model).await }
+    });
+    let started = std::time::Instant::now();
+    let (port, endpoint) = loop {
+        match try_rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), model) {
+            Some((port, endpoint)) if Some(endpoint.as_str()) != previous_endpoint => {
+                break (port, endpoint)
+            }
+            _ => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "{model} never spawned"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    let link = shard_rpc_tunnel::rpc_client(&endpoint).await;
+    let (completion, error) = loading.await.unwrap().expect("dispatch");
+    assert_eq!(completion, Completion::Stop, "{model}: {error:?}");
+    (port, endpoint, link)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1430,7 +1634,7 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
         &["alpha", "beta"],
         2,
         3,
-        &[],
+        &[("FAKE_LLAMA_WARMUP_MS", "1500")],
         Duration::from_secs(10),
         |config| {
             config.rpc_peer_offload = Some(offload_to(&coordinator, provider_peer));
@@ -1441,13 +1645,17 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
     assert!(fx.worker.uses_rpc_layer_offload());
     assert_eq!(fx.worker.execution_trust_label(), "trusted-circle-sharded");
 
-    for model in ["alpha", "beta"] {
-        let (completion, error) = run_to_final(&fx.worker, model).await.expect("dispatch");
-        assert_eq!(completion, Completion::Stop, "{model}: {error:?}");
-    }
-    let (alpha_port, alpha_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "alpha");
-    let (beta_port, beta_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "beta");
+    // Each model's llama-server attaches a tunnel to the enrolled provider.
+    let (alpha_port, alpha_rpc, mut alpha_link) = load_attaching_rpc_peer(&fx, "alpha", None).await;
+    let (beta_port, beta_rpc, mut beta_link) = load_attaching_rpc_peer(&fx, "beta", None).await;
     assert_ne!(alpha_rpc, beta_rpc, "every spawn binds its own peer proxy");
+    assert_eq!(
+        resident_summary(&fx.worker),
+        [
+            ("alpha".to_string(), ResidentModelKind::Generation, true),
+            ("beta".to_string(), ResidentModelKind::Generation, true),
+        ]
+    );
     for endpoint in [&alpha_rpc, &beta_rpc] {
         let address: std::net::SocketAddr = endpoint.parse().unwrap();
         assert!(address.ip().is_loopback());
@@ -1459,10 +1667,6 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
         )),
         "{joined}"
     );
-
-    // Each model's llama-server holds a tunnel to the enrolled provider.
-    let mut alpha_link = rpc_client(&alpha_rpc).await;
-    let mut beta_link = rpc_client(&beta_rpc).await;
 
     // alpha's link dies on the provider side (its backend hangs up). Only
     // alpha is retired; beta keeps serving warm on its own healthy tunnel.
@@ -1477,6 +1681,11 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, beta_port)).is_err(),
         "a model with a healthy tunnel must stay resident"
     );
+    assert_eq!(
+        resident_summary(&fx.worker),
+        [("beta".to_string(), ResidentModelKind::Generation, true)],
+        "the retired model drops out of the resident list"
+    );
     let (completion, error) = run_to_final(&fx.worker, "beta").await.expect("beta warm");
     assert_eq!(completion, Completion::Stop, "{error:?}");
     beta_link.write_all(b"still-up").await.unwrap();
@@ -1486,12 +1695,9 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
     assert_eq!(spawned_models(fx.dir.path()), ["alpha", "beta"]);
 
     // The next alpha request cold-loads over a fresh proxy.
-    let (completion, error) = run_to_final(&fx.worker, "alpha")
-        .await
-        .expect("alpha reload");
-    assert_eq!(completion, Completion::Stop, "{error:?}");
+    let (_, reloaded_rpc, _reloaded_link) =
+        load_attaching_rpc_peer(&fx, "alpha", Some(&alpha_rpc)).await;
     assert_eq!(spawned_models(fx.dir.path()), ["alpha", "beta", "alpha"]);
-    let (_, reloaded_rpc) = rpc_endpoint_for(fx.dir.path(), fx.ports.clone(), "alpha");
     assert_ne!(reloaded_rpc, alpha_rpc);
 
     // The provider withdrawing cluster_enabled drops beta's live tunnel and
@@ -1509,6 +1715,104 @@ async fn rpc_peer_offload_gives_each_model_its_own_tunnels_and_retires_only_the_
         wait_port_bindable(beta_port, Duration::from_secs(8)).await,
         "RPC-backed model must be retired after its tunnel is revoked"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_peer_offload_refuses_a_load_whose_peer_device_never_attached() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    use shard_rpc_tunnel::*;
+
+    // The pinned llama-server passes /health even when an --rpc device never
+    // attached (it runs those layers locally). This fixture never connects
+    // to its --rpc endpoint, exactly like that case: the load is refused.
+    let coordinator_identity = NodeIdentity::generate();
+    let coordinator = discovery_for(&coordinator_identity);
+    let backend = counting_forwarder(None).await;
+    let provider = provider_enrolling(&coordinator_identity, backend.port).await;
+    connect(&coordinator, &provider.discovery).await;
+    let (gate, _gate_open) = switch_gate(true);
+    let fx = flexible_worker(&["lonely"], 1, 1, &[], Duration::from_secs(10), |config| {
+        config.rpc_peer_offload = Some(offload_to(
+            &coordinator,
+            *provider.discovery.local_peer_id(),
+        ));
+        config.rpc_cluster_gate = Some(gate);
+    });
+    let refused = run_to_final(&fx.worker, "lonely")
+        .await
+        .expect_err("an unattached peer device must refuse the load");
+    assert!(refused.contains("did not attach"), "{refused}");
+    assert!(
+        !refused.contains(&provider.discovery.local_peer_id().to_string()),
+        "callers must not learn circle membership: {refused}"
+    );
+    assert_eq!(spawned_models(fx.dir.path()), ["lonely"]);
+    assert!(fx.worker.resident_models().is_empty());
+    assert!(
+        wait_port_bindable(fx.ports.start, Duration::from_secs(5)).await,
+        "the refused child is killed and its port released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_peer_offload_retires_a_respawn_that_did_not_reattach_its_peer() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    use shard_rpc_tunnel::*;
+
+    let coordinator_identity = NodeIdentity::generate();
+    let coordinator = discovery_for(&coordinator_identity);
+    let backend = counting_forwarder(None).await;
+    let provider = provider_enrolling(&coordinator_identity, backend.port).await;
+    connect(&coordinator, &provider.discovery).await;
+    let (gate, _gate_open) = switch_gate(true);
+    // Every child warms up for 1.5 s and exits on its own at 3 s.
+    let fx = flexible_worker(
+        &["phoenix"],
+        1,
+        1,
+        &[
+            ("FAKE_LLAMA_WARMUP_MS", "1500"),
+            ("FAKE_LLAMA_CRASH_AFTER_MS", "3000"),
+        ],
+        Duration::from_secs(10),
+        |config| {
+            config.rpc_peer_offload = Some(offload_to(
+                &coordinator,
+                *provider.discovery.local_peer_id(),
+            ));
+            config.rpc_cluster_gate = Some(gate);
+        },
+    );
+    let (port, _, link) = load_attaching_rpc_peer(&fx, "phoenix", None).await;
+    assert_eq!(fx.worker.resident_models().len(), 1);
+
+    // The child crashes; llama-server's RPC socket dies with it. The
+    // respawn never re-attaches (as when the peer is gone), so the pinned
+    // llama-server would run every layer locally: it is retired instead.
+    wait_resident(&fx.worker, Duration::from_secs(5), <[_]>::is_empty).await;
+    drop(link);
+    let started = std::time::Instant::now();
+    while spawned_models(fx.dir.path()).len() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(10), "no respawn");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The respawn passes /health 1.5 s after it starts; it must never be
+    // reported resident, and no further respawn follows its retirement.
+    let watched = std::time::Instant::now();
+    while watched.elapsed() < Duration::from_secs(3) {
+        assert!(
+            fx.worker.resident_models().is_empty(),
+            "an unattached respawn must not serve as trusted-circle work"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        wait_port_bindable(port, Duration::from_secs(2)).await,
+        "the unattached respawn is killed and its port released"
+    );
+    assert_eq!(spawned_models(fx.dir.path()), ["phoenix", "phoenix"]);
 }
 
 /// End-to-end Tier-1 layer offload through the shard-rpc tunnel with the
@@ -1666,4 +1970,199 @@ async fn real_llama_server_offloads_layers_through_shard_rpc_tunnel() {
     drop(sharded);
     let _ = rpc_server.start_kill();
     let _ = rpc_server.wait().await;
+}
+
+/// One real embedding through `worker`, or the dispatch/stream error.
+async fn real_embedding(worker: &LlamaCppWorker, model_id: &str) -> Result<Vec<f32>, String> {
+    let manifest = ManifestBuilder::new(JobSpec::Embedding(EmbeddingJobSpec {
+        model_cid: model_id.to_string(),
+        input: vec!["trusted circle layer offload".to_string()],
+    }))
+    .sign_with(&NodeIdentity::generate())
+    .expect("sign");
+    let (_handle, mut stream) = worker.execute(manifest).await.map_err(|e| e.to_string())?;
+    let mut vector = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            JobEvent::Output(chunk) => {
+                vector = Some(serde_json::from_slice::<Vec<f32>>(&chunk.data).unwrap());
+            }
+            JobEvent::Final { result, error } => {
+                if result.completion != Completion::Stop {
+                    return Err(format!("{:?}: {error:?}", result.completion));
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    vector.ok_or_else(|| "no embedding vector".to_string())
+}
+
+/// Zero-CLI provider end to end with the real pinned binaries: the provider
+/// runs no operator `ggml-rpc-server`. lucidd locates the pinned build beside
+/// `LLAMA_SERVER_PATH` (which must be a pinned `b12651` runtime directory),
+/// starts it only once `cluster_enabled` is on, and the coordinator's layers
+/// execute on it through the tunnel; withdrawing the opt-in kills it and
+/// retires the coordinator's RPC-backed model. Requires `LLAMA_SERVER_PATH`
+/// and `LLAMA_TEST_EMBED_MODEL_PATH`; see the test above for
+/// `LLAMA_TEST_RPC_TENSOR_SPLIT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn real_auto_managed_ggml_rpc_server_serves_layer_offload_only_while_cluster_enabled() {
+    #[cfg(target_os = "macos")]
+    let _fixture_guard = fixture_process_guard().await;
+    use lucidd::node_config::{NodeConfig, NodeConfigStore};
+    use lucidd::shard_worker::{
+        locate_pinned_ggml_rpc_server, ManagedRpcServerConfig, ManagedShardRpcProvider,
+    };
+    use shard_rpc_tunnel::*;
+
+    let missing = "real auto-managed shard-rpc gate unavailable: set LLAMA_SERVER_PATH and LLAMA_TEST_EMBED_MODEL_PATH";
+    let server_bin = PathBuf::from(std::env::var("LLAMA_SERVER_PATH").expect(missing));
+    let model_path = PathBuf::from(std::env::var("LLAMA_TEST_EMBED_MODEL_PATH").expect(missing));
+    let split = std::env::var("LLAMA_TEST_RPC_TENSOR_SPLIT").unwrap_or_else(|_| "1,0".to_string());
+    let model_dir = model_path.parent().expect("model dir").to_path_buf();
+    let model_id = model_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("model stem")
+        .to_string();
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&server_bin).unwrap().uid()
+    };
+    #[cfg(not(unix))]
+    let owner = 0;
+    let binary = locate_pinned_ggml_rpc_server(&server_bin, owner)
+        .expect("LLAMA_SERVER_PATH must sit beside the pinned b12651 ggml-rpc-server");
+
+    let coordinator_identity = NodeIdentity::generate();
+    let coordinator = discovery_for(&coordinator_identity);
+    let provider = discovery_for(&NodeIdentity::generate());
+    let (policy, _policy_dir) = policy_enrolling(&coordinator_identity).await;
+    let provider_config = NodeConfigStore::in_memory(NodeConfig::default());
+    let cache = tempfile::tempdir().unwrap();
+    let managed = ManagedShardRpcProvider::start(
+        provider.clone(),
+        policy,
+        provider_config.clone(),
+        ManagedRpcServerConfig::new(binary, cache.path().join("ggml-rpc-cache")),
+    );
+    connect(&coordinator, &provider).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(managed.serving_port(), None, "default off: no server runs");
+
+    let (gate, _) = switch_gate(true);
+    let port = free_port();
+    let sharded = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_binary_path: server_bin.clone(),
+            model_dir: model_dir.clone(),
+            default_n_gpu_layers: i32::MAX,
+            default_context_size: 512,
+            server_port_range: port..(port + 1),
+            max_loaded_models: 1,
+            model_load_timeout: Duration::from_secs(120),
+            per_request_idle_timeout: Duration::from_secs(120),
+            rpc_peer_offload: Some(offload_to(&coordinator, *provider.local_peer_id())),
+            tensor_split: Some(split),
+            rpc_cluster_gate: Some(gate),
+            ..Default::default()
+        },
+    );
+    // The provider has not opted in, so its tunnels are refused and the
+    // RPC-backed load fails closed.
+    let refused = tokio::time::timeout(
+        Duration::from_secs(150),
+        real_embedding(&sharded, &model_id),
+    )
+    .await
+    .expect("refused load ends");
+    assert!(
+        refused.is_err(),
+        "no layer offload before the provider opts in"
+    );
+    assert!(sharded.resident_models().is_empty());
+
+    // Opting in starts the pinned server on demand and the same load works.
+    provider_config
+        .update(|config| {
+            config.cluster_enabled = true;
+            Ok(())
+        })
+        .unwrap();
+    let started = std::time::Instant::now();
+    let rpc_port = loop {
+        if let Some(port) = managed.serving_port() {
+            break port;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "managed ggml-rpc-server never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let remote = real_embedding(&sharded, &model_id)
+        .await
+        .expect("sharded embedding over the auto-managed server");
+    assert_eq!(
+        resident_summary(&sharded),
+        [(model_id.clone(), ResidentModelKind::Embedding, true)]
+    );
+
+    let local_port = free_port();
+    let local = LlamaCppWorker::new(
+        NodeIdentity::generate(),
+        LlamaCppConfig {
+            server_binary_path: server_bin,
+            model_dir,
+            default_n_gpu_layers: i32::MAX,
+            default_context_size: 512,
+            server_port_range: local_port..(local_port + 1),
+            max_loaded_models: 1,
+            model_load_timeout: Duration::from_secs(120),
+            per_request_idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        },
+    );
+    let reference = real_embedding(&local, &model_id)
+        .await
+        .expect("local embedding");
+    drop(local);
+    assert_eq!(remote.len(), reference.len());
+    let dot: f64 = remote
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let cosine = dot / (norm(&remote) * norm(&reference));
+    eprintln!("auto-managed ggml-rpc-server on 127.0.0.1:{rpc_port}; cosine(sharded, local) = {cosine:.6}");
+    assert!(
+        cosine > 0.999,
+        "sharded and local embeddings diverge: {cosine}"
+    );
+
+    // Withdrawing the opt-in kills and reaps the server and retires the
+    // coordinator's model whose layers lived there.
+    provider_config
+        .update(|config| {
+            config.cluster_enabled = false;
+            Ok(())
+        })
+        .unwrap();
+    let started = std::time::Instant::now();
+    while managed.serving_port().is_some() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "server outlived the opt-in"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(wait_port_bindable(rpc_port, Duration::from_secs(2)).await);
+    wait_resident(&sharded, Duration::from_secs(15), <[_]>::is_empty).await;
+    managed.shutdown().await;
 }

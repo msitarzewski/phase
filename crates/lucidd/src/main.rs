@@ -266,7 +266,10 @@ struct Cli {
     /// `ggml-rpc-server -H 127.0.0.1 -p <PORT> -c`. When set, enrolled peers
     /// may open `/phase/shard-rpc/1.0.0` tunnels that are bridged to it, ONLY
     /// while `cluster_enabled` is on; turning it off drops live tunnels.
-    /// Default: off (no tunnel is ever admitted).
+    /// When absent, lucidd instead runs the pinned `ggml-rpc-server` found
+    /// beside the configured `llama-server` itself, on an ephemeral
+    /// `127.0.0.1` port and only while `cluster_enabled` is on (default off),
+    /// killing it when the opt-in is withdrawn or lucidd exits.
     #[arg(long)]
     shard_rpc_bridge_port: Option<u16>,
 
@@ -582,6 +585,72 @@ fn relay_reservation_target(raw: &str) -> Result<(PeerId, String), String> {
         .parse::<Multiaddr>()
         .map_err(|_| "relay candidate is not a valid multiaddr".to_string())?;
     Ok((peer_id, format!("{candidate}/p2p-circuit")))
+}
+
+/// Child environment that binaries of a `llama.cpp` runtime directory need
+/// beyond the cleared default: a Linux CUDA build loads the CUDA 12 runtime
+/// libraries from the host's install, found next to `libggml-cuda.so`.
+fn llama_runtime_extra_env(runtime_binary: &std::path::Path) -> Vec<(String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut env = Vec::new();
+        if let Some(bin_dir) = runtime_binary.parent() {
+            if bin_dir.join("libggml-cuda.so").exists() {
+                if let Some(cuda_dir) = lucidd::runtime_manager::find_linux_cuda12_lib_dir() {
+                    if let Ok(canon_cuda) = cuda_dir.canonicalize() {
+                        env.push((
+                            "LD_LIBRARY_PATH".to_string(),
+                            format!("{}:{}", bin_dir.display(), canon_cuda.display()),
+                        ));
+                    }
+                }
+            }
+        }
+        env
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = runtime_binary;
+        Vec::new()
+    }
+}
+
+/// Configuration of the zero-CLI Tier-1 provider, or why it cannot run on
+/// this node (fail closed: nothing is ever spawned). It runs the pinned
+/// `ggml-rpc-server` found beside the configured `llama-server`, which must
+/// be owned by root or `trusted_owner`.
+fn managed_shard_rpc_config(
+    cli: &Cli,
+    node_cfg: &lucidd::node_config::NodeConfig,
+    trusted_owner: u32,
+) -> Result<lucidd::shard_worker::ManagedRpcServerConfig, String> {
+    let llama_server = cli
+        .llama_server_binary
+        .as_ref()
+        .or(node_cfg.llama_server_binary.as_ref())
+        .ok_or("no llama-server runtime is configured")?;
+    let binary = lucidd::shard_worker::locate_pinned_ggml_rpc_server(llama_server, trusted_owner)
+        .map_err(|error| format!("{error:#}"))?;
+    let cache_dir = lucidd::shard_worker::default_managed_rpc_cache_dir()
+        .map_err(|error| format!("{error:#}"))?;
+    let mut config = lucidd::shard_worker::ManagedRpcServerConfig::new(binary, cache_dir);
+    config.extra_env = llama_runtime_extra_env(config.binary.path());
+    Ok(config)
+}
+
+/// The account that owns this node's identity key: the operator, trusted
+/// (with root) to own the runtime binaries lucidd runs for peers.
+fn node_owner_uid(identity_path: &std::path::Path) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(identity_path)?.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity_path;
+        Ok(0)
+    }
 }
 
 fn identity_sidecar_path(identity_path: &std::path::Path, suffix: &str) -> PathBuf {
@@ -1201,6 +1270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Optional local worker.
     let mut local_worker_uses_rpc_offload = false;
+    // Live residency of the local worker's models, for `/api/ps`. Echo and
+    // consume-only nodes hold no model processes, so theirs stays empty.
+    let mut resident_models = lucidd::worker_llama::ResidentModels::none();
     let local_worker: Option<Arc<dyn DynWorker>> = if no_local_worker {
         tracing::info!(
             mode = ?effective_mode,
@@ -1424,27 +1496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                #[cfg(target_os = "linux")]
-                let extra_env = {
-                    let mut env = Vec::new();
-                    if let Some(bin_dir) = server_binary_path.parent() {
-                        if bin_dir.join("libggml-cuda.so").exists() {
-                            if let Some(cuda_dir) =
-                                lucidd::runtime_manager::find_linux_cuda12_lib_dir()
-                            {
-                                if let Ok(canon_cuda) = cuda_dir.canonicalize() {
-                                    env.push((
-                                        "LD_LIBRARY_PATH".to_string(),
-                                        format!("{}:{}", bin_dir.display(), canon_cuda.display()),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    env
-                };
-                #[cfg(not(target_os = "linux"))]
-                let extra_env = Vec::new();
+                let extra_env = llama_runtime_extra_env(&server_binary_path);
                 // Flags were validated by `validate_llama_rpc_cli` at startup;
                 // the worker re-validates them before every spawn.
                 // Enrolled-peer layer offload: every llama-server spawn gets its
@@ -1495,6 +1547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // PeerId (a random key would fail that bind). See the echo arm.
                 let worker_identity = node_identity.clone();
                 let worker = Arc::new(LlamaCppWorker::new(worker_identity, config));
+                resident_models = worker.resident_models_handle();
                 local_worker_uses_rpc_offload = worker.uses_rpc_layer_offload();
                 if local_worker_uses_rpc_offload {
                     tracing::info!(
@@ -1519,6 +1572,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("MLX context length missing after successful preflight")?;
                 let worker = MlxWorker::new(node_identity.clone(), prepared.config)?;
                 worker.preload().await?;
+                resident_models = worker.resident_models_handle();
                 let metadata = worker.bundle_metadata();
                 if metadata != prepared.metadata {
                     return Err(
@@ -1608,7 +1662,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the operator configures the bridge port; every tunnel is still refused
     // unless `cluster_enabled = true` and the caller is enrolled, and live
     // tunnels drop as soon as either stops holding.
-    if let Some(bridge_port) = cli.shard_rpc_bridge_port {
+    // Without a manual bridge port, lucidd runs the pinned ggml-rpc-server
+    // itself, on demand, only while `cluster_enabled` is on.
+    let managed_shard_rpc = if let Some(bridge_port) = cli.shard_rpc_bridge_port {
         let shard_rpc_handler = lucidd::shard_worker::make_opt_in_inbound_shard_rpc_handler(
             policy.clone(),
             node_config_store.clone(),
@@ -1620,7 +1676,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cluster_enabled = node_config_store.snapshot().cluster_enabled,
             "registered opt-in Tier-1 Trusted-Circle shard rpc bridge"
         );
-    }
+        None
+    } else {
+        let config = node_owner_uid(&identity_path)
+            .map_err(|error| format!("cannot inspect the identity key's owner: {error}"))
+            .and_then(|owner| managed_shard_rpc_config(&cli, &node_cfg, owner));
+        match config {
+            Ok(config) => {
+                tracing::info!(
+                    binary = %config.binary.path().display(),
+                    sha256 = config.binary.sha256(),
+                    cluster_enabled = node_cfg.cluster_enabled,
+                    "armed auto-managed ggml-rpc-server: it runs on 127.0.0.1 only while cluster_enabled is on"
+                );
+                Some(lucidd::shard_worker::ManagedShardRpcProvider::start(
+                    discovery.clone(),
+                    policy.clone(),
+                    node_config_store.clone(),
+                    config,
+                ))
+            }
+            Err(reason) => {
+                if node_cfg.cluster_enabled {
+                    tracing::warn!(%reason, "cluster_enabled is on but the auto-managed ggml-rpc-server is unavailable; this node will not serve shard rpc tunnels");
+                } else {
+                    tracing::debug!(%reason, "auto-managed ggml-rpc-server unavailable");
+                }
+                None
+            }
+        }
+    };
 
     // The router itself. Evidence is local, privacy-minimal, and bound to the
     // same persistent PeerId used for transport and receipts. Redundant checks
@@ -1786,10 +1871,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = ollama_router(state, addr.ip().to_canonical().is_loopback());
 
-    tracing::info!(%addr, "lucidd listening");
+    tracing::info!(
+        %addr,
+        resident_models = resident_models.snapshot().len(),
+        "lucidd listening"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Withdraw the trusted-circle bridge and kill and reap the
+            // auto-managed ggml-rpc-server first, rather than after HTTP
+            // clients drain (which has no deadline). If serving fails instead,
+            // dropping the provider stops it, and the server's lifeline guard
+            // kills it once lucidd exits.
+            if let Some(managed) = managed_shard_rpc {
+                managed.shutdown().await;
+            }
+        })
         .await?;
     tracing::info!("lucidd shutdown complete");
     Ok(())
@@ -2347,6 +2446,45 @@ mod tests {
         assert_eq!(cli.shard_rpc_bridge_port, Some(50052));
         let cli = Cli::try_parse_from(["lucidd"]).expect("flags parse");
         assert_eq!(cli.shard_rpc_bridge_port, None, "bridge is off by default");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_managed_shard_rpc_fails_closed_without_the_pinned_runtime() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(dir.path()).unwrap().uid();
+        let node_cfg = lucidd::node_config::NodeConfig {
+            cluster_enabled: true,
+            ..Default::default()
+        };
+
+        // No llama-server runtime configured anywhere: nothing to run.
+        let cli = Cli::try_parse_from(["lucidd"]).expect("flags parse");
+        let reason = managed_shard_rpc_config(&cli, &node_cfg, owner).unwrap_err();
+        assert!(reason.contains("no llama-server runtime"), "{reason}");
+
+        // A ggml-rpc-server beside llama-server that is not the pinned build
+        // is never armed, even with cluster_enabled on.
+        let llama_server = dir.path().join("llama-server");
+        let rpc_server = dir.path().join("ggml-rpc-server");
+        for path in [&llama_server, &rpc_server] {
+            std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cli = Cli::try_parse_from([
+            "lucidd",
+            "--llama-server-binary",
+            llama_server.to_str().unwrap(),
+        ])
+        .expect("flags parse");
+        let reason = managed_shard_rpc_config(&cli, &node_cfg, owner).unwrap_err();
+        assert!(reason.contains("not the pinned b12651"), "{reason}");
+
+        // The trusted owner comes from the identity key.
+        let identity = dir.path().join("identity.key");
+        std::fs::write(&identity, b"key").unwrap();
+        assert_eq!(node_owner_uid(&identity).unwrap(), owner);
     }
 
     #[test]

@@ -19,10 +19,13 @@
 //!   every verification result carries `trust_label = "trusted-circle-sharded"`.
 //!
 //! The same module serves the provider side of `/phase/shard-rpc/1.0.0`: an
-//! enrolled coordinator's opaque byte tunnel is bridged onto an operator-run
-//! loopback `ggml-rpc-server` (see [`make_opt_in_inbound_shard_rpc_handler`]).
+//! enrolled coordinator's opaque byte tunnel is bridged onto a loopback
+//! `ggml-rpc-server` (see [`make_opt_in_inbound_shard_rpc_handler`]), either
+//! operator-run (`--shard-rpc-bridge-port`) or, with zero CLI, the pinned
+//! build that [`ManagedShardRpcProvider`] runs only while `cluster_enabled`
+//! is on.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -572,6 +575,793 @@ fn ed25519_pubkey_hex_for_peer(peer: &PeerId) -> Option<String> {
         .ok()?;
     let pubkey_hex = hex::encode(key.to_bytes());
     (PeerId::from(PublicKey::from(key)) == *peer).then_some(pubkey_hex)
+}
+
+// ---------------------------------------------------------------------------
+// Zero-CLI auto-managed loopback `ggml-rpc-server` (Tier-1 provider)
+// ---------------------------------------------------------------------------
+
+/// File name of the `ggml-rpc` backend server that every pinned `llama.cpp`
+/// release archive ships next to `llama-server`.
+pub const GGML_RPC_SERVER_BINARY_NAME: &str = "ggml-rpc-server";
+
+/// SHA-256 of `ggml-rpc-server` inside each pinned `b12651` archive of
+/// [`crate::runtime_manager::PINNED_LLAMA_ASSETS`], keyed by `platform_id`.
+/// Each digest was taken from an archive whose own pinned SHA-256 matched.
+///
+/// The executable is small: most of its code is in the `libggml*` shared
+/// libraries beside it, which it loads from its own directory (Linux builds
+/// also load backend plugins found there). Those libraries are covered by the
+/// install-time archive verification plus the ownership and write-permission
+/// checks of [`locate_pinned_ggml_rpc_server`], not re-hashed on each spawn.
+pub const PINNED_GGML_RPC_SERVER_SHA256: &[(&str, &str)] = &[
+    (
+        "macos-arm64-metal",
+        "cc5945ecb7744b0e843acd44115d12729427d4b494820b79b519ebd3114ef8ce",
+    ),
+    (
+        "linux-x86_64-cuda",
+        "7f8f4a788f8c2fee8d2ead139d1a0d97e2336051dff0115f2847229da1dbb156",
+    ),
+    (
+        "linux-x86_64-vulkan",
+        "a8a238a73da848562e08256364fe983b143e343beab89585981af2d56c8c9dde",
+    ),
+    (
+        "linux-x86_64-cpu",
+        "a8a238a73da848562e08256364fe983b143e343beab89585981af2d56c8c9dde",
+    ),
+    (
+        "linux-aarch64-cpu",
+        "c7b2129989bce69a5f55589a86715bbedcc65b134cbf100535708e90ce159fc9",
+    ),
+];
+
+/// Line the pinned `ggml-rpc-server` writes to stderr from its own accept
+/// loop (`ggml_backend_rpc_start_server`). Readiness requires it after the
+/// probe connection: a listener that won the close-to-bind race for the
+/// reserved port could answer the probe, but cannot make our child log it.
+const GGML_RPC_SERVER_ACCEPT_LINE: &str = "Accepted client connection";
+/// How long the child has to log its accept of the readiness probe.
+const MANAGED_RPC_ACCEPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a managed server must stay up after it accepted the probe. When
+/// its port was taken, `ggml-rpc-server` prints
+/// `Failed to create server socket` and exits (status 0) after device init.
+const MANAGED_RPC_SERVER_SETTLE: Duration = Duration::from_millis(300);
+const MANAGED_RPC_SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const MANAGED_RPC_SERVER_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// Bound on waiting for the guard to exit once its lifeline is closed.
+const MANAGED_RPC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const MANAGED_RPC_MAX_LOG_LINE_BYTES: usize = 4 * 1024;
+
+/// First stderr line of the lifeline guard: `<prefix> <server pid>`, so a
+/// last-resort kill can reach the server even if the guard is wedged.
+const GUARD_PID_LINE_PREFIX: &str = "lucidd-rpc-guard: server pid";
+
+/// `/bin/sh` guard that runs `ggml-rpc-server` (`$1`, arguments after it)
+/// as its own child and ties it to lucidd's lifetime without `unsafe`: its
+/// stdin is a pipe whose only writer is lucidd. A watcher kills the server
+/// once that pipe reaches EOF, which happens however lucidd ends, SIGKILL
+/// included, and also when lucidd closes it to stop the server. The guard
+/// itself exits with the server's status once the server is gone, so lucidd
+/// still observes an unexpected exit. ggml-rpc has no authentication, so the
+/// server must never outlive the libp2p handler in front of it.
+const RPC_SERVER_LIFELINE_GUARD: &str = r#"exec 3<&0
+server=$1
+shift
+"$server" "$@" </dev/null 3<&- &
+child=$!
+printf '%s %s\n' "$GUARD_PID_PREFIX" "$child" >&2
+{
+    while read -r _; do :; done
+    kill -KILL "$child" 2>/dev/null
+} <&3 &
+watcher=$!
+exec 3<&-
+wait "$child"
+status=$?
+kill "$watcher" 2>/dev/null
+exit "$status"
+"#;
+/// Start or run failures tolerated within [`MANAGED_RPC_FAILURE_WINDOW`]
+/// before the manager stops retrying until `cluster_enabled` is turned off
+/// and on again.
+const MANAGED_RPC_MAX_FAILURES: usize = 3;
+const MANAGED_RPC_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const MANAGED_RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A `ggml-rpc-server` executable verified to be a pinned build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedRpcServerBinary {
+    path: PathBuf,
+    sha256: String,
+    /// Account trusted (with root) to own the binary, its libraries, and
+    /// every directory above them.
+    trusted_owner: u32,
+}
+
+impl PinnedRpcServerBinary {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Repeat the locate-time checks and require the very bytes located
+    /// then, so a binary replaced while lucidd runs is never spawned.
+    fn reverify(&self) -> Result<()> {
+        verify_rpc_server_binary(&self.path, &[self.sha256.as_str()], self.trusted_owner)
+            .map(|_| ())
+    }
+}
+
+/// Find the pinned `b12651` `ggml-rpc-server` beside the configured
+/// `llama-server` (no `PATH` lookup) and verify it:
+///
+/// - a regular, executable, non-symlink file whose SHA-256 is one of
+///   [`PINNED_GGML_RPC_SERVER_SHA256`];
+/// - it, its directory, and the `libggml*` libraries it loads from that
+///   directory are owned by root or `trusted_owner` (the account that owns
+///   this node's identity) and writable by neither group nor others, and
+///   every library symlink stays inside the directory;
+/// - every directory above is owned by root or `trusted_owner` and, unless
+///   sticky, writable by neither group nor others, so nobody else can swap
+///   the runtime directory out from under it.
+///
+/// `trusted_owner` is a Unix uid; it is ignored elsewhere.
+pub fn locate_pinned_ggml_rpc_server(
+    llama_server: &Path,
+    trusted_owner: u32,
+) -> Result<PinnedRpcServerBinary> {
+    let pinned: Vec<&str> = PINNED_GGML_RPC_SERVER_SHA256
+        .iter()
+        .map(|(_, sha256)| *sha256)
+        .collect();
+    locate_rpc_server_beside(llama_server, &pinned, trusted_owner)
+}
+
+fn locate_rpc_server_beside(
+    llama_server: &Path,
+    pinned: &[&str],
+    trusted_owner: u32,
+) -> Result<PinnedRpcServerBinary> {
+    if !llama_server.is_absolute() {
+        bail!("llama-server path must be absolute to locate ggml-rpc-server beside it");
+    }
+    let llama_server = llama_server
+        .canonicalize()
+        .with_context(|| format!("cannot resolve llama-server {}", llama_server.display()))?;
+    let directory = llama_server
+        .parent()
+        .context("llama-server path has no parent directory")?;
+    let path = directory.join(GGML_RPC_SERVER_BINARY_NAME);
+    let sha256 = verify_rpc_server_binary(&path, pinned, trusted_owner)?;
+    Ok(PinnedRpcServerBinary {
+        path,
+        sha256,
+        trusted_owner,
+    })
+}
+
+fn verify_rpc_server_binary(path: &Path, pinned: &[&str], trusted_owner: u32) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{} must be a regular file, not a symlink", path.display());
+    }
+    let directory = path
+        .parent()
+        .context("ggml-rpc-server path has no parent directory")?;
+    let directory_metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("cannot inspect {}", directory.display()))?;
+    if !directory_metadata.is_dir() {
+        bail!("{} must be a real directory", directory.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("{} is not executable", path.display());
+        }
+        require_owner_only_writable(path, &metadata, trusted_owner, false)?;
+        require_owner_only_writable(directory, &directory_metadata, trusted_owner, false)
+            .context("ggml-rpc-server loads its libraries from its own directory")?;
+        for ancestor in directory.ancestors().skip(1) {
+            let ancestor_metadata = std::fs::symlink_metadata(ancestor)
+                .with_context(|| format!("cannot inspect {}", ancestor.display()))?;
+            require_owner_only_writable(ancestor, &ancestor_metadata, trusted_owner, true)?;
+        }
+        verify_rpc_server_libraries(directory, trusted_owner)?;
+    }
+    #[cfg(not(unix))]
+    let _ = trusted_owner;
+    let actual = crate::runtime_manager::sha256_file_hex(path)?;
+    if !pinned
+        .iter()
+        .any(|expected| expected.eq_ignore_ascii_case(&actual))
+    {
+        bail!(
+            "{} is not the pinned {} ggml-rpc-server (SHA-256 {actual})",
+            path.display(),
+            crate::runtime_manager::PINNED_LLAMA_CPP_TAG
+        );
+    }
+    Ok(actual)
+}
+
+/// `path` is owned by root or `trusted_owner` and neither group nor others
+/// can write it; a sticky directory (others cannot rename entries they do
+/// not own) is accepted when `allow_sticky`.
+#[cfg(unix)]
+fn require_owner_only_writable(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    trusted_owner: u32,
+    allow_sticky: bool,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    const STICKY: u32 = 0o1000;
+    let owner = metadata.uid();
+    if owner != 0 && owner != trusted_owner {
+        bail!(
+            "{} is owned by uid {owner}, not root or this node's owner",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 && !(allow_sticky && metadata.is_dir() && mode & STICKY != 0) {
+        bail!("{} must not be writable by group or others", path.display());
+    }
+    Ok(())
+}
+
+/// Every `libggml*` entry beside the binary is a library it may load: each
+/// must be a trusted, owner-only-writable regular file, or a symlink that
+/// resolves to one inside the same directory.
+#[cfg(unix)]
+fn verify_rpc_server_libraries(directory: &Path, trusted_owner: u32) -> Result<()> {
+    let entries = std::fs::read_dir(directory)
+        .with_context(|| format!("cannot list {}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot list {}", directory.display()))?;
+        if !entry.file_name().to_string_lossy().starts_with("libggml") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            let target = path
+                .canonicalize()
+                .with_context(|| format!("cannot resolve {}", path.display()))?;
+            if target.parent() != Some(directory) {
+                bail!(
+                    "{} must resolve inside {}",
+                    path.display(),
+                    directory.display()
+                );
+            }
+            let target_metadata = std::fs::metadata(&target)
+                .with_context(|| format!("cannot inspect {}", target.display()))?;
+            if !target_metadata.is_file() {
+                bail!("{} must resolve to a regular file", path.display());
+            }
+            require_owner_only_writable(&target, &target_metadata, trusted_owner, false)?;
+        } else if metadata.is_file() {
+            require_owner_only_writable(&path, &metadata, trusted_owner, false)?;
+        } else {
+            bail!("{} must be a regular file or symlink", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Default private cache directory handed to the managed server's `-c`
+/// tensor cache (`LLAMA_CACHE`), kept apart from any other llama.cpp cache.
+pub fn default_managed_rpc_cache_dir() -> Result<PathBuf> {
+    let base = dirs::cache_dir().context("could not resolve the platform cache directory")?;
+    Ok(base.join("lucidd").join("ggml-rpc-cache"))
+}
+
+/// How [`ManagedShardRpcProvider`] runs its `ggml-rpc-server`.
+#[derive(Debug, Clone)]
+pub struct ManagedRpcServerConfig {
+    pub binary: PinnedRpcServerBinary,
+    /// Directory for the `-c` tensor cache, passed as `LLAMA_CACHE`. Created
+    /// `0700` before every spawn. With `b12651` the coordinator's client sets
+    /// the cache flag only for tensors over 10 MiB in a weights buffer
+    /// (`rpc_use_hash_cache`), so the cache holds uploaded weights, not
+    /// activations. It is shared by every enrolled coordinator and not
+    /// size-bounded by `ggml-rpc-server`.
+    pub cache_dir: PathBuf,
+    /// Extra child environment, e.g. the CUDA library path `llama-server`
+    /// also gets. Cannot override `LLAMA_CACHE`.
+    pub extra_env: Vec<(String, String)>,
+    /// Deadline for a spawned server to accept connections.
+    pub ready_timeout: Duration,
+    /// How often the live `cluster_enabled` opt-in is re-read.
+    pub gate_poll_interval: Duration,
+    /// First restart delay after a failure; doubles per failure in the window.
+    pub restart_backoff: Duration,
+}
+
+impl ManagedRpcServerConfig {
+    pub fn new(binary: PinnedRpcServerBinary, cache_dir: PathBuf) -> Self {
+        Self {
+            binary,
+            cache_dir,
+            extra_env: Vec::new(),
+            ready_timeout: Duration::from_secs(30),
+            gate_poll_interval: SHARD_RPC_REAUTHORIZE_INTERVAL,
+            restart_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Zero-CLI Tier-1 Trusted-Circle provider. While the live `cluster_enabled`
+/// opt-in is on, it keeps one pinned `ggml-rpc-server -c` running on an
+/// ephemeral `127.0.0.1` port and bridges enrolled peers'
+/// `/phase/shard-rpc/1.0.0` tunnels to it through
+/// [`make_opt_in_inbound_shard_rpc_handler`], so every tunnel passes exactly
+/// the same admission (explicit enrollment, `cluster_enabled`, manual pause)
+/// as with an operator-run bridge. When `cluster_enabled` turns off, the
+/// server exits on its own, or the provider shuts down, it withdraws the
+/// handler first (dropping every live tunnel) and then kills and reaps the
+/// server. The server runs under a lifeline guard, so it also dies when
+/// lucidd dies without cleaning up (SIGKILL, crash). It owns the node's
+/// shard-rpc handler slot, so it is only for nodes without a manual
+/// `--shard-rpc-bridge-port`.
+pub struct ManagedShardRpcProvider {
+    stop: tokio::sync::watch::Sender<bool>,
+    serving: tokio::sync::watch::Receiver<Option<u16>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ManagedShardRpcProvider {
+    /// Start supervising; nothing is spawned until `cluster_enabled` is on.
+    pub fn start(
+        discovery: Arc<Discovery>,
+        policy: Arc<PolicyEngine>,
+        node_config: Arc<NodeConfigStore>,
+        config: ManagedRpcServerConfig,
+    ) -> Self {
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (serving_tx, serving) = tokio::sync::watch::channel(None);
+        let manager = RpcServerManager {
+            discovery,
+            policy,
+            node_config,
+            config,
+            stop: stop_rx,
+            serving: serving_tx,
+            failures: Vec::new(),
+        };
+        Self {
+            stop,
+            serving,
+            task: Some(tokio::spawn(manager.run())),
+        }
+    }
+
+    /// Loopback port of the server currently bridged to peers. `None` while
+    /// no server runs; it turns `None` only after the server is reaped.
+    pub fn serving_port(&self) -> Option<u16> {
+        *self.serving.borrow()
+    }
+
+    /// Withdraw the shard-rpc handler, kill and reap the server, and wait
+    /// (bounded) for the manager to finish.
+    pub async fn shutdown(mut self) {
+        self.stop.send_replace(true);
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(MANAGED_RPC_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "auto-managed ggml-rpc-server manager did not stop in time; aborting it"
+                );
+                // The aborted task drops the child, and `kill_on_drop`
+                // still terminates it.
+                task.abort();
+            }
+        }
+    }
+}
+
+impl Drop for ManagedShardRpcProvider {
+    fn drop(&mut self) {
+        // The manager notices and cleans up on its own while the runtime
+        // lives. If it is torn down instead, dropping the server closes its
+        // lifeline, and the guard kills it.
+        self.stop.send_replace(true);
+    }
+}
+
+/// One running managed server under its lifeline guard. Owned by the manager
+/// outside any future it races, so a cancelled wait can still kill **and
+/// reap** it.
+struct ManagedRpcServer {
+    /// The `/bin/sh` lifeline guard; `ggml-rpc-server` is its child.
+    child: Child,
+    /// Write end of the guard's lifeline. Closing it (or lucidd ending in
+    /// any way) makes the guard kill the server.
+    lifeline: Option<tokio::process::ChildStdin>,
+    port: u16,
+    /// Number of `Accepted client connection` lines the server has logged.
+    accepted: tokio::sync::watch::Receiver<u64>,
+    /// The server's pid, as its guard reported it.
+    server_pid: tokio::sync::watch::Receiver<Option<u32>>,
+    log_drain: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ManagedRpcServer {
+    fn drop(&mut self) {
+        // Dropping also closes the lifeline, so the guard kills the server
+        // even if `kill_on_drop` takes the guard down first.
+        self.log_drain.abort();
+    }
+}
+
+enum StartOutcome {
+    Ready(Box<ManagedRpcServer>),
+    Stopped,
+    ClusterOff,
+    Failed(anyhow::Error),
+}
+
+enum RunEnd {
+    Stopped,
+    ClusterOff,
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
+struct RpcServerManager {
+    discovery: Arc<Discovery>,
+    policy: Arc<PolicyEngine>,
+    node_config: Arc<NodeConfigStore>,
+    config: ManagedRpcServerConfig,
+    stop: tokio::sync::watch::Receiver<bool>,
+    serving: tokio::sync::watch::Sender<Option<u16>>,
+    /// Recent start/run failures, for the restart budget.
+    failures: Vec<std::time::Instant>,
+}
+
+impl RpcServerManager {
+    async fn run(mut self) {
+        loop {
+            // Idle until the operator opts in.
+            if !self.wait_for_cluster(true).await {
+                return;
+            }
+            let mut server = match self.start().await {
+                StartOutcome::Ready(server) => *server,
+                StartOutcome::Stopped => return,
+                StartOutcome::ClusterOff => continue,
+                StartOutcome::Failed(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "auto-managed ggml-rpc-server failed to start");
+                    if !self.back_off_after_failure().await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let port = server.port;
+            let installed = make_opt_in_inbound_shard_rpc_handler(
+                self.policy.clone(),
+                self.node_config.clone(),
+                port,
+            )
+            .and_then(|handler| self.discovery.set_shard_rpc_handler(Some(handler)));
+            if let Err(error) = installed {
+                tracing::error!(error = %format!("{error:#}"), "cannot register the shard rpc bridge; stopping the auto-managed ggml-rpc-server");
+                reap_managed_rpc_server(&mut server).await;
+                return;
+            }
+            self.serving.send_replace(Some(port));
+            tracing::info!(
+                loopback_port = port,
+                "auto-managed ggml-rpc-server is bridged to enrolled peers over /phase/shard-rpc/1.0.0"
+            );
+
+            let end = tokio::select! {
+                biased;
+                _ = self.stop.wait_for(|stop| *stop) => RunEnd::Stopped,
+                () = cluster_enabled_becomes(&self.node_config, false, self.config.gate_poll_interval) => RunEnd::ClusterOff,
+                status = server.child.wait() => RunEnd::Exited(status),
+            };
+            // Withdraw first: no new tunnel can reach the dying server, and
+            // every live session the handler admitted drops now.
+            if let Err(error) = self.discovery.set_shard_rpc_handler(None) {
+                tracing::error!(error = %format!("{error:#}"), "cannot withdraw the shard rpc bridge");
+            }
+            reap_managed_rpc_server(&mut server).await;
+            self.serving.send_replace(None);
+            match end {
+                RunEnd::Stopped => {
+                    tracing::info!("stopped the auto-managed ggml-rpc-server");
+                    return;
+                }
+                RunEnd::ClusterOff => {
+                    tracing::info!("cluster_enabled turned off: withdrew the shard rpc bridge and stopped ggml-rpc-server");
+                    self.failures.clear();
+                }
+                RunEnd::Exited(status) => {
+                    tracing::warn!(?status, "auto-managed ggml-rpc-server exited unexpectedly; withdrew the shard rpc bridge");
+                    if !self.back_off_after_failure().await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verify, spawn, and wait for readiness, abandoning (with kill and
+    /// reap) as soon as the opt-in is withdrawn or the provider stops.
+    async fn start(&mut self) -> StartOutcome {
+        let mut server = match spawn_managed_rpc_server(&self.config).await {
+            Ok(server) => server,
+            Err(error) => return StartOutcome::Failed(error),
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = self.stop.wait_for(|stop| *stop) => StartOutcome::Stopped,
+            () = cluster_enabled_becomes(&self.node_config, false, self.config.gate_poll_interval) => StartOutcome::ClusterOff,
+            ready = wait_managed_rpc_server_ready(&mut server, self.config.ready_timeout) => match ready {
+                Ok(()) => return StartOutcome::Ready(Box::new(server)),
+                Err(error) => StartOutcome::Failed(error),
+            },
+        };
+        reap_managed_rpc_server(&mut server).await;
+        outcome
+    }
+
+    /// Record a failure and wait out the restart backoff. Once the failure
+    /// budget is spent, stay stopped until the operator turns
+    /// `cluster_enabled` off (and later on) again. Returns `false` when the
+    /// provider is stopping.
+    async fn back_off_after_failure(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        self.failures
+            .retain(|at| now.duration_since(*at) < MANAGED_RPC_FAILURE_WINDOW);
+        self.failures.push(now);
+        if self.failures.len() >= MANAGED_RPC_MAX_FAILURES {
+            tracing::error!(
+                failures = self.failures.len(),
+                "auto-managed ggml-rpc-server keeps failing; leaving it stopped until cluster_enabled is turned off and on again"
+            );
+            let resumed = self.wait_for_cluster(false).await;
+            self.failures.clear();
+            return resumed;
+        }
+        let exponent = u32::try_from(self.failures.len() - 1).unwrap_or(u32::MAX);
+        let delay = self
+            .config
+            .restart_backoff
+            .saturating_mul(2_u32.saturating_pow(exponent));
+        tokio::select! {
+            biased;
+            _ = self.stop.wait_for(|stop| *stop) => false,
+            // Withdrawn meanwhile: the outer loop idles until it is back.
+            () = cluster_enabled_becomes(&self.node_config, false, self.config.gate_poll_interval) => true,
+            () = tokio::time::sleep(delay) => true,
+        }
+    }
+
+    /// Wait until `cluster_enabled == enabled`; `false` if stopping first.
+    async fn wait_for_cluster(&mut self, enabled: bool) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.stop.wait_for(|stop| *stop) => false,
+            () = cluster_enabled_becomes(&self.node_config, enabled, self.config.gate_poll_interval) => true,
+        }
+    }
+}
+
+async fn cluster_enabled_becomes(node_config: &NodeConfigStore, enabled: bool, every: Duration) {
+    let mut checks = tokio::time::interval(every);
+    checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        checks.tick().await;
+        if node_config.snapshot().cluster_enabled == enabled {
+            return;
+        }
+    }
+}
+
+/// Re-verify the pinned binary, then spawn it on a fresh ephemeral loopback
+/// port inside a cleared environment, under the lifeline guard.
+async fn spawn_managed_rpc_server(config: &ManagedRpcServerConfig) -> Result<ManagedRpcServer> {
+    let binary = config.binary.clone();
+    let cache_dir = config.cache_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        binary.reverify()?;
+        crate::node_config::ensure_private_dir(&cache_dir)
+    })
+    .await
+    .context("ggml-rpc-server verification task failed")??;
+
+    // ggml-rpc-server cannot inherit a listener, so this only proves the port
+    // was free a moment ago; losing the close-to-bind race makes the server
+    // exit, which readiness and supervision catch.
+    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .context("reserve a loopback port for ggml-rpc-server")?
+        .port();
+    let directory = config
+        .binary
+        .path()
+        .parent()
+        .context("ggml-rpc-server path has no parent directory")?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(RPC_SERVER_LIFELINE_GUARD)
+        .arg("ggml-rpc-guard")
+        .arg(config.binary.path());
+    // Nothing from lucidd's environment reaches the guard or the server.
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin");
+    for (key, value) in &config.extra_env {
+        cmd.env(key, value);
+    }
+    cmd.env("LLAMA_CACHE", &config.cache_dir);
+    cmd.env("GUARD_PID_PREFIX", GUARD_PID_LINE_PREFIX);
+    // ggml also searches the working directory for backend plugins; keep it
+    // the verified binary directory rather than wherever lucidd started.
+    cmd.current_dir(directory);
+    cmd.arg("-H").arg("127.0.0.1");
+    cmd.arg("-p").arg(port.to_string());
+    cmd.arg("-c");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "failed to spawn the /bin/sh lifeline guard for {}",
+            config.binary.path().display()
+        )
+    })?;
+    let lifeline = child.stdin.take();
+    let (accepted_tx, accepted) = tokio::sync::watch::channel(0_u64);
+    let (server_pid_tx, server_pid) = tokio::sync::watch::channel(None);
+    let log_drain = match child.stderr.take() {
+        Some(stderr) => tokio::spawn(drain_managed_rpc_server_log(
+            stderr,
+            accepted_tx,
+            server_pid_tx,
+        )),
+        None => tokio::spawn(async {}),
+    };
+    Ok(ManagedRpcServer {
+        child,
+        lifeline,
+        port,
+        accepted,
+        server_pid,
+        log_drain,
+    })
+}
+
+/// Drain the guard's and server's stderr in bounded lines (a full pipe would
+/// stall the server), recording the server pid the guard reports and
+/// counting the accept lines readiness relies on.
+async fn drain_managed_rpc_server_log(
+    mut stderr: tokio::process::ChildStderr,
+    accepted: tokio::sync::watch::Sender<u64>,
+    server_pid: tokio::sync::watch::Sender<Option<u32>>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0_u8; 1024];
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let read = match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        for &byte in &buffer[..read] {
+            if byte != b'\n' {
+                if line.len() < MANAGED_RPC_MAX_LOG_LINE_BYTES {
+                    line.push(byte);
+                }
+                continue;
+            }
+            let text = String::from_utf8_lossy(&line);
+            if text.trim() == GGML_RPC_SERVER_ACCEPT_LINE {
+                accepted.send_modify(|count| *count = count.wrapping_add(1));
+            } else if server_pid.borrow().is_none() {
+                if let Some(pid) = text
+                    .strip_prefix(GUARD_PID_LINE_PREFIX)
+                    .and_then(|pid| pid.trim().parse::<u32>().ok())
+                {
+                    server_pid.send_replace(Some(pid));
+                }
+            }
+            tracing::trace!(target: "lucidd::ggml_rpc_server", line = %text.escape_debug(), "ggml-rpc-server output");
+            line.clear();
+        }
+    }
+}
+
+async fn wait_managed_rpc_server_ready(
+    server: &mut ManagedRpcServer,
+    deadline: Duration,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(status) = server.child.try_wait()? {
+            bail!("ggml-rpc-server exited during startup ({status})");
+        }
+        if started.elapsed() >= deadline {
+            bail!("ggml-rpc-server did not accept connections within {deadline:?}");
+        }
+        let accepted_before = *server.accepted.borrow();
+        let probe = tokio::time::timeout(
+            MANAGED_RPC_SERVER_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port)),
+        )
+        .await;
+        if let Ok(Ok(probe)) = probe {
+            drop(probe);
+            // Only our child logs its own accepts; anything else answering on
+            // the port (it won the close-to-bind race) never produces one.
+            let accepted = &mut server.accepted;
+            let confirmed = tokio::time::timeout(MANAGED_RPC_ACCEPT_CONFIRM_TIMEOUT, async move {
+                accepted
+                    .wait_for(|accepted| *accepted > accepted_before)
+                    .await
+                    .is_ok()
+            })
+            .await;
+            if confirmed != Ok(true) {
+                bail!(
+                    "127.0.0.1:{} answered, but ggml-rpc-server did not accept that connection: another process holds the port",
+                    server.port
+                );
+            }
+            tokio::time::sleep(MANAGED_RPC_SERVER_SETTLE).await;
+            if let Some(status) = server.child.try_wait()? {
+                bail!("ggml-rpc-server exited right after starting ({status})");
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(MANAGED_RPC_SERVER_PROBE_INTERVAL).await;
+    }
+}
+
+/// Stop the server and wait for it, so its port and GPU context are released
+/// before this returns: closing the lifeline makes the guard SIGKILL the
+/// server, reap it, and exit. Killing both directly is only the fallback.
+async fn reap_managed_rpc_server(server: &mut ManagedRpcServer) {
+    drop(server.lifeline.take());
+    if tokio::time::timeout(MANAGED_RPC_REAP_TIMEOUT, server.child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            port = server.port,
+            "ggml-rpc-server guard did not exit after its lifeline closed; killing the server and its guard"
+        );
+        // The guard is still alive, so it has not reaped the server and the
+        // pid cannot have been reused: kill the server first, then the guard.
+        let server_pid = *server.server_pid.borrow();
+        if let Some(pid) = server_pid {
+            let _ = Command::new("/bin/kill")
+                .env_clear()
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        if let Err(error) = server.child.kill().await {
+            tracing::warn!(%error, port = server.port, "failed to kill the ggml-rpc-server guard");
+        }
+    }
 }
 
 /// Wire envelope carried inside `ShardStageRequest::plan_bytes` (opaque to `phase-net`).
@@ -1327,5 +2117,824 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.end, ShardRpcSessionEnd::RemoteClosed, "{report:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Zero-CLI auto-managed ggml-rpc-server
+    // -----------------------------------------------------------------
+
+    /// The managed provider driven against a stand-in `ggml-rpc-server`
+    /// re-entered from this test executable through a recording launcher,
+    /// so the real spawn, readiness, supervision, and reaping paths run.
+    mod managed_rpc_server {
+        use super::*;
+        use std::io::{Read, Write};
+
+        const ENTRYPOINT: &str =
+            "shard_worker::tests::managed_rpc_server::fake_ggml_rpc_server_entrypoint";
+
+        /// Internal subprocess entrypoint: a loopback echo server on the
+        /// launcher's `-p` port. Like the pinned `ggml-rpc-server`, it logs
+        /// each accept to stderr and exits with status 0 when its port is
+        /// taken. Ignored in ordinary runs.
+        #[test]
+        #[ignore = "internal ggml-rpc-server fixture subprocess entrypoint"]
+        fn fake_ggml_rpc_server_entrypoint() {
+            if std::env::var_os("PHASE_FAKE_GGML_RPC_PROCESS").is_none() {
+                eprintln!("internal fixture entrypoint unavailable outside its launcher");
+                return;
+            }
+            let port: u16 = std::env::var("PHASE_FAKE_GGML_RPC_PORT")
+                .expect("launcher sets the port")
+                .parse()
+                .expect("port is a u16");
+            if let Some(ms) = std::env::var("PHASE_FAKE_GGML_RPC_EXIT_AFTER_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    std::process::exit(3);
+                });
+            }
+            if let Some(ms) = std::env::var("PHASE_FAKE_GGML_RPC_BIND_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            // Silent: answers connections like any listener, but never logs
+            // the accept (what readiness sees when another process holds
+            // the port).
+            let silent = std::env::var_os("PHASE_FAKE_GGML_RPC_SILENT").is_some();
+            let Ok(listener) = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            else {
+                eprintln!("Failed to create server socket");
+                std::process::exit(0);
+            };
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                if !silent {
+                    eprintln!("{GGML_RPC_SERVER_ACCEPT_LINE}");
+                }
+                std::thread::spawn(move || {
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                if stream.write_all(&buffer[..read]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        fn shell_quote(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        }
+
+        #[cfg(unix)]
+        fn set_mode(path: &Path, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        struct Fixture {
+            dir: tempfile::TempDir,
+            llama_server: PathBuf,
+            launcher: PathBuf,
+        }
+
+        /// How the stand-in server misbehaves, if at all.
+        #[derive(Default)]
+        struct Behaviour {
+            /// Exit on its own this long after starting.
+            exit_after_ms: Option<u64>,
+            /// Wait this long before binding its port.
+            bind_delay_ms: Option<u64>,
+            /// Never log accepts.
+            silent: bool,
+        }
+
+        impl Fixture {
+            fn new(exit_after_ms: Option<u64>) -> Self {
+                Self::with(Behaviour {
+                    exit_after_ms,
+                    ..Behaviour::default()
+                })
+            }
+
+            /// A fake runtime directory: a `llama-server` file and, beside it,
+            /// a `ggml-rpc-server` launcher that records each spawn's argv,
+            /// environment, working directory, and PID before exec'ing the
+            /// stand-in with `behaviour`.
+            fn with(behaviour: Behaviour) -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let llama_server = dir.path().join("llama-server");
+                std::fs::write(&llama_server, b"#!/bin/sh\nexit 0\n").unwrap();
+                let records = dir.path().join("fixture");
+                let test_exe = std::env::current_exe().unwrap();
+                let script = format!(
+                    r#"#!/bin/sh
+records={records}
+for arg in "$@"; do
+    printf '%s\n' "$arg"
+done > "$records.argv.$$"
+/usr/bin/env > "$records.env.$$"
+pwd -P > "$records.cwd.$$"
+port=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -p)
+            [ "$#" -ge 2 ] || exit 64
+            port="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+[ -n "$port" ] || exit 64
+for kind in argv env cwd; do
+    mv "$records.$kind.$$" "$records.$port.$kind"
+done
+printf '%s\n' "$$" >> "$records.pids"
+export PHASE_FAKE_GGML_RPC_PROCESS=1
+export PHASE_FAKE_GGML_RPC_PORT="$port"
+export PHASE_FAKE_GGML_RPC_EXIT_AFTER_MS={exit_after}
+export PHASE_FAKE_GGML_RPC_BIND_DELAY_MS={bind_delay}
+{silent}exec {exe} --exact {entrypoint} --ignored --nocapture
+"#,
+                    records = shell_quote(records.to_str().unwrap()),
+                    exit_after = shell_quote(
+                        &behaviour
+                            .exit_after_ms
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_default()
+                    ),
+                    bind_delay = shell_quote(
+                        &behaviour
+                            .bind_delay_ms
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_default()
+                    ),
+                    silent = if behaviour.silent {
+                        "export PHASE_FAKE_GGML_RPC_SILENT=1\n"
+                    } else {
+                        ""
+                    },
+                    exe = shell_quote(test_exe.to_str().unwrap()),
+                    entrypoint = ENTRYPOINT,
+                );
+                let launcher = dir.path().join(GGML_RPC_SERVER_BINARY_NAME);
+                std::fs::write(&launcher, script).unwrap();
+                #[cfg(unix)]
+                {
+                    set_mode(&llama_server, 0o755);
+                    set_mode(&launcher, 0o755);
+                }
+                Self {
+                    dir,
+                    llama_server,
+                    launcher,
+                }
+            }
+
+            /// The launcher, pinned to its own digest (production pins only
+            /// accept the real `b12651` bytes).
+            fn pinned(&self) -> PinnedRpcServerBinary {
+                let sha256 = crate::runtime_manager::sha256_file_hex(&self.launcher).unwrap();
+                locate_rpc_server_beside(&self.llama_server, &[sha256.as_str()], self.owner())
+                    .unwrap()
+            }
+
+            /// The test's own account, as owner of everything it created.
+            fn owner(&self) -> u32 {
+                owner_of(self.dir.path())
+            }
+
+            fn cache_dir(&self) -> PathBuf {
+                self.dir.path().join("rpc-cache")
+            }
+
+            fn config(&self) -> ManagedRpcServerConfig {
+                ManagedRpcServerConfig {
+                    ready_timeout: Duration::from_secs(15),
+                    gate_poll_interval: Duration::from_millis(50),
+                    restart_backoff: Duration::from_millis(50),
+                    ..ManagedRpcServerConfig::new(self.pinned(), self.cache_dir())
+                }
+            }
+
+            fn pids(&self) -> Vec<u32> {
+                std::fs::read_to_string(self.dir.path().join("fixture.pids"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| line.parse().unwrap())
+                    .collect()
+            }
+
+            fn record(&self, port: u16, kind: &str) -> Vec<String> {
+                std::fs::read_to_string(self.dir.path().join(format!("fixture.{port}.{kind}")))
+                    .unwrap_or_else(|_| panic!("spawn on {port} recorded its {kind}"))
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+
+        #[cfg(unix)]
+        fn owner_of(path: &Path) -> u32 {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().uid()
+        }
+
+        #[cfg(not(unix))]
+        fn owner_of(_: &Path) -> u32 {
+            0
+        }
+
+        /// `true` while `pid` still exists, zombie included: a reaped child
+        /// is gone from the process table.
+        fn pid_exists(pid: u32) -> bool {
+            std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stderr(Stdio::null())
+                .status()
+                .expect("probe pid")
+                .success()
+        }
+
+        async fn wait_serving(
+            provider: &ManagedShardRpcProvider,
+            within: Duration,
+            predicate: impl Fn(Option<u16>) -> bool,
+        ) -> Option<u16> {
+            let started = tokio::time::Instant::now();
+            loop {
+                let port = provider.serving_port();
+                if predicate(port) {
+                    return port;
+                }
+                assert!(
+                    started.elapsed() < within,
+                    "serving port never reached the expected state (now {port:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// The provider's shard-rpc handler slot is empty: `phase-net` drops
+        /// the stream before any admission decision. A handler still
+        /// installed would answer with a rejection instead (cluster off, or
+        /// its dead backend unavailable).
+        async fn assert_no_bridge(coordinator: &Discovery, provider: PeerId, session: u8) {
+            let refused = coordinator
+                .open_shard_rpc_tunnel(provider, rpc_open(session))
+                .await
+                .expect_err("no bridge, no tunnel");
+            assert!(
+                !format!("{refused:#}").contains("rejected"),
+                "the bridge must be withdrawn, not merely refusing: {refused:#}"
+            );
+        }
+
+        async fn wait_pids(fixture: &Fixture, count: usize, within: Duration) {
+            let started = tokio::time::Instant::now();
+            while fixture.pids().len() < count {
+                assert!(
+                    started.elapsed() < within,
+                    "expected {count} spawns, saw {:?}",
+                    fixture.pids()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn echo_round_trip(
+            coordinator: &Discovery,
+            provider: PeerId,
+            session_byte: u8,
+        ) -> (
+            tokio::io::DuplexStream,
+            tokio::task::JoinHandle<phase_net::ShardRpcSessionReport>,
+        ) {
+            let tunnel = coordinator
+                .open_shard_rpc_tunnel(provider, rpc_open(session_byte))
+                .await
+                .expect("enrolled coordinator is admitted");
+            let (splice_io, mut local) = tokio::io::duplex(64 * 1024);
+            let session = tokio::spawn(tunnel.splice(splice_io, None));
+            let payload = pattern(256 * 1024, u32::from(session_byte));
+            local.write_all(&payload).await.unwrap();
+            let mut echoed = vec![0_u8; payload.len()];
+            tokio::time::timeout(Duration::from_secs(20), local.read_exact(&mut echoed))
+                .await
+                .expect("echo through the managed server completes")
+                .unwrap();
+            assert!(echoed == payload, "bytes survive the managed bridge intact");
+            (local, session)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn locate_requires_a_pinned_owner_only_executable_beside_llama_server() {
+            let fixture = Fixture::new(None);
+            let digest = crate::runtime_manager::sha256_file_hex(&fixture.launcher).unwrap();
+            let pinned = [digest.as_str()];
+            let owner = fixture.owner();
+            let located = locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap();
+            assert_eq!(
+                located.path(),
+                fixture
+                    .dir
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(GGML_RPC_SERVER_BINARY_NAME)
+            );
+            assert_eq!(located.sha256(), digest);
+
+            // Production pins accept only the real b12651 bytes.
+            let unpinned = locate_pinned_ggml_rpc_server(&fixture.llama_server, owner).unwrap_err();
+            assert!(
+                format!("{unpinned:#}").contains("not the pinned b12651"),
+                "{unpinned:#}"
+            );
+            // Never resolved through PATH or a relative path.
+            assert!(locate_rpc_server_beside(Path::new("llama-server"), &pinned, owner).is_err());
+
+            // Writable by group/others, or in such a directory: refused.
+            set_mode(&fixture.launcher, 0o775);
+            assert!(locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).is_err());
+            set_mode(&fixture.launcher, 0o644);
+            let not_executable =
+                locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap_err();
+            assert!(format!("{not_executable:#}").contains("not executable"));
+            set_mode(&fixture.launcher, 0o755);
+            set_mode(fixture.dir.path(), 0o777);
+            let shared_dir =
+                locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap_err();
+            assert!(
+                format!("{shared_dir:#}").contains("loads its libraries"),
+                "{shared_dir:#}"
+            );
+            set_mode(fixture.dir.path(), 0o700);
+
+            // A symlink in place of the binary is refused, even to pinned bytes.
+            let real = fixture.dir.path().join("real-ggml-rpc-server");
+            std::fs::rename(&fixture.launcher, &real).unwrap();
+            std::os::unix::fs::symlink(&real, &fixture.launcher).unwrap();
+            assert!(locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).is_err());
+            std::fs::remove_file(&fixture.launcher).unwrap();
+            assert!(locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).is_err());
+            std::fs::rename(&real, &fixture.launcher).unwrap();
+
+            // Owned by anyone but root or this node's owner: refused. (Run
+            // as root, everything here is root-owned and trusted.)
+            if owner != 0 {
+                let foreign =
+                    locate_rpc_server_beside(&fixture.llama_server, &pinned, owner.wrapping_add(1))
+                        .unwrap_err();
+                assert!(
+                    format!("{foreign:#}").contains("not root or this node's owner"),
+                    "{foreign:#}"
+                );
+            }
+
+            // Libraries it loads from its directory must be owner-only
+            // writable and must not point outside it.
+            let library = fixture.dir.path().join("libggml-base.so");
+            std::fs::write(&library, b"library").unwrap();
+            set_mode(&library, 0o666);
+            let writable_library =
+                locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap_err();
+            assert!(
+                format!("{writable_library:#}").contains("libggml-base.so"),
+                "{writable_library:#}"
+            );
+            set_mode(&library, 0o644);
+            locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let elsewhere = outside.path().join("libggml-cpu.so");
+            std::fs::write(&elsewhere, b"library").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, fixture.dir.path().join("libggml-cpu.so"))
+                .unwrap();
+            let escaping =
+                locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap_err();
+            assert!(
+                format!("{escaping:#}").contains("must resolve inside"),
+                "{escaping:#}"
+            );
+            std::fs::remove_file(fixture.dir.path().join("libggml-cpu.so")).unwrap();
+            // A library symlink to any writable file beside it is refused too.
+            let blob = fixture.dir.path().join("blob.so");
+            std::fs::write(&blob, b"library").unwrap();
+            set_mode(&blob, 0o666);
+            std::os::unix::fs::symlink(&blob, fixture.dir.path().join("libggml-cpu.so")).unwrap();
+            let writable_target =
+                locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap_err();
+            assert!(
+                format!("{writable_target:#}").contains("blob.so"),
+                "{writable_target:#}"
+            );
+            std::fs::remove_file(fixture.dir.path().join("libggml-cpu.so")).unwrap();
+            std::fs::remove_file(&blob).unwrap();
+
+            // A directory above it that others can write (and is not sticky)
+            // lets them swap the whole runtime directory: refused.
+            let shared = fixture.dir.path().join("shared");
+            let runtime = shared.join("runtime");
+            std::fs::create_dir_all(&runtime).unwrap();
+            for name in ["llama-server", GGML_RPC_SERVER_BINARY_NAME] {
+                std::fs::copy(fixture.dir.path().join(name), runtime.join(name)).unwrap();
+                set_mode(&runtime.join(name), 0o755);
+            }
+            set_mode(&shared, 0o777);
+            let swappable = locate_rpc_server_beside(&runtime.join("llama-server"), &pinned, owner)
+                .unwrap_err();
+            assert!(format!("{swappable:#}").contains("shared"), "{swappable:#}");
+            set_mode(&shared, 0o1777);
+            locate_rpc_server_beside(&runtime.join("llama-server"), &pinned, owner)
+                .expect("a sticky ancestor cannot have our entries renamed");
+            set_mode(&shared, 0o755);
+
+            // Replacing the located bytes later fails re-verification.
+            let located = locate_rpc_server_beside(&fixture.llama_server, &pinned, owner).unwrap();
+            located.reverify().unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&fixture.launcher)
+                .unwrap();
+            file.write_all(b"# replaced\n").unwrap();
+            assert!(located.reverify().is_err());
+        }
+
+        #[test]
+        fn pinned_rpc_server_digests_cover_every_pinned_llama_asset() {
+            for asset in crate::runtime_manager::PINNED_LLAMA_ASSETS {
+                assert_eq!(asset.tag, "b12651");
+                let pinned = PINNED_GGML_RPC_SERVER_SHA256
+                    .iter()
+                    .find(|(platform, _)| *platform == asset.platform_id)
+                    .unwrap_or_else(|| panic!("no ggml-rpc-server pin for {}", asset.platform_id));
+                assert_eq!(pinned.1.len(), 64);
+                assert!(pinned
+                    .1
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            }
+            assert_eq!(
+                PINNED_GGML_RPC_SERVER_SHA256.len(),
+                crate::runtime_manager::PINNED_LLAMA_ASSETS.len()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn runs_only_while_cluster_enabled_and_bridges_enrolled_tunnels() {
+            let _gate = two_node_gate().await;
+            let fixture = Fixture::new(None);
+            let provider_identity = NodeIdentity::generate();
+            let coordinator_identity = NodeIdentity::generate();
+            let provider = discovery_for(&provider_identity);
+            let coordinator = discovery_for(&coordinator_identity);
+            connect(&coordinator, &provider).await;
+            let provider_peer = *provider.local_peer_id();
+            let node_config = cluster_config(false);
+            let managed = ManagedShardRpcProvider::start(
+                provider.clone(),
+                policy_enrolling(&[&coordinator_identity]),
+                node_config.clone(),
+                fixture.config(),
+            );
+
+            // Default off: no server, no bridge.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(managed.serving_port(), None);
+            assert!(
+                fixture.pids().is_empty(),
+                "nothing spawns before the opt-in"
+            );
+            assert!(
+                !fixture.cache_dir().exists(),
+                "nothing is even prepared before the opt-in"
+            );
+            assert_no_bridge(&coordinator, provider_peer, 20).await;
+
+            // Opting in spawns the server on demand and bridges to it.
+            set_cluster(&node_config, true);
+            let port = wait_serving(&managed, Duration::from_secs(15), |port| port.is_some())
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.record(port, "argv"),
+                ["-H", "127.0.0.1", "-p", &port.to_string(), "-c"]
+            );
+            let env = fixture.record(port, "env");
+            assert!(env.contains(&"PATH=/usr/bin:/bin".to_string()), "{env:?}");
+            assert!(
+                env.contains(&format!("LLAMA_CACHE={}", fixture.cache_dir().display())),
+                "{env:?}"
+            );
+            assert!(
+                !env.iter()
+                    .any(|entry| entry.starts_with("HOME=") || entry.starts_with("CARGO")),
+                "lucidd's environment must not reach the server: {env:?}"
+            );
+            assert_eq!(
+                fixture.record(port, "cwd"),
+                [fixture
+                    .pinned()
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .display()
+                    .to_string()]
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(fixture.cache_dir())
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700, "tensor cache stays private");
+            }
+            let (mut local, session) = echo_round_trip(&coordinator, provider_peer, 21).await;
+
+            // Withdrawing the opt-in drops the live tunnel, then kills and
+            // reaps the server before the port reads as no longer serving.
+            let first_pid = fixture.pids()[0];
+            set_cluster(&node_config, false);
+            wait_serving(&managed, Duration::from_secs(5), |port| port.is_none()).await;
+            assert!(
+                !pid_exists(first_pid),
+                "ggml-rpc-server {first_pid} must be reaped"
+            );
+            assert!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok());
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), local.read_to_end(&mut rest))
+                .await
+                .expect("coordinator observes the tunnel ending")
+                .unwrap();
+            drop(local);
+            let report = tokio::time::timeout(Duration::from_secs(5), session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.end, ShardRpcSessionEnd::RemoteClosed, "{report:?}");
+            assert_no_bridge(&coordinator, provider_peer, 22).await;
+
+            // Opting in again starts a fresh server.
+            set_cluster(&node_config, true);
+            wait_serving(&managed, Duration::from_secs(15), |port| port.is_some()).await;
+            assert_eq!(fixture.pids().len(), 2);
+            let (local, _session) = echo_round_trip(&coordinator, provider_peer, 23).await;
+            drop(local);
+
+            // Shutdown (lucidd exiting) kills and reaps it and withdraws the bridge.
+            let second_pid = fixture.pids()[1];
+            managed.shutdown().await;
+            assert!(
+                !pid_exists(second_pid),
+                "ggml-rpc-server {second_pid} must be reaped"
+            );
+            assert_no_bridge(&coordinator, provider_peer, 24).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_crashed_server_is_unbridged_and_restarted() {
+            let _gate = two_node_gate().await;
+            let fixture = Fixture::new(Some(3_000));
+            let provider = discovery_for(&NodeIdentity::generate());
+            let managed = ManagedShardRpcProvider::start(
+                provider,
+                policy_enrolling(&[]),
+                cluster_config(true),
+                fixture.config(),
+            );
+            wait_serving(&managed, Duration::from_secs(15), |port| port.is_some()).await;
+            // The server exits on its own; the bridge comes down with it...
+            wait_serving(&managed, Duration::from_secs(5), |port| port.is_none()).await;
+            assert!(!pid_exists(fixture.pids()[0]));
+            // ...and a replacement is started and bridged after the backoff.
+            wait_serving(&managed, Duration::from_secs(15), |port| port.is_some()).await;
+            assert!(fixture.pids().len() >= 2);
+            managed.shutdown().await;
+            assert!(fixture.pids().iter().all(|pid| !pid_exists(*pid)));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repeated_start_failures_stop_retrying_until_cluster_is_toggled() {
+            let _gate = two_node_gate().await;
+            // Exits immediately, as if it lost its port every time.
+            let fixture = Fixture::new(Some(0));
+            let node_config = cluster_config(true);
+            let managed = ManagedShardRpcProvider::start(
+                discovery_for(&NodeIdentity::generate()),
+                policy_enrolling(&[]),
+                node_config.clone(),
+                fixture.config(),
+            );
+            let started = tokio::time::Instant::now();
+            while fixture.pids().len() < MANAGED_RPC_MAX_FAILURES {
+                assert_eq!(
+                    managed.serving_port(),
+                    None,
+                    "a failed start is never bridged"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "{:?}",
+                    fixture.pids()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(
+                fixture.pids().len(),
+                MANAGED_RPC_MAX_FAILURES,
+                "budget spent: no more retries"
+            );
+            assert!(fixture.pids().iter().all(|pid| !pid_exists(*pid)));
+
+            // Turning the opt-in off and on again re-arms it.
+            set_cluster(&node_config, false);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            set_cluster(&node_config, true);
+            wait_pids(
+                &fixture,
+                MANAGED_RPC_MAX_FAILURES + 1,
+                Duration::from_secs(10),
+            )
+            .await;
+            managed.shutdown().await;
+            assert!(fixture.pids().iter().all(|pid| !pid_exists(*pid)));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_listener_that_never_logs_our_accept_is_never_bridged() {
+            let _gate = two_node_gate().await;
+            // Stands in for another process winning the race for the reserved
+            // port: the probe connects, but our child never logs accepting it.
+            let fixture = Fixture::with(Behaviour {
+                silent: true,
+                ..Behaviour::default()
+            });
+            let managed = ManagedShardRpcProvider::start(
+                discovery_for(&NodeIdentity::generate()),
+                policy_enrolling(&[]),
+                cluster_config(true),
+                fixture.config(),
+            );
+            let started = tokio::time::Instant::now();
+            while fixture.pids().len() < MANAGED_RPC_MAX_FAILURES {
+                assert_eq!(
+                    managed.serving_port(),
+                    None,
+                    "an unconfirmed listener is never bridged"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{:?}",
+                    fixture.pids()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Each attempt is refused once its accept confirmation times
+            // out, then killed and reaped; the spent budget starts no more.
+            let started = tokio::time::Instant::now();
+            while fixture.pids().iter().any(|pid| pid_exists(*pid)) {
+                assert_eq!(managed.serving_port(), None);
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "an unconfirmed server was not reaped"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(managed.serving_port(), None);
+            assert_eq!(fixture.pids().len(), MANAGED_RPC_MAX_FAILURES);
+            managed.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn withdrawing_cluster_during_startup_kills_the_starting_server() {
+            let _gate = two_node_gate().await;
+            let fixture = Fixture::with(Behaviour {
+                bind_delay_ms: Some(10_000),
+                ..Behaviour::default()
+            });
+            let node_config = cluster_config(true);
+            let managed = ManagedShardRpcProvider::start(
+                discovery_for(&NodeIdentity::generate()),
+                policy_enrolling(&[]),
+                node_config.clone(),
+                fixture.config(),
+            );
+            wait_pids(&fixture, 1, Duration::from_secs(10)).await;
+            let pid = fixture.pids()[0];
+            set_cluster(&node_config, false);
+            let started = tokio::time::Instant::now();
+            while pid_exists(pid) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "starting server outlived the opt-in"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(managed.serving_port(), None);
+            assert_eq!(fixture.pids().len(), 1, "no restart while opted out");
+            managed.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dropping_the_provider_without_shutdown_still_reaps_the_server() {
+            let _gate = two_node_gate().await;
+            let fixture = Fixture::new(None);
+            let managed = ManagedShardRpcProvider::start(
+                discovery_for(&NodeIdentity::generate()),
+                policy_enrolling(&[]),
+                cluster_config(true),
+                fixture.config(),
+            );
+            wait_serving(&managed, Duration::from_secs(15), |port| port.is_some()).await;
+            let pid = fixture.pids()[0];
+            drop(managed);
+            let started = tokio::time::Instant::now();
+            while pid_exists(pid) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "server outlived its provider"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_server_dies_with_its_lifeline_even_when_the_guard_is_killed() {
+            let _gate = two_node_gate().await;
+            let fixture = Fixture::new(None);
+            let config = fixture.config();
+            let mut server = spawn_managed_rpc_server(&config).await.unwrap();
+            wait_managed_rpc_server_ready(&mut server, Duration::from_secs(15))
+                .await
+                .expect("stand-in becomes ready");
+            let pid = fixture.pids()[0];
+            assert_eq!(
+                *server.server_pid.borrow(),
+                Some(pid),
+                "the guard reports the server pid the last-resort kill targets"
+            );
+
+            // SIGKILL the guard, as `kill_on_drop` or a crash would: the
+            // server keeps running only while lucidd's end of the lifeline
+            // is open...
+            server.child.kill().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(pid_exists(pid), "the guard alone does not hold the server");
+            // ...and dies as soon as it closes, which is also what any exit
+            // of lucidd itself does, SIGKILL included.
+            drop(server.lifeline.take());
+            let started = tokio::time::Instant::now();
+            while pid_exists(pid) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "server outlived its lifeline"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_binary_replaced_after_startup_is_never_spawned() {
+            let fixture = Fixture::new(None);
+            let config = fixture.config();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&fixture.launcher)
+                .unwrap();
+            file.write_all(b"# replaced\n").unwrap();
+            drop(file);
+            let managed = ManagedShardRpcProvider::start(
+                discovery_for(&NodeIdentity::generate()),
+                policy_enrolling(&[]),
+                cluster_config(true),
+                config,
+            );
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
+            assert_eq!(managed.serving_port(), None);
+            assert!(
+                fixture.pids().is_empty(),
+                "a replaced binary must never run"
+            );
+            managed.shutdown().await;
+        }
     }
 }

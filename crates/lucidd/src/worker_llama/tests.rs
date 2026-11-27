@@ -18,6 +18,7 @@ fn test_loaded_model(port: u16, supervisor: tokio::task::JoinHandle<()>) -> Arc<
         kill,
         stopped,
         supervisor,
+        residency: Arc::new(Residency::healthy("test", false, false, SystemTime::now())),
     })
 }
 
@@ -1003,6 +1004,12 @@ async fn closing_rpc_gate_at_runtime_kills_resident_rpc_backed_children() {
         kill,
         stopped,
         supervisor: tokio::spawn(std::future::pending::<()>()),
+        residency: Arc::new(Residency::healthy(
+            "resident",
+            false,
+            true,
+            SystemTime::now(),
+        )),
     });
     worker
         .inner
@@ -1039,6 +1046,7 @@ async fn shutdown_signals_supervisor_and_wait_stopped_observes_completion() {
         kill,
         stopped,
         supervisor,
+        residency: Arc::new(Residency::healthy("test", false, false, SystemTime::now())),
     };
     assert!(!model.wait_stopped(Duration::from_millis(50)).await);
     model.shutdown();
@@ -1088,6 +1096,12 @@ async fn supervisor_kills_reaps_and_releases_port_on_kill_signal() {
             embeddings: false,
             rpc_endpoints: Vec::new(),
             rpc_peer_proxies: None,
+            residency: Arc::new(Residency::healthy(
+                "stand-in",
+                false,
+                false,
+                SystemTime::now(),
+            )),
         },
         child,
     ));
@@ -1152,6 +1166,12 @@ async fn dropping_the_loaded_model_handle_kills_the_supervised_child() {
             embeddings: false,
             rpc_endpoints: Vec::new(),
             rpc_peer_proxies: None,
+            residency: Arc::new(Residency::healthy(
+                "stand-in",
+                false,
+                false,
+                SystemTime::now(),
+            )),
         },
         child,
     ));
@@ -1163,4 +1183,105 @@ async fn dropping_the_loaded_model_handle_kills_the_supervised_child() {
         .ok();
     task.await.unwrap();
     assert!(!worker.inner.ports_in_use.lock().unwrap().contains(&port));
+}
+
+#[test]
+fn residency_reports_only_a_healthy_current_child() {
+    let residency = Residency::healthy("alpha", false, false, SystemTime::now());
+    let since = residency.healthy_since().expect("healthy at the gate");
+
+    // A failed periodic probe hides the model until a probe passes again;
+    // recovery keeps the original readiness time.
+    residency.record_probe(false);
+    assert_eq!(residency.healthy_since(), None);
+    residency.record_probe(true);
+    assert_eq!(residency.healthy_since(), Some(since));
+
+    // Once the child is gone, no probe result can resurrect it...
+    residency.mark_down();
+    residency.record_probe(true);
+    assert_eq!(residency.healthy_since(), None);
+    // ...only a respawn that passes `/health`, which reports its own time.
+    residency.mark_healthy_now();
+    assert!(residency
+        .healthy_since()
+        .is_some_and(|respawn| respawn >= since));
+}
+
+#[tokio::test]
+async fn resident_models_skip_failed_and_unhealthy_instances_and_sort_by_model_then_kind() {
+    let worker = LlamaCppWorker::new(NodeIdentity::generate(), LlamaCppConfig::default());
+    let insert = |key: &str, residency: Residency| {
+        let mut model = test_loaded_model(18080, tokio::spawn(std::future::pending::<()>()));
+        Arc::get_mut(&mut model).expect("sole handle").residency = Arc::new(residency);
+        worker.inner.loaded_models.insert(key.into(), model.clone());
+        model
+    };
+    insert(
+        "zeta",
+        Residency::healthy("zeta", false, true, SystemTime::now()),
+    );
+    insert(
+        "alpha\u{0}emb",
+        Residency::healthy("alpha", true, false, SystemTime::now()),
+    );
+    insert(
+        "alpha",
+        Residency::healthy("alpha", false, false, SystemTime::now()),
+    );
+    insert(
+        "probing",
+        Residency::healthy("probing", false, false, SystemTime::now()),
+    )
+    .residency
+    .record_probe(false);
+    insert(
+        "respawning",
+        Residency::healthy("respawning", false, false, SystemTime::now()),
+    )
+    .residency
+    .mark_down();
+    insert(
+        "retired",
+        Residency::healthy("retired", false, false, SystemTime::now()),
+    )
+    .shutdown();
+
+    let resident = worker.resident_models();
+    let summary: Vec<_> = resident
+        .iter()
+        .map(|model| {
+            (
+                model.model_id.as_str(),
+                model.kind,
+                model.trusted_circle_sharded,
+                model.backend,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                "alpha",
+                ResidentModelKind::Generation,
+                false,
+                LLAMA_CPP_BACKEND
+            ),
+            (
+                "alpha",
+                ResidentModelKind::Embedding,
+                false,
+                LLAMA_CPP_BACKEND
+            ),
+            (
+                "zeta",
+                ResidentModelKind::Generation,
+                true,
+                LLAMA_CPP_BACKEND
+            ),
+        ]
+    );
+    assert_eq!(worker.resident_models_handle().snapshot(), resident);
+    assert!(ResidentModels::none().snapshot().is_empty());
 }
