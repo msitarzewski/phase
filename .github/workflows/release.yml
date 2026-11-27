@@ -50,6 +50,10 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/lucid-desktop/src-tauri -> target
 
       - name: Build and verify release bundle
         env:
@@ -97,7 +101,7 @@ jobs:
   build-macos:
     name: Build macOS Apple Silicon (CLI + LUCID.app)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,6 +111,10 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/lucid-desktop/src-tauri -> target
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

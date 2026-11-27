@@ -1305,7 +1305,13 @@ pub struct ModelRegistry {
     /// alias→CID resolutions to avoid repeating WAN DHT lookups on every
     /// `/api/chat` request.
     alias_cid_cache: RwLock<HashMap<String, (ModelCid, tokio::time::Instant)>>,
+    /// Short-TTL, bounded cache of cryptographically verified peer lists per
+    /// model CID from legacy single-key DHT queries, preventing repeated 10s
+    /// Kademlia sweeps on back-to-back `/api/chat` requests.
+    model_peers_cache: RwLock<HashMap<ModelCid, CachedModelPeers>>,
 }
+
+type CachedModelPeers = (Vec<(PeerId, ModelCapabilities)>, tokio::time::Instant);
 
 impl ModelRegistry {
     async fn refresh_network_catalog(&self) {
@@ -1480,6 +1486,7 @@ impl ModelRegistry {
             catalog_query: Mutex::new(()),
             network_catalog: RwLock::new(NetworkCatalogCache::default()),
             alias_cid_cache: RwLock::new(HashMap::new()),
+            model_peers_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1541,6 +1548,7 @@ impl ModelRegistry {
             catalog_query: Mutex::new(()),
             network_catalog: RwLock::new(NetworkCatalogCache::default()),
             alias_cid_cache: RwLock::new(HashMap::new()),
+            model_peers_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -2645,11 +2653,29 @@ impl ModelRegistry {
                 .refreshed
                 .is_none_or(|at| at.elapsed() >= CATALOG_REFRESH_INTERVAL)
         };
-        // Refresh the multi-peer catalog before falling back to the legacy
-        // single-key DHT record (which is last-writer-wins on Kademlia and
-        // can hide additional peers serving the same model CID).
+        // Check short-TTL verified single-key peer cache before hitting WAN DHT.
+        {
+            let now = unix_ms_now();
+            let cache = self.model_peers_cache.read().await;
+            if let Some((cached, cached_at)) = cache.get(model_cid) {
+                if cached_at.elapsed() < CATALOG_REFRESH_INTERVAL {
+                    let valid: Vec<_> = cached
+                        .iter()
+                        .filter(|(_, caps)| caps.validate_at(now).is_ok())
+                        .cloned()
+                        .collect();
+                    if !valid.is_empty() {
+                        return Ok(valid);
+                    }
+                }
+            }
+        }
+        // Bound opportunistic multi-peer catalog refresh tightly so a slow or
+        // unreachable peer never stalls live `/api/chat` routing for 8 seconds.
         if needs_catalog_refresh {
-            let _ = self.discover_network_models().await;
+            let _ =
+                tokio::time::timeout(Duration::from_millis(500), self.discover_network_models())
+                    .await;
             let cache = self.network_catalog.read().await;
             let candidates = lookup_cached(&cache);
             if !candidates.is_empty() {
@@ -2711,6 +2737,16 @@ impl ModelRegistry {
                     debug!("registry: drop unverifiable record: {e}");
                 }
             }
+        }
+        if !out.is_empty() {
+            let mut cache = self.model_peers_cache.write().await;
+            if cache.len() >= 256 {
+                cache.retain(|_, (_, at)| at.elapsed() < CATALOG_REFRESH_INTERVAL);
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+            }
+            cache.insert(*model_cid, (out.clone(), tokio::time::Instant::now()));
         }
         Ok(out)
     }

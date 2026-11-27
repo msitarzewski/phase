@@ -35,7 +35,10 @@ const MAX_GRANTS: usize = 1024;
 const MAX_STORE_BYTES: usize = 1024 * 1024;
 const MAX_INVITE_TTL_SECS: u64 = 3600;
 const GRANT_TTL_SECS: u64 = 24 * 3600;
-const QUERY_DEADLINE: Duration = Duration::from_secs(5);
+// Must exceed phase-net's 10s DISCOVERY_OPERATION_TIMEOUT so WAN Kademlia
+// PutRecord/GetRecord calls across NATted or --outbound-only fleets flush
+// collected records rather than timing out prematurely.
+const QUERY_DEADLINE: Duration = Duration::from_secs(15);
 const ENROLLMENT_DEADLINE: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const INVITE_DOMAIN: &str = "phase/lucid-enrollment/invitation/v1";

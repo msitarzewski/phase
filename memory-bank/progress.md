@@ -1,20 +1,20 @@
 # Progress: Phase Open MVP + Phase Core + LUCID
 
-**Last Updated**: 2026-11-26
-**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 physical fleet qualification (`v0.2.0-rc4` → `v0.2.0-rc6` live on all 5 nodes, `v0.2.0-rc7` performance sprint)
+**Last Updated**: 2026-11-27
+**Version**: 1.0 (MVP) + phase-core M1-M8 + LUCID v0.1/v0.1.1 shipped + LUCID v0.2 physical fleet qualification (`v0.2.0-rc4` → `v0.2.0-rc8` across all 5 physical nodes)
 **Phase**: LUCID v0.2 physical fleet qualification is active and advancing rapidly across all 5 hardware nodes (Cloud Relay, Ubuntu Desktop, Ubuntu Laptop, Mac M1 Max, Mac M5 Max). Full scorecard & benchmark trend live in [fleet-progress-report.md](releases/lucid-v0.2/fleet-progress-report.md).
 
 ---
 
 ## Major Deliverables
 
-### Physical Fleet Qualification & Performance Iteration (`v0.2.0-rc4` → `v0.2.0-rc7`, 2026-11-26)
+### Physical Fleet Qualification & Performance Iteration (`v0.2.0-rc4` → `v0.2.0-rc8`, 2026-11-26 → 2026-11-27)
 
 - **Live 5-Node Physical Fleet & Public DNS**: Provisioned hardened Cloud Relay (`User=lucid`, TCP `4001`, `18.5 MiB` RSS, Caddy untouched) and updated `bootstrap.phasebased.net` TXT via Porkbun v3 API; verified zero-config bootstrap across Mac M5 Max (`366 ms`), Ubuntu Desktop (`51 ms` relay reservation), Mac M1 Max, and Ubuntu Laptop (`DCUtR`).
-- **Benchmark Progression (`lucidd bench`, `100%` verified Ed25519 receipts)**: Progressed from `3.7 ch/s` (`4,468 ms` TTFT p50, Run #1 CPU fallback) → `12.0 tok/s` (`2,710 ms`, Run #2 Mac M1 Max Metal `c=2`) → `24.1 tok/s` (`2,422 ms`, Run #4 `c=4`) → **`24.7 tok/s`** (`1,696 ms` TTFT p50, **`-30%` TTFT**, **`6.7×` Run #1**, Run #5B `v0.2.0-rc7`).
+- **Benchmark Progression (`lucidd bench`, `50/50` = `100%` verified Ed25519 receipts)**: Progressed from `3.7 ch/s` (`4,468 ms` TTFT p50, Run #1 CPU fallback) → `12.0 tok/s` (`2,710 ms`, Run #2 Mac M1 Max Metal `c=2`) → `24.1 tok/s` (`2,422 ms`, Run #4 `c=4`) → `24.7 tok/s` (`1,696 ms`, Run #5B Metal) → `66.7 tok/s` (`72 ms`, Run #6 local MLX) → **`67.1 tok/s` (`85 ms` TTFT p50, `206 ms` p95, `18.1×` Run #1, Run #7B WAN Apple Silicon MLX over Cloud Relay — within `13 ms` of local loopback!)** + 2-peer reputation-guided routing (`Run #8`: `peer_count: 2`, `20.7 tok/s`, `2.88×` Run #3).
 - **Physical 10.18 GB P2P Pull + Interrupt & Resume**: Pulled `qwen3.8-iq3xxs:latest` (`10,934,860,704 B`) from Ubuntu Desktop → Mac M1 Max, interrupted at `172 MiB`, resumed at exact byte offset (`180,289,536 B`), SHA-256 verified (`c0b7c303…`), and installed read-only.
-- **Security & Portability Hardening**: Verified default-deny rejection of uninvited DCUtR-connected Ubuntu Laptop; fixed 2012 Ivy Bridge BMI1 `andn` `SIGILL` via baseline `x86-64` Linux release flags; fixed `:latest` human-name routing in `ModelRegistry::resolve_model_cid`; honored `node.toml` `serve_model_content`; added Ollama CUDA-12 library discovery + graceful stale-runtime fallback; cut startup catalog restore from `20.19s → 9.2 ms` (2,194×) + eliminated inode triple-hashing + switched multi-GB SHA-256 to hardware-accelerated `ring::digest::SHA256` (`~2.7 GB/s`, 7.8× faster); added short-TTL verified alias cache, multi-peer catalog refresh in `find_peers_for_model`, in-flight load-aware peer spreading, and `--cache-reuse 256`.
-- **Tier-1 `ShardWorker` Real GGUF Validation**: Inspected real `86.7 GB` `DeepSeek-V4-Flash` GGUF in `<100 ms` into a coordinator-signed 3-stage fleet plan (`43 layers`).
+- **Security, Enrollment, & Performance Hardening**: Verified default-deny rejection of uninvited DCUtR-connected Ubuntu Laptop; fixed 2012 Ivy Bridge BMI1 `andn` `SIGILL` via baseline `x86-64` Linux release flags; fixed `:latest` human-name routing in `ModelRegistry::resolve_model_cid`; honored `node.toml` `serve_model_content`; added Ollama CUDA-12 library discovery + graceful stale-runtime fallback; cut startup catalog restore `20.19s → 9.2 ms` (2,194×) + eliminated inode triple-hashing + switched multi-GB SHA-256 to `ring::digest::SHA256` (`~2.7 GB/s`, 7.8× faster); added `mlx-lm 0.32.x` `delta.reasoning` parsing + `SIGTERM`/`SIGINT` graceful child reaping; added `model_peers_cache` + `500 ms` catalog bound (cutting WAN MLX TTFT `10,458 → 85 ms`, **123× faster**); fixed WAN DHT enrollment timeout (`consumer.rs` `QUERY_DEADLINE` 5s→15s above `phase-net`'s 10s Kademlia sweep); added Tauri workspace caching + `60m` macOS timeout in `.github/workflows/release.yml`.
+- **Live Cross-Machine Tier-1 `ShardWorker` (`Run #9`)**: Inspected real `86.7 GB` `DeepSeek-V4-Flash` GGUF (`<100 ms`), added control-token-authenticated `POST /api/lucid/cluster/execute` + dedicated shard-worker invitation minting, and verified live 2-stage execution across **Mac M5 Max → Cloud Relay → Mac M1 Max** in **`51.5 ms`** with Tier-2 fail-closed (`403`), local/remote `cluster_enabled=false` default-deny, live zero-restart opt-in toggle, and `2/2` chained Ed25519 stage receipts (`trust_label: "trusted-circle-sharded"`).
 
 ### Self-configuring `lucidd`, Tauri v2 desktop app, `lucidd bench`, & Tier-1 `ShardWorker` foundation (2026-11-23 → 2026-11-25)
 

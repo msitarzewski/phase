@@ -274,6 +274,10 @@ pub struct AppState {
     pub cached_probe: Arc<tokio::sync::RwLock<Option<crate::runtime_manager::SystemProbe>>>,
     pub runtime_lock: Arc<tokio::sync::Mutex<()>>,
     pub started_at: tokio::time::Instant,
+    /// Optional loopback port for the Tier-1 Trusted-Circle `ShardWorker` stage
+    /// bridge (`--shard-stage-bridge-port`). Used only when `cluster_enabled` is
+    /// explicitly enabled in `node.toml`.
+    pub shard_stage_bridge_port: Option<u16>,
 }
 
 /// HTTP header that flips this request to local-only mode. Honored on
@@ -457,6 +461,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/lucid/cluster/plan",
             post(handle_control_cluster_plan).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/lucid/cluster/execute",
+            post(handle_control_cluster_execute).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         // Health check for liveness probes.
         .route("/", get(|| async { "lucidd ready: see /api/version" }))
@@ -1352,6 +1360,7 @@ async fn handle_control_cluster(State(state): State<AppState>, headers: HeaderMa
         StatusCode::OK,
         serde_json::json!({
             "cluster_enabled": node_cfg.cluster_enabled,
+            "shard_stage_bridge_configured": state.shard_stage_bridge_port.is_some(),
             "trust_tier": "trusted-circle",
             "trust_label": crate::shard_plan::ShardTrustTier::TrustedCircle.trust_label(),
             "untrusted_sharding_allowed": false,
@@ -1495,6 +1504,137 @@ async fn handle_control_cluster_plan(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClusterExecuteRequest {
+    #[serde(default)]
+    job_id: Option<String>,
+    signed_plan: crate::shard_plan::SignedShardPartitionPlan,
+    input_base64: String,
+    #[serde(default)]
+    per_stage_timeout_ms: Option<u64>,
+}
+
+async fn handle_control_cluster_execute(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ClusterExecuteRequest>,
+) -> Response {
+    if let Some(response) = authorize_control(&state, &headers) {
+        return response;
+    }
+    if !state.node_config.snapshot().cluster_enabled {
+        return control_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "Trusted-circle cluster mode is disabled on this node. Enable cluster_enabled in /api/lucid/settings first."
+            }),
+        );
+    }
+    if req.signed_plan.plan.trust_tier != crate::shard_plan::ShardTrustTier::TrustedCircle {
+        return control_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "Untrusted sharded execution is disabled pending partial-compute verification ADR approval."
+            }),
+        );
+    }
+
+    let job_id = match req.job_id {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > 128
+                || !trimmed
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                return control_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": "Invalid job_id."}),
+                );
+            }
+            trimmed.to_string()
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+
+    let input_bytes =
+        match base64::engine::general_purpose::STANDARD.decode(req.input_base64.trim()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return control_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": "input_base64 must be valid standard base64."}),
+                );
+            }
+        };
+    if input_bytes.is_empty() || input_bytes.len() > phase_net::SHARD_STAGE_MAX_PAYLOAD_BYTES {
+        return control_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": format!(
+                    "Decoded input size {} outside 1..={} bytes.",
+                    input_bytes.len(),
+                    phase_net::SHARD_STAGE_MAX_PAYLOAD_BYTES
+                )
+            }),
+        );
+    }
+
+    let timeout = std::time::Duration::from_millis(
+        req.per_stage_timeout_ms
+            .unwrap_or(30_000)
+            .clamp(500, 60_000),
+    );
+    let local_bridge = match state.shard_stage_bridge_port {
+        Some(port) => match crate::shard_worker::LoopbackStageBridgeExecutor::new(port, timeout) {
+            Ok(exec) => Some(exec),
+            Err(err) => {
+                return control_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": format!("Invalid local stage bridge config: {err}")}),
+                );
+            }
+        },
+        None => None,
+    };
+    let local_exec_ref: Option<&dyn crate::shard_worker::ShardStageExecutor> = local_bridge
+        .as_ref()
+        .map(|b| b as &dyn crate::shard_worker::ShardStageExecutor);
+
+    match crate::shard_worker::execute_sharded_pipeline(
+        &state.discovery,
+        &state.client_identity,
+        &req.signed_plan,
+        &job_id,
+        &input_bytes,
+        local_exec_ref,
+        timeout,
+    )
+    .await
+    {
+        Ok(output) => control_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "verified": true,
+                "trust_label": output.verification.trust_label,
+                "job_id": job_id,
+                "output_base64": base64::engine::general_purpose::STANDARD.encode(&output.output_payload),
+                "verification": output.verification,
+                "receipts": output.receipts,
+            }),
+        ),
+        Err(err) => control_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "verified": false,
+                "error": err.to_string(),
+            }),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeSetupRequest {
     /// `"pin_detected"` or `"download_pinned"`
     action: String,
@@ -1623,10 +1763,12 @@ async fn handle_create_invitation(
     if let Some(response) = authorize_control(&state, &headers) {
         return response;
     }
-    if state.registry.local_models_async().await.is_empty() {
+    if state.registry.local_models_async().await.is_empty()
+        && state.shard_stage_bridge_port.is_none()
+    {
         return control_response(
             StatusCode::CONFLICT,
-            serde_json::json!({"error": "This node is not serving models."}),
+            serde_json::json!({"error": "This node is not serving models or shard stages."}),
         );
     }
     match state.consumer.create_invitation(request.ttl_seconds).await {

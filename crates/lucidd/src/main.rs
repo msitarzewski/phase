@@ -1655,6 +1655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cached_probe,
         runtime_lock: Arc::new(tokio::sync::Mutex::new(())),
         started_at: tokio::time::Instant::now(),
+        shard_stage_bridge_port: cli.shard_stage_bridge_port,
     };
     let app = ollama_router(state);
 

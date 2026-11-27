@@ -1015,6 +1015,34 @@ async fn find_peers_bounds_total_decoded_bytes_per_query() {
 }
 
 #[tokio::test]
+async fn find_peers_for_model_caches_verified_dht_results() {
+    let provider = NodeIdentity::generate();
+    let transport = Arc::new(MockTransport::default());
+    let registry = ModelRegistry::new(NodeIdentity::generate(), transport.clone() as _);
+    let cid = ModelCid([0x7b; 32]);
+    let mut caps = sample_caps();
+    caps.model_cid = cid;
+    transport.replace_records(
+        cid.dht_key(),
+        vec![SignedModelAdvertisement::sign(caps, &provider)
+            .unwrap()
+            .encode()
+            .unwrap()],
+    );
+
+    let first = registry.find_peers_for_model(&cid).await.unwrap();
+    assert_eq!(first.len(), 1);
+
+    // Clear the backing DHT transport; a back-to-back lookup within the short
+    // cache TTL must still return the previously verified peer without stalling
+    // on another full WAN DHT sweep.
+    transport.replace_records(cid.dht_key(), Vec::new());
+    let second = registry.find_peers_for_model(&cid).await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].0, first[0].0);
+}
+
+#[tokio::test]
 async fn find_peers_by_model_id_uses_local_name_map() {
     let identity = NodeIdentity::generate();
     let transport = Arc::new(MockTransport::default());
