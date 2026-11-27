@@ -846,7 +846,9 @@
       <h2 id="cluster-title">Trusted-Circle Cluster</h2>
       <p class="subtitle">
         Tier 1 shares model activations with enrolled circle devices so they can run a model together.
-        Everyone operating those devices must be fully trusted with the activations. Open-network
+        Everyone operating those devices must be fully trusted with the activations. Per llama.cpp's
+        RPC security model, granting a peer access to your RPC bridge carries full machine-level trust
+        comparable to SSH access—only enroll devices and operators you completely trust. Open-network
         sharding is disabled.
       </p>
 
