@@ -17,7 +17,9 @@
 //!   signed alias/provider records and performs a resumable verified pull.
 //! - Anything else under `/api/*` returns 404 rather than claiming support.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
@@ -32,7 +34,8 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use hyper::body::Frame;
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
 use phase_net::PeerId;
@@ -45,8 +48,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::content::{ContentError, PullProgress, PullSelection};
 use crate::router::{
-    find_local_model_by_alias, ReceiptVerification, RouteDecision, RouteVia, Router as LucidRouter,
-    RouterError,
+    find_local_model_by_alias, ReceiptVerification, RedundantCheckResult, RouteDecision, RouteVia,
+    Router as LucidRouter, RouterError, SpotCheckResult,
 };
 
 /// Explicit caller-signed generation bound for Ollama requests that omit
@@ -295,6 +298,42 @@ pub const HEADER_ROUTED_VIA: &str = "x-lucid-routed-via";
 /// receipt verified and bound to the dispatched job + peer. `true` / `false` /
 /// `unverifiable`; omitted on the local path (no peer receipt to assert).
 pub const HEADER_RECEIPT_VERIFIED: &str = "x-lucid-receipt-verified";
+pub const HEADER_TRUST_LABEL: &str = "x-lucid-trust-label";
+pub(crate) const TERMINAL_TRUST_LABEL: &str = "x_lucid_trust_label";
+
+/// Provenance and empirical replay agreement reported by this daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrustLabel {
+    Local,
+    RemotePending,
+    RemoteReceiptVerified,
+    RemoteSpotChecked,
+    TrustedCircleSharded,
+}
+
+impl TrustLabel {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::RemotePending => "remote-pending",
+            Self::RemoteReceiptVerified => "remote-receipt-verified",
+            Self::RemoteSpotChecked => "remote-spot-checked",
+            Self::TrustedCircleSharded => "trusted-circle-sharded",
+        }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "local" => Some(Self::Local),
+            "remote-pending" => Some(Self::RemotePending),
+            "remote-receipt-verified" => Some(Self::RemoteReceiptVerified),
+            "remote-spot-checked" => Some(Self::RemoteSpotChecked),
+            "trusted-circle-sharded" => Some(Self::TrustedCircleSharded),
+            _ => None,
+        }
+    }
+}
 
 /// Bounded, public routing rationale. The value is a sanitized summary only:
 /// it never contains raw evidence records or a peer identifier.
@@ -337,6 +376,7 @@ fn loopback_cors() -> CorsLayer {
             HeaderName::from_static(HEADER_ROUTED_VIA),
             HeaderName::from_static(HEADER_ROUTE_EXPLANATION),
             HeaderName::from_static(HEADER_RECEIPT_VERIFIED),
+            HeaderName::from_static(HEADER_TRUST_LABEL),
             HeaderName::from_static("x-phase-receipt"),
         ])
 }
@@ -1619,17 +1659,24 @@ async fn handle_control_cluster_execute(
     )
     .await
     {
-        Ok(output) => control_response(
-            StatusCode::OK,
-            serde_json::json!({
+        Ok(output) => {
+            let trust_label = TrustLabel::from_wire(&output.verification.trust_label);
+            let mut response = control_response(
+                StatusCode::OK,
+                serde_json::json!({
                 "verified": true,
                 "trust_label": output.verification.trust_label,
                 "job_id": job_id,
                 "output_base64": base64::engine::general_purpose::STANDARD.encode(&output.output_payload),
                 "verification": output.verification,
                 "receipts": output.receipts,
-            }),
-        ),
+                }),
+            );
+            if trust_label == Some(TrustLabel::TrustedCircleSharded) {
+                set_trust_label(&mut response, TrustLabel::TrustedCircleSharded);
+            }
+            response
+        }
         Err(err) => control_response(
             StatusCode::BAD_GATEWAY,
             serde_json::json!({
@@ -2354,16 +2401,18 @@ async fn handle_generate(
         }
     };
 
-    let (handle, mut job_stream, receipt_verification) =
-        match state.router.execute(&decision, manifest).await {
-            Ok(t) => t,
-            Err(RouterError::Refused { reason }) => return refused_response(&reason),
-            Err(e) => {
-                tracing::error!(error = %e, "router dispatch failed (/api/generate)");
-                return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e))
-                    .into_response();
-            }
-        };
+    let ((handle, mut job_stream, receipt_verification), spot_check) = match state
+        .router
+        .execute_with_spot_check(&decision, manifest)
+        .await
+    {
+        Ok(t) => t,
+        Err(RouterError::Refused { reason }) => return refused_response(&reason),
+        Err(e) => {
+            tracing::error!(error = %e, "router dispatch failed (/api/generate)");
+            return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e)).into_response();
+        }
+    };
 
     let job_id = handle.job_id().clone();
     let started_at = std::time::Instant::now();
@@ -2430,6 +2479,9 @@ async fn handle_generate(
             finished_receipt.verification,
             Some(&route_explanation),
         );
+        if let Some(label) = completed_trust_label(&finished_receipt, spot_check).await {
+            set_trust_label(&mut resp, label);
+        }
         tracing::info!(%job_id, "non-streaming generate complete");
         return resp;
     }
@@ -2454,7 +2506,7 @@ async fn handle_generate(
                             });
                             if let Ok(mut bytes) = serde_json::to_vec(&payload) {
                                 bytes.push(b'\n');
-                                yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
+                                yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(bytes)));
                             }
                         }
                         Err(error) => {
@@ -2496,29 +2548,23 @@ async fn handle_generate(
             "eval_count": completion_tokens,
             "eval_duration": total_duration,
         });
-        annotate_stream_terminal(&mut final_value, &terminal, &finished_receipt);
+        let trust_label = stream_terminal_trust_label(
+            &mut final_value, &terminal, &finished_receipt, spot_check,
+        ).await;
         if let Ok(mut bytes) = serde_json::to_vec(&final_value) {
             bytes.push(b'\n');
-            yield Ok(Bytes::from(bytes));
+            yield Ok(Frame::data(Bytes::from(bytes)));
+            if let Some(label) = trust_label {
+                yield Ok(trust_label_trailer(label));
+            }
         }
     };
-    let body = Body::from_stream(ndjson);
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .header("X-Phase-Worker", "lucidd");
-    if let Some(rv) = routed_via.as_deref() {
-        builder = builder.header(HEADER_ROUTED_VIA, rv);
-    }
-    builder = builder.header(HEADER_ROUTE_EXPLANATION, &route_explanation);
-    // A live peer starts as `pending`; only legacy pre-verified batches may
-    // truthfully say `true` before the body. The final verdict is in NDJSON.
-    if let Some(v) = receipt_verification.header_value() {
-        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
-    }
-    builder.body(body).unwrap_or_else(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
-    })
+    inference_stream_response(
+        ndjson,
+        routed_via.as_deref(),
+        &route_explanation,
+        receipt_verification,
+    )
 }
 
 async fn handle_chat(
@@ -2584,16 +2630,18 @@ async fn handle_chat(
         }
     };
 
-    let (handle, mut job_stream, receipt_verification) =
-        match state.router.execute(&decision, manifest).await {
-            Ok(t) => t,
-            Err(RouterError::Refused { reason }) => return refused_response(&reason),
-            Err(e) => {
-                tracing::error!(error = %e, "router dispatch failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e))
-                    .into_response();
-            }
-        };
+    let ((handle, mut job_stream, receipt_verification), spot_check) = match state
+        .router
+        .execute_with_spot_check(&decision, manifest)
+        .await
+    {
+        Ok(t) => t,
+        Err(RouterError::Refused { reason }) => return refused_response(&reason),
+        Err(e) => {
+            tracing::error!(error = %e, "router dispatch failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, public_dispatch_error(&e)).into_response();
+        }
+    };
 
     let job_id = handle.job_id().clone();
     let started_at = std::time::Instant::now();
@@ -2663,6 +2711,9 @@ async fn handle_chat(
             finished_receipt.verification,
             Some(&route_explanation),
         );
+        if let Some(label) = completed_trust_label(&finished_receipt, spot_check).await {
+            set_trust_label(&mut resp, label);
+        }
         tracing::info!(%job_id, "non-streaming chat complete");
         return resp;
     }
@@ -2692,7 +2743,7 @@ async fn handle_chat(
                             match serde_json::to_vec(&payload) {
                                 Ok(mut bytes) => {
                                     bytes.push(b'\n');
-                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
+                                    yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(bytes)));
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, "failed to serialize chunk");
@@ -2715,8 +2766,6 @@ async fn handle_chat(
             }
         }
 
-        // Trailer-free protocol: headers are already flushed, so resolve the
-        // receipt after tokens and carry the final verification in-band.
         let finished_receipt = finish_http_receipt(handle, receipt_verification).await;
         let total_duration = started_at.elapsed().as_nanos() as u64;
         if let Some(commitment) = finished_receipt.commitment.as_ref() {
@@ -2742,31 +2791,24 @@ async fn handle_chat(
             eval_duration: total_duration,
         };
         let mut final_value = serde_json::to_value(&final_payload).unwrap_or(serde_json::json!({}));
-        annotate_stream_terminal(&mut final_value, &terminal, &finished_receipt);
+        let trust_label = stream_terminal_trust_label(
+            &mut final_value, &terminal, &finished_receipt, spot_check,
+        ).await;
         if let Ok(mut bytes) = serde_json::to_vec(&final_value) {
             bytes.push(b'\n');
-            yield Ok(Bytes::from(bytes));
+            yield Ok(Frame::data(Bytes::from(bytes)));
+            if let Some(label) = trust_label {
+                yield Ok(trust_label_trailer(label));
+            }
         }
     };
 
-    let body = Body::from_stream(ndjson);
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .header("X-Phase-Worker", "lucidd");
-    if let Some(rv) = routed_via.as_deref() {
-        builder = builder.header(HEADER_ROUTED_VIA, rv);
-    }
-    builder = builder.header(HEADER_ROUTE_EXPLANATION, &route_explanation);
-    // A live peer starts as `pending`; the final verdict is emitted in-band
-    // after the receipt arrives. Never promote this header optimistically.
-    if let Some(v) = receipt_verification.header_value() {
-        builder = builder.header(HEADER_RECEIPT_VERIFIED, v);
-    }
-    builder.body(body).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "failed to build streaming response");
-        (StatusCode::INTERNAL_SERVER_ERROR, "response build failure").into_response()
-    })
+    inference_stream_response(
+        ndjson,
+        routed_via.as_deref(),
+        &route_explanation,
+        receipt_verification,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3619,13 +3661,110 @@ fn execution_failure_response(
     response
 }
 
+async fn completed_trust_label(
+    receipt: &FinishedReceipt,
+    spot_check: Option<SpotCheckResult>,
+) -> Option<TrustLabel> {
+    match receipt.verification {
+        ReceiptVerification::Local => Some(TrustLabel::Local),
+        ReceiptVerification::Verified => {
+            // Keep a slow validator from delaying completion indefinitely.
+            if let Some(check) = spot_check {
+                if matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), check).await,
+                    Ok(Ok(RedundantCheckResult::Agreement { commitment }))
+                        if receipt.commitment == Some(commitment)
+                ) {
+                    return Some(TrustLabel::RemoteSpotChecked);
+                }
+            }
+            Some(TrustLabel::RemoteReceiptVerified)
+        }
+        _ => None,
+    }
+}
+
+fn set_trust_label(response: &mut Response, label: TrustLabel) {
+    response
+        .headers_mut()
+        .insert(HEADER_TRUST_LABEL, HeaderValue::from_static(label.as_str()));
+}
+
+fn trust_label_trailer(label: TrustLabel) -> Frame<Bytes> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert(HEADER_TRUST_LABEL, HeaderValue::from_static(label.as_str()));
+    Frame::trailers(trailers)
+}
+
+struct InferenceBody<S>(Pin<Box<S>>);
+
+impl<S: Stream<Item = Result<Frame<Bytes>, std::io::Error>>> axum::body::HttpBody
+    for InferenceBody<S>
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.get_mut().0.as_mut().poll_next(cx)
+    }
+}
+
+fn inference_stream_response(
+    stream: impl Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + 'static,
+    routed_via: Option<&str>,
+    route_explanation: &str,
+    verification: ReceiptVerification,
+) -> Response {
+    let mut response = Response::new(Body::new(InferenceBody(Box::pin(stream))));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    headers.insert("x-phase-worker", HeaderValue::from_static("lucidd"));
+    headers.insert(
+        header::TRAILER,
+        HeaderValue::from_static(HEADER_TRUST_LABEL),
+    );
+    let label = if verification == ReceiptVerification::Local {
+        TrustLabel::Local
+    } else {
+        TrustLabel::RemotePending
+    };
+    set_trust_label(&mut response, label);
+    apply_result_headers(
+        &mut response,
+        routed_via,
+        verification,
+        Some(route_explanation),
+    );
+    response
+}
+
+async fn stream_terminal_trust_label(
+    value: &mut serde_json::Value,
+    terminal: &HttpTerminal,
+    receipt: &FinishedReceipt,
+    spot_check: Option<SpotCheckResult>,
+) -> Option<TrustLabel> {
+    if !annotate_stream_terminal(value, terminal, receipt) {
+        return None;
+    }
+    let label = completed_trust_label(receipt, spot_check).await?;
+    value[TERMINAL_TRUST_LABEL] = serde_json::Value::String(label.as_str().to_string());
+    Some(label)
+}
+
 fn annotate_stream_terminal(
     value: &mut serde_json::Value,
     terminal: &HttpTerminal,
     receipt: &FinishedReceipt,
-) {
+) -> bool {
     let Some(map) = value.as_object_mut() else {
-        return;
+        return false;
     };
     if let Some(verification) = receipt.verification.header_value() {
         map.insert(
@@ -3639,12 +3778,15 @@ fn annotate_stream_terminal(
             serde_json::Value::String("error".to_string()),
         );
         map.insert("error".to_string(), serde_json::Value::String(reason));
-    } else if let Some(commitment) = receipt.commitment.as_ref() {
+        return false;
+    }
+    if let Some(commitment) = receipt.commitment.as_ref() {
         map.insert(
             "x_phase_commitment".to_string(),
             serde_json::Value::String(hex32(commitment)),
         );
     }
+    true
 }
 
 /// HTTP-submitted jobs get a short replay window so a captured signed request

@@ -294,6 +294,8 @@ fn assert_stream_shape(response: &reqwest::Response) {
             .and_then(|value| value.to_str().ok()),
         Some("lucidd")
     );
+    assert_eq!(response.headers()["x-lucid-trust-label"], "local");
+    assert_eq!(response.headers()["trailer"], "x-lucid-trust-label");
     assert_public_route_explanation(response);
 }
 
@@ -394,6 +396,7 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
             .await
             .expect("non-streaming chat request");
         assert_eq!(chat.status(), StatusCode::OK);
+        assert_eq!(chat.headers()["x-lucid-trust-label"], "local");
         assert_local_receipt_headers(&chat);
         let chat_body: Value = chat.json().await.expect("non-streaming chat JSON");
         assert_eq!(chat_body["message"]["content"], "cba");
@@ -413,6 +416,7 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
         assert_eq!(report.local_commitments, 1);
         assert_eq!(report.receipt_verified_count, 0);
         assert_eq!(report.eval_count_source, "self_reported");
+        assert_eq!(report.trust_label_distribution.get("local"), Some(&1));
 
         let chat_stream = client
             .post(daemon.url("/api/chat"))
@@ -439,6 +443,7 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
         assert_eq!(streamed_chat, "maerts");
         let chat_final = chat_lines.last().expect("terminal chat frame");
         assert_eq!(chat_final["done"], true);
+        assert_eq!(chat_final["x_lucid_trust_label"], "local");
         assert_eq!(
             chat_final["x_phase_commitment"]
                 .as_str()
@@ -454,6 +459,7 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
             .await
             .expect("non-streaming generate request");
         assert_eq!(generate.status(), StatusCode::OK);
+        assert_eq!(generate.headers()["x-lucid-trust-label"], "local");
         assert_local_receipt_headers(&generate);
         let generate_body: Value = generate.json().await.expect("generate JSON");
         assert_eq!(generate_body["response"], "esahp");
@@ -479,7 +485,24 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
                 .collect::<String>(),
             "yx"
         );
-        assert_eq!(generate_lines.last().expect("generate final")["done"], true);
+        let generate_final = generate_lines.last().expect("generate final");
+        assert_eq!(generate_final["done"], true);
+        assert_eq!(generate_final["x_lucid_trust_label"], "local");
+
+        // Inspect the wire because reqwest consumes trailers without exposing them.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let address = daemon.base_url.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let payload = r#"{"model":"echo","prompt":"trailers","stream":true}"#;
+        let request = format!(
+            "POST /api/generate HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTE: trailers\r\nConnection: close, TE\r\n\r\n{payload}",
+            payload.len(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw_response = Vec::new();
+        stream.read_to_end(&mut raw_response).await.unwrap();
+        let raw_response = std::str::from_utf8(&raw_response).unwrap();
+        assert!(raw_response.ends_with("0\r\nx-lucid-trust-label: local\r\n\r\n"), "{raw_response}");
 
         let embed = client
             .post(daemon.url("/api/embed"))
@@ -1021,4 +1044,18 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
             .len(),
         2
     );
+    let cluster_disabled = client
+        .post(format!("{base_url}/api/lucid/cluster/execute"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "signed_plan": trusted_plan["signed_plan"],
+            "input_base64": "AQ==",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cluster_disabled.status(), StatusCode::FORBIDDEN);
+    assert!(!cluster_disabled
+        .headers()
+        .contains_key("x-lucid-trust-label"));
 }

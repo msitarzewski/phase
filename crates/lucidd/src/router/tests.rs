@@ -648,6 +648,9 @@ fn deterministic_inference_manifest(
     use phase_protocol::{ChatMessage, ChatRole, InferenceJobSpec, SamplingParams};
     let mut sampling = SamplingParams::default();
     sampling.params.insert("seed".to_string(), "7".to_string());
+    sampling
+        .params
+        .insert("temperature".to_string(), "0".to_string());
     ManifestBuilder::new(JobSpec::Inference(InferenceJobSpec {
         model_cid: model_id.to_string(),
         messages: vec![ChatMessage {
@@ -683,7 +686,8 @@ async fn automatic_redundancy_is_disabled_by_default_and_strictly_bounded_when_e
         EvidenceRuntime::open(temp.path().join("redundant-evidence.log"), observer).unwrap(),
     );
     let router = Router::new(None, registry, policy, identity, build_test_discovery())
-        .with_evidence_runtime(runtime);
+        .with_evidence_runtime(runtime.clone())
+        .with_remote_access(None, true);
     let client = NodeIdentity::generate();
     let deterministic = deterministic_inference_manifest(&client, &loaded_test_model_cid());
     let primary = PeerId::random();
@@ -716,12 +720,29 @@ async fn automatic_redundancy_is_disabled_by_default_and_strictly_bounded_when_e
         .to_string()
         .contains("numeric-tolerance and backend-equivalence"));
 
+    assert!(enabled
+        .try_begin_redundant_probe(&deterministic, primary, duplicate)
+        .is_none());
+    for peer in [primary, duplicate] {
+        runtime
+            .set_operator_override(
+                peer,
+                OperatorOverride {
+                    pinned: true,
+                    blocked: false,
+                },
+            )
+            .unwrap();
+    }
+    assert!(enabled
+        .try_begin_redundant_probe(&nondeterministic, primary, duplicate)
+        .is_none());
     let permit = enabled
         .try_begin_redundant_probe(&deterministic, primary, duplicate)
         .expect("eligible job gets the sole non-queueing permit");
     assert_eq!(enabled.redundant_gate.available_permits(), 0);
     assert!(enabled
-        .try_begin_redundant_probe(&deterministic, primary, PeerId::random())
+        .try_begin_redundant_probe(&deterministic, primary, duplicate)
         .is_none());
     drop(permit);
     assert_eq!(enabled.redundant_gate.available_permits(), 1);
@@ -731,7 +752,7 @@ async fn automatic_redundancy_is_disabled_by_default_and_strictly_bounded_when_e
 }
 
 #[test]
-fn redundant_sampling_and_commitment_comparison_are_bounded_and_literal() {
+fn redundant_sampling_is_keyed_and_bounded() {
     let identity = NodeIdentity::generate();
     assert!(!redundant_sample_selected(&identity, [0; 32], 0));
     assert!(redundant_sample_selected(&identity, [0; 32], 1_000));
@@ -745,24 +766,6 @@ fn redundant_sampling_and_commitment_comparison_are_bounded_and_literal() {
     assert!(
         (1_000..=2_500).contains(&selected),
         "25permille keyed sample should remain near its operator cap; got {selected}"
-    );
-
-    assert_eq!(
-        compare_redundant_commitments(Some([1; 32]), Some([1; 32])),
-        RedundantCheckResult::Agreement {
-            commitment: [1; 32]
-        }
-    );
-    assert_eq!(
-        compare_redundant_commitments(Some([1; 32]), Some([2; 32])),
-        RedundantCheckResult::Disagreement {
-            primary_commitment: [1; 32],
-            duplicate_commitment: [2; 32],
-        }
-    );
-    assert_eq!(
-        compare_redundant_commitments(Some([1; 32]), None),
-        RedundantCheckResult::Incomparable
     );
 }
 
@@ -789,15 +792,196 @@ fn redundant_disagreement_requires_equivalent_signed_backend_capabilities() {
         &equivalent
     ));
 
-    // A commitment mismatch from non-equivalent execution is never fed
-    // to `compare_redundant_commitments`; the gate yields the neutral,
-    // non-negative evidence class instead.
-    let result = if capabilities_are_redundancy_equivalent(&primary, &different_backend) {
-        compare_redundant_commitments(Some([1; 32]), Some([2; 32]))
-    } else {
-        RedundantCheckResult::Incomparable
+    let mut different_context = primary.clone();
+    different_context.context_length *= 2;
+    assert!(!capabilities_are_redundancy_equivalent(
+        &primary,
+        &different_context
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn independent_spot_check_compares_two_verified_text_streams() {
+    #[derive(Clone)]
+    struct ReplayWorker {
+        identity: NodeIdentity,
+        primary: bool,
+        mode: Arc<AtomicUsize>,
+    }
+
+    impl phase_protocol::Worker for ReplayWorker {
+        fn supported_kinds(&self) -> &[phase_protocol::JobSpecKind] {
+            &[phase_protocol::JobSpecKind::Inference]
+        }
+
+        async fn execute(
+            &self,
+            job: SignedManifest<JobSpec>,
+        ) -> Result<(JobHandle, JobStream), WorkerError> {
+            let job_hash = job.manifest_hash().unwrap();
+            let mode = self.mode.load(Ordering::Relaxed);
+            let text: &[&str] = match (self.primary, mode) {
+                (true, _) => &["deterministic ", "answer"],
+                (false, 1) => &["different answer"],
+                (false, _) => &["deterministic answer"],
+            };
+            let mut commitment = CommitmentAccumulator::new();
+            let mut events = Vec::new();
+            for (seq, text) in text.iter().enumerate() {
+                let chunk = phase_protocol::OutputChunk {
+                    kind: "token".into(),
+                    data: bytes::Bytes::from_static(text.as_bytes()),
+                    seq: seq as u64,
+                };
+                commitment.update(&chunk);
+                events.push(JobEvent::Output(chunk));
+            }
+            let (output_commitment, output_chunk_count) = commitment.finalize();
+            let result = JobResult {
+                job_spec_hash: job_hash,
+                output_commitment,
+                output_chunk_count,
+                completion: Completion::Stop,
+                resumption: None,
+                metrics: JobMetrics::default(),
+            };
+            let signer = if !self.primary && mode == 2 {
+                NodeIdentity::generate()
+            } else {
+                self.identity.clone()
+            };
+            let receipt = phase_receipt::ReceiptBuilder::new(result.clone(), job_hash)
+                .sign_with(&signer)
+                .unwrap();
+            events.push(JobEvent::Final {
+                result,
+                error: None,
+            });
+            let (handle, mut producer) = JobHandle::new(JobId(job_hash));
+            producer.deliver_receipt(receipt);
+            Ok((handle, Box::pin(futures::stream::iter(events))))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let evidence_path = dir.path().join("spot-check.log");
+    let client = NodeIdentity::generate();
+    let client_net = discovery_for(&client);
+    let observer = *client_net.local_peer_id();
+    let runtime = Arc::new(EvidenceRuntime::open(&evidence_path, observer).unwrap());
+    let transport = Arc::new(MockDht::default());
+    let cid = loaded_test_model_cid();
+    let serving_policy = Arc::new(PolicyEngine::new_for_tests(
+        PolicyConfig {
+            authorized_submitters: vec![hex::encode(client.peer_id_bytes())],
+            ..PolicyConfig::default()
+        },
+        PolicyState::default(),
+    ));
+    let mode = Arc::new(AtomicUsize::new(0));
+    let mut providers = Vec::new();
+    for primary in [true, false] {
+        let identity = NodeIdentity::generate();
+        let net = discovery_for(&identity);
+        let registry = Arc::new(ModelRegistry::new(identity.clone(), transport.clone()));
+        registry
+            .advertise_loaded(sample_caps("qwen3-mini", 1))
+            .await
+            .unwrap();
+        net.set_job_relay_stream_handler(Some(make_inbound_relay_stream_handler(
+            Arc::new(ReplayWorker {
+                identity,
+                primary,
+                mode: mode.clone(),
+            }),
+            registry,
+            serving_policy.clone(),
+        )))
+        .unwrap();
+        dial_loopback_fixture(&client_net, &net).await;
+        runtime
+            .set_operator_override(
+                *net.local_peer_id(),
+                OperatorOverride {
+                    pinned: true,
+                    blocked: false,
+                },
+            )
+            .unwrap();
+        providers.push(net);
+    }
+    let primary = *providers[0].local_peer_id();
+    let validator = *providers[1].local_peer_id();
+    let router = Router::new(
+        None,
+        Arc::new(ModelRegistry::new(client.clone(), transport)),
+        Arc::new(PolicyEngine::new_for_tests(
+            PolicyConfig::default(),
+            PolicyState::default(),
+        )),
+        client.clone(),
+        client_net,
+    )
+    .with_evidence_runtime(runtime)
+    .with_redundant_verification(RedundantVerificationConfig {
+        enabled: true,
+        sample_cap_permille: 1_000,
+    });
+    let decision = RouteDecision {
+        via: RouteVia::Peer { peer_id: primary },
+        model_id: cid.clone(),
+        fallback_peers: vec![validator],
+        explanation: "test providers".into(),
     };
-    assert_eq!(result, RedundantCheckResult::Incomparable);
+    for case in 0..=2 {
+        mode.store(case, Ordering::Relaxed);
+        let job = deterministic_inference_manifest(&client, &cid);
+        let ((handle, mut stream, verification), check) = router
+            .execute_with_spot_check(&decision, job)
+            .await
+            .unwrap();
+        assert_eq!(verification, ReceiptVerification::Pending);
+        while futures::StreamExt::next(&mut stream).await.is_some() {}
+        let receipt = handle.finish().await.unwrap();
+        let verdict = timeout(Duration::from_secs(5), check.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        match case {
+            0 => assert_eq!(
+                verdict,
+                RedundantCheckResult::Agreement {
+                    commitment: receipt.result.output_commitment
+                }
+            ),
+            1 => assert!(matches!(verdict, RedundantCheckResult::Disagreement { .. })),
+            _ => assert_eq!(verdict, RedundantCheckResult::Incomparable),
+        }
+    }
+    drop(router);
+    let store = crate::reputation::EvidenceStore::open(&evidence_path, observer).unwrap();
+    let spot_checks: Vec<_> = store
+        .records()
+        .iter()
+        .filter(|record| record.protocol_version() == SPOT_CHECK_METHOD)
+        .collect();
+    assert_eq!(spot_checks.len(), 2);
+    let EvidenceOutcome::VerifiedSpotCheckAgreement(agreement) = spot_checks[0].outcome() else {
+        panic!("expected paired agreement evidence");
+    };
+    assert_eq!(agreement.validator_peer, validator);
+    assert_ne!(
+        spot_checks[0].output_commitment(),
+        Some(agreement.validator_commitment)
+    );
+    assert_eq!(
+        agreement.primary_text_digest,
+        agreement.validator_text_digest
+    );
+    assert!(matches!(
+        spot_checks[1].outcome(),
+        EvidenceOutcome::VerifiedSpotCheckDisagreement(_)
+    ));
 }
 
 #[test]
@@ -1902,6 +2086,34 @@ async fn inbound_v1_and_v2_enforce_absolute_whole_job_deadlines() {
     assert!(frames_rx.recv().await.is_none());
 }
 
+fn discovery_for(identity: &NodeIdentity) -> Arc<Discovery> {
+    Arc::new(
+        Discovery::new(phase_net::DiscoveryConfig {
+            identity: Some(identity.clone()),
+            ..phase_net::DiscoveryConfig::default()
+        })
+        .unwrap(),
+    )
+}
+
+async fn dial_loopback_fixture(client: &Discovery, worker: &Discovery) {
+    worker.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let address = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(address) = worker.listen_addrs().await.unwrap().into_iter().next() {
+                break address;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker listen address");
+    client
+        .dial_peer(&format!("{address}/p2p/{}", worker.local_peer_id()))
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_two_peer_router_streams_before_completion_and_verifies_receipt() {
     #[derive(Clone)]
@@ -1941,33 +2153,10 @@ async fn v2_two_peer_router_streams_before_completion_and_verifies_receipt() {
 
     let client_identity = NodeIdentity::generate();
     let worker_identity = NodeIdentity::generate();
-    let client_net = Arc::new(
-        Discovery::new(phase_net::DiscoveryConfig {
-            identity: Some(client_identity.clone()),
-            ..phase_net::DiscoveryConfig::default()
-        })
-        .unwrap(),
-    );
-    let worker_net = Arc::new(
-        Discovery::new(phase_net::DiscoveryConfig {
-            identity: Some(worker_identity.clone()),
-            ..phase_net::DiscoveryConfig::default()
-        })
-        .unwrap(),
-    );
+    let client_net = discovery_for(&client_identity);
+    let worker_net = discovery_for(&worker_identity);
     let worker_peer = *worker_net.local_peer_id();
-    worker_net.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
-    let mut worker_addr = None;
-    for _ in 0..50 {
-        worker_addr = worker_net.listen_addrs().await.unwrap().into_iter().next();
-        if worker_addr.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let worker_addr = worker_addr.expect("worker listen address");
-    let worker_dial_addr = format!("{worker_addr}/p2p/{worker_peer}");
-    client_net.dial_peer(&worker_dial_addr).await.unwrap();
+    dial_loopback_fixture(&client_net, &worker_net).await;
 
     let worker_registry = registry_with_model("qwen3-mini").await;
     let client_pubkey = {

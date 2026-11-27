@@ -21,7 +21,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::ollama::{HEADER_RECEIPT_VERIFIED, HEADER_ROUTED_VIA};
+use crate::ollama::{
+    TrustLabel, HEADER_RECEIPT_VERIFIED, HEADER_ROUTED_VIA, HEADER_TRUST_LABEL,
+    TERMINAL_TRUST_LABEL,
+};
 
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
@@ -39,6 +42,8 @@ pub struct BenchSample {
     pub ok: bool,
     pub http_status: u16,
     pub routed_via: String,
+    #[serde(default)]
+    pub trust_label: Option<TrustLabel>,
     pub receipt_verified: bool,
     #[serde(default)]
     pub local_commitment: bool,
@@ -73,6 +78,8 @@ pub struct BenchReport {
     pub duration_p50_ms: Option<f64>,
     pub duration_p95_ms: Option<f64>,
     pub route_distribution: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub trust_label_distribution: BTreeMap<String, usize>,
     pub samples: Vec<BenchSample>,
 }
 
@@ -152,6 +159,7 @@ async fn execute_single_sample(
                 ok: false,
                 http_status: 0,
                 routed_via: "none".to_string(),
+                trust_label: None,
                 receipt_verified: false,
                 local_commitment: false,
                 ttft_ms: None,
@@ -175,6 +183,11 @@ async fn execute_single_sample(
         .get(HEADER_RECEIPT_VERIFIED)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let initial_trust_label = resp
+        .headers()
+        .get(HEADER_TRUST_LABEL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(TrustLabel::from_wire);
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -183,6 +196,7 @@ async fn execute_single_sample(
             ok: false,
             http_status,
             routed_via,
+            trust_label: None,
             receipt_verified: false,
             local_commitment: false,
             ttft_ms: None,
@@ -201,6 +215,7 @@ async fn execute_single_sample(
     let mut done_seen = false;
     let mut terminal_verified = false;
     let mut terminal_commitment = false;
+    let mut terminal_trust_label = None;
     let mut stream_err: Option<String> = None;
 
     while let Some(item) = stream.next().await {
@@ -235,7 +250,14 @@ async fn execute_single_sample(
                     chunks += 1;
                 }
                 if frame.get("done").and_then(|v| v.as_bool()) == Some(true) {
+                    if done_seen {
+                        stream_err = Some("duplicate terminal benchmark frame".to_string());
+                    }
                     done_seen = true;
+                    terminal_trust_label = frame
+                        .get(TERMINAL_TRUST_LABEL)
+                        .and_then(|value| value.as_str())
+                        .and_then(TrustLabel::from_wire);
                     if let Some(count) = frame.get("eval_count").and_then(|v| v.as_u64()) {
                         eval_tokens = count;
                     }
@@ -260,13 +282,27 @@ async fn execute_single_sample(
     let receipt_verified = ok
         && is_peer_route(&routed_via)
         && (terminal_verified || header_verified.as_deref() == Some("true"));
-    let local_commitment = ok && routed_via == "local" && terminal_commitment;
+    let trust_label = if ok {
+        completed_benchmark_label(
+            initial_trust_label,
+            terminal_trust_label,
+            &routed_via,
+            receipt_verified,
+        )
+    } else {
+        None
+    };
+    let local_commitment = ok
+        && routed_via == "local"
+        && terminal_commitment
+        && trust_label != Some(TrustLabel::TrustedCircleSharded);
 
     BenchSample {
         index,
         ok,
         http_status,
         routed_via,
+        trust_label,
         receipt_verified,
         local_commitment,
         ttft_ms,
@@ -274,6 +310,24 @@ async fn execute_single_sample(
         chunks,
         eval_tokens,
         error: stream_err,
+    }
+}
+
+fn completed_benchmark_label(
+    initial: Option<TrustLabel>,
+    terminal: Option<TrustLabel>,
+    route: &str,
+    receipt_verified: bool,
+) -> Option<TrustLabel> {
+    match terminal.or(initial) {
+        Some(TrustLabel::Local) if route == "local" => Some(TrustLabel::Local),
+        Some(label @ (TrustLabel::RemoteSpotChecked | TrustLabel::RemoteReceiptVerified))
+            if receipt_verified =>
+        {
+            Some(label)
+        }
+        Some(TrustLabel::TrustedCircleSharded) => Some(TrustLabel::TrustedCircleSharded),
+        _ => None,
     }
 }
 
@@ -295,6 +349,7 @@ pub fn summarize_samples(
     let mut ttfts = Vec::new();
     let mut durations = Vec::new();
     let mut route_distribution: BTreeMap<String, usize> = BTreeMap::new();
+    let mut trust_label_distribution = BTreeMap::new();
 
     for s in &samples {
         if s.ok {
@@ -312,6 +367,11 @@ pub fn summarize_samples(
                 local_commitments += 1;
             }
             *route_distribution.entry(s.routed_via.clone()).or_insert(0) += 1;
+            if let Some(label) = s.trust_label {
+                *trust_label_distribution
+                    .entry(label.as_str().to_string())
+                    .or_insert(0) += 1;
+            }
         } else {
             failed += 1;
         }
@@ -338,6 +398,7 @@ pub fn summarize_samples(
         duration_p50_ms: percentile(&mut durations, 0.50),
         duration_p95_ms: percentile(&mut durations, 0.95),
         route_distribution,
+        trust_label_distribution,
         samples,
     }
 }
@@ -356,6 +417,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn benchmark_prefers_the_terminal_label_and_requires_a_verified_peer_receipt() {
+        let pending = Some(TrustLabel::RemotePending);
+        let checked = Some(TrustLabel::RemoteSpotChecked);
+        let receipt_only = Some(TrustLabel::RemoteReceiptVerified);
+        assert_eq!(
+            completed_benchmark_label(pending, checked, "peer", true),
+            checked
+        );
+        assert_eq!(
+            completed_benchmark_label(pending, checked, "peer", false),
+            None
+        );
+        assert_eq!(completed_benchmark_label(pending, None, "peer", true), None);
+        assert_eq!(
+            completed_benchmark_label(receipt_only, None, "peer", true),
+            receipt_only
+        );
+    }
+
+    #[test]
     fn summarize_samples_computes_percentiles_and_route_distribution() {
         let cfg = BenchConfig {
             api_base: "http://127.0.0.1:11435".to_string(),
@@ -371,6 +452,7 @@ mod tests {
                 ok: true,
                 http_status: 200,
                 routed_via: "peer:peerA".to_string(),
+                trust_label: Some(TrustLabel::RemoteReceiptVerified),
                 receipt_verified: true,
                 local_commitment: false,
                 ttft_ms: Some(120.0),
@@ -384,6 +466,7 @@ mod tests {
                 ok: true,
                 http_status: 200,
                 routed_via: "local".to_string(),
+                trust_label: Some(TrustLabel::Local),
                 // Even reports with a stale verification flag count local work
                 // exclusively as a local commitment.
                 receipt_verified: true,
@@ -399,6 +482,7 @@ mod tests {
                 ok: true,
                 http_status: 200,
                 routed_via: "peer:peerA".to_string(),
+                trust_label: Some(TrustLabel::RemoteSpotChecked),
                 receipt_verified: true,
                 local_commitment: false,
                 ttft_ms: Some(150.0),
@@ -412,6 +496,7 @@ mod tests {
                 ok: false,
                 http_status: 503,
                 routed_via: "none".to_string(),
+                trust_label: None,
                 receipt_verified: false,
                 local_commitment: false,
                 ttft_ms: None,
@@ -435,5 +520,16 @@ mod tests {
         assert_eq!(report.duration_p50_ms, Some(900.0));
         assert_eq!(report.route_distribution.get("peer:peerA"), Some(&2));
         assert_eq!(report.route_distribution.get("local"), Some(&1));
+        assert_eq!(report.trust_label_distribution.get("local"), Some(&1));
+        assert_eq!(
+            report
+                .trust_label_distribution
+                .get("remote-receipt-verified"),
+            Some(&1)
+        );
+        assert_eq!(
+            report.trust_label_distribution.get("remote-spot-checked"),
+            Some(&1)
+        );
     }
 }
