@@ -1,5 +1,6 @@
 # Build and publish installable LUCID release bundles (Linux x86_64, Linux ARM64,
-# macOS Apple Silicon CLI + native LUCID.app) with SHA-256 checksums.
+# macOS Apple Silicon, and Windows x86_64 CLI + native desktop packages) with
+# SHA-256 checksums.
 #
 # Triggered automatically on `v*` tags or manually via `workflow_dispatch` (e.g.
 # prerelease test candidates so every test machine installs via
@@ -151,9 +152,60 @@ jobs:
             ${{ runner.temp }}/dist-upload/*.zip
             ${{ runner.temp }}/dist-upload/*.dmg
 
+  build-windows-x86_64:
+    name: Build Windows x86_64 (CLI)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Build and package Windows CLI
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          cargo build --release --locked --bin lucidd --target x86_64-pc-windows-msvc
+
+          $versionMatch = Select-String `
+            -Path crates/lucidd/Cargo.toml `
+            -Pattern '^version = "([^"]+)"' `
+            -CaseSensitive | Select-Object -First 1
+          if ($null -eq $versionMatch) {
+            throw "Could not read lucidd version from crates/lucidd/Cargo.toml"
+          }
+          $version = $versionMatch.Matches[0].Groups[1].Value
+          $bundleName = "lucidd-$version-x86_64-pc-windows-msvc"
+          $stage = Join-Path $env:RUNNER_TEMP "$bundleName"
+          $upload = Join-Path $env:RUNNER_TEMP "dist-upload"
+          New-Item -ItemType Directory -Force -Path "$stage\bin", $upload | Out-Null
+          Copy-Item `
+            "target\x86_64-pc-windows-msvc\release\lucidd.exe" `
+            "$stage\bin\lucidd.exe"
+          & "$stage\bin\lucidd.exe" --help | Out-Null
+          Compress-Archive `
+            -Path "$stage\*" `
+            -DestinationPath "$upload\$bundleName.zip" `
+            -CompressionLevel Optimal
+
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/dist-upload/*.zip
+
   publish:
     name: Checksum & Publish GitHub Release
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, build-windows-x86_64]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

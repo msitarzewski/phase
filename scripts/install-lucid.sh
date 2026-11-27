@@ -80,9 +80,9 @@ verify_checksum() {
     local archive_path="$2"
     local archive_name expected actual
     archive_name="$(basename "$archive_path")"
-    expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1; exit }' "$sums_file")"
-    if [[ -z "$expected" ]]; then
-        echo "ERROR: no SHA-256 entry for ${archive_name} in $(basename "$sums_file")" >&2
+    expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1 }' "$sums_file" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "ERROR: expected exactly one valid SHA-256 entry for ${archive_name} in $(basename "$sums_file")" >&2
         exit 1
     fi
     actual="$(sha256_file "$archive_path")"
@@ -103,19 +103,41 @@ if [[ "$INSTALL_SYSTEMD" -eq 1 && "$(uname -s)" != "Linux" ]]; then
     exit 1
 fi
 
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "ERROR: --repo must be in OWNER/REPO form" >&2
+    exit 1
+fi
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 SUMS_FILE="$TMP_DIR/SHA256SUMS.txt"
 
+if [[ -z "$FROM_DIR" && "$TAG" == "latest" ]]; then
+    echo "Resolving the latest published LUCID release..."
+    RELEASES_JSON="$(curl -fsSL --proto '=https' --tlsv1.2 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: LUCID-Installer' \
+        "https://api.github.com/repos/${REPO}/releases?per_page=1")"
+    TAG="$(printf '%s' "$RELEASES_JSON" | tr -d '\r\n' \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [[ -z "$TAG" ]]; then
+        echo "ERROR: GitHub did not return a latest release tag for ${REPO}" >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "$FROM_DIR" || "$TAG" != "latest" ]]; then
+    if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "ERROR: release tag contains unsupported characters: ${TAG}" >&2
+        exit 1
+    fi
+fi
+
 if [[ -n "$FROM_DIR" ]]; then
     cp "$FROM_DIR/SHA256SUMS.txt" "$SUMS_FILE"
 else
-    if [[ "$TAG" == "latest" ]]; then
-        BASE_URL="https://github.com/${REPO}/releases/latest/download"
-    else
-        BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-    fi
+    BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
     curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/SHA256SUMS.txt" -o "$SUMS_FILE"
 fi
 
@@ -129,12 +151,16 @@ if [[ -z "$ARCHIVE_NAME" ]]; then
     echo "ERROR: could not locate matching archive for ${TARGET} in SHA256SUMS.txt" >&2
     exit 1
 fi
+if [[ "$ARCHIVE_NAME" == */* || "$ARCHIVE_NAME" == *"\\"* || "$ARCHIVE_NAME" != "$(basename "$ARCHIVE_NAME")" ]]; then
+    echo "ERROR: archive name in SHA256SUMS.txt is not a plain file name" >&2
+    exit 1
+fi
 
 ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME"
 if [[ -n "$FROM_DIR" ]]; then
     cp "$FROM_DIR/$ARCHIVE_NAME" "$ARCHIVE_PATH"
 else
-    echo "Downloading ${ARCHIVE_NAME} from ${REPO} (${TAG})..."
+    echo "Downloading ${ARCHIVE_NAME} from ${REPO} release ${TAG}..."
     curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/${ARCHIVE_NAME}" -o "$ARCHIVE_PATH"
 fi
 

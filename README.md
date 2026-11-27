@@ -4,6 +4,8 @@ Phase is the open verifiable compute protocol — a credibly-neutral, vendor-agn
 
 See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale.
 
+**New to LUCID?** Start with the [60-second Friends & Family Quickstart](docs/friends-and-family-quickstart.md).
+
 ---
 
 ## Status
