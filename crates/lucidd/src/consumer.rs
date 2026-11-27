@@ -7,6 +7,7 @@
 //! cross the existing DHT. Enrollment never enables anonymous execution and
 //! never bypasses the router's signer/transport, model, or resource checks.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -119,6 +120,15 @@ struct Ledger {
     received: Vec<Approval>,
 }
 
+impl Ledger {
+    fn active_issued_grants(&self) -> impl Iterator<Item = &ApprovalBody> {
+        let now = unix_seconds();
+        self.grants
+            .iter()
+            .filter(move |grant| grant.issuer == self.owner && grant.expires_at > now)
+    }
+}
+
 /// One atomic ledger holds invitation consumption and its resulting grant.
 /// Policy readers consult only grants issued by this ledger's own node.
 pub struct EnrollmentStore {
@@ -158,12 +168,8 @@ impl EnrollmentStore {
         let Ok(ledger) = self.ledger.lock() else {
             return false;
         };
-        let now = unix_seconds();
-        ledger.grants.iter().any(|grant| {
-            grant.issuer == ledger.owner
-                && grant.requester.eq_ignore_ascii_case(requester)
-                && grant.expires_at > now
-        })
+        let mut grants = ledger.active_issued_grants();
+        grants.any(|grant| grant.requester.eq_ignore_ascii_case(requester))
     }
 
     fn persist(&self, ledger: &Ledger) -> Result<()> {
@@ -421,6 +427,34 @@ impl ConsumerControl {
         self.authorized_issuers()
             .into_iter()
             .filter_map(|issuer| peer_id_from_ed25519_pubkey(&issuer).ok())
+    }
+
+    /// Circle membership includes active invitations and explicit submitter
+    /// allowlist entries. The development override does not enroll a peer.
+    pub(crate) fn authorized_circle_peers(&self, policy: &PolicyEngine) -> HashSet<PeerId> {
+        let mut peers: HashSet<_> = self.authorized_issuer_peers().collect();
+        let peer_from_key = |key: &str| {
+            // The operator's allowlist accepts either case. Signed enrollment
+            // data still goes through the ledger's canonical decoder.
+            let mut raw = [0; 32];
+            hex::decode_to_slice(key, &mut raw).ok()?;
+            peer_id_from_ed25519_pubkey(&raw).ok()
+        };
+        peers.extend(
+            policy
+                .config()
+                .authorized_submitters
+                .iter()
+                .filter_map(|key| peer_from_key(key)),
+        );
+        if let Ok(ledger) = self.store.ledger.lock() {
+            peers.extend(
+                ledger
+                    .active_issued_grants()
+                    .filter_map(|grant| peer_from_key(&grant.requester)),
+            );
+        }
+        peers
     }
 
     fn set_status(&self, state: &str, message: &str) {
@@ -1026,6 +1060,11 @@ mod tests {
         assert!(!policy.is_authorized_submitter(&request.body.requester));
         let grant = control.store.claim(&request, unix_seconds()).unwrap();
         assert!(policy.is_authorized_submitter(&request.body.requester));
+        let client_peer = peer_id_from_ed25519_pubkey(&client.peer_id_bytes()).unwrap();
+        assert_eq!(
+            control.authorized_circle_peers(&policy),
+            HashSet::from([client_peer])
+        );
         assert_eq!(
             control
                 .store
@@ -1113,12 +1152,17 @@ mod tests {
         assert!(!ledger.contains(&private_invitation.delegation_seed));
         assert!(!ledger.contains("delegation_seed"));
         drop(consumer);
-        let (reopened, _) = setup(client, Arc::clone(&dht), &tmp.path().join("client"));
+        let (reopened, reopened_policy) =
+            setup(client, Arc::clone(&dht), &tmp.path().join("client"));
         assert_eq!(reopened.enrollment_status().state, "authorized");
         assert_eq!(reopened.authorized_issuers(), vec![issuer.peer_id_bytes()]);
         assert_eq!(
             reopened.authorized_issuer_peers().collect::<Vec<_>>(),
             vec![peer_id_from_ed25519_pubkey(&issuer.peer_id_bytes()).unwrap()]
+        );
+        assert_eq!(
+            reopened.authorized_circle_peers(&reopened_policy),
+            HashSet::from([peer_id_from_ed25519_pubkey(&issuer.peer_id_bytes()).unwrap()])
         );
     }
 
@@ -1138,8 +1182,10 @@ mod tests {
             control.store.persist(&ledger).unwrap();
         }
         assert!(!policy.is_authorized_submitter(&request.body.requester));
-        let (_, reopened) = setup(issuer, dht, tmp.path());
+        assert!(control.authorized_circle_peers(&policy).is_empty());
+        let (control, reopened) = setup(issuer, dht, tmp.path());
         assert!(!reopened.is_authorized_submitter(&request.body.requester));
+        assert!(control.authorized_circle_peers(&reopened).is_empty());
     }
 
     #[tokio::test]

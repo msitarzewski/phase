@@ -774,11 +774,25 @@
   {:else if peers.length === 0}
     <p class="row-help">No connected peers reported.</p>
   {:else}
+    {@const orderedPeers = [...peers].sort(
+      (a, b) => Number(b.authorized === true) - Number(a.authorized === true),
+    )}
     <ul class="peer-list connection-list">
-      {#each peers as peer (peer.peer_id)}
+      {#each orderedPeers as peer (peer.peer_id)}
         <li class="peer-row">
           <span class="mono">{shortPeerId(peer.peer_id)}</span>
-          <span class="chip">{connectionPathLabel(peer.path)}</span>
+          <span class="peer-badges">
+            <span class="chip" class:sharing={peer.authorized === true}>
+              {#if peer.authorized === true}
+                Circle authorized
+              {:else if peer.authorized === false}
+                Other connection
+              {:else}
+                Authorization unknown
+              {/if}
+            </span>
+            <span class="chip">{connectionPathLabel(peer.path)}</span>
+          </span>
         </li>
       {/each}
     </ul>
@@ -792,7 +806,7 @@
       <h2 id="peers-title">Peers</h2>
       <section class="card compact">
         <h3 class="row-label">Network enrollment</h3>
-        <p class="row-help">{deviceEnrollment}. Circle membership is unavailable for individual peers.</p>
+        <p class="row-help">{deviceEnrollment}.</p>
       </section>
       <section class="connection-section">
         <h3 class="row-label">
@@ -878,8 +892,8 @@
             </div>
           </dl>
           <p class="row-help" id="cluster-preview-unavailable">
-            Layer split preview needs verified peer identities and memory. This daemon does not
-            report which connected devices are eligible or how much memory they can contribute.
+            Pooled memory and layer split preview need per-device capacity, which this daemon
+            does not report.
           </p>
         </section>
 
@@ -1407,6 +1421,13 @@
   .connection-list {
     list-style: none;
     padding: 0;
+  }
+
+  .peer-badges {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
   }
 
   .modal-actions {

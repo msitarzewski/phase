@@ -27,11 +27,25 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn spawn() -> Self {
+        Self::spawn_with_bootstrap(&[], None).await
+    }
+
+    async fn spawn_with_bootstrap(bootstrap_peers: &[String], policy: Option<&str>) -> Self {
         let temp = tempfile::tempdir().expect("create daemon temp dir");
         let log_path = temp.path().join("lucidd.log");
         let log = File::create(&log_path).expect("create daemon log");
         let stderr = log.try_clone().expect("clone daemon log handle");
+        let policy_path = temp.path().join("policy.toml");
+        if let Some(policy) = policy {
+            std::fs::write(&policy_path, policy).expect("write test policy");
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_lucidd"));
+        if !bootstrap_peers.is_empty() {
+            command.arg("--no-bootstrap-relays");
+            for address in bootstrap_peers {
+                command.arg("--bootstrap-peer").arg(address);
+            }
+        }
         command
             .args([
                 "--worker",
@@ -44,7 +58,7 @@ impl TestDaemon {
             ])
             .arg(temp.path().join("identity.key"))
             .arg("--policy-config")
-            .arg(temp.path().join("policy.toml"))
+            .arg(&policy_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -93,6 +107,98 @@ impl TestDaemon {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+}
+
+#[tokio::test]
+async fn peer_and_cluster_status_distinguish_explicit_authorization_from_open_mode() {
+    use phase_identity::NodeIdentity;
+    use phase_net::{Discovery, DiscoveryConfig};
+
+    let authorized_identity = NodeIdentity::generate();
+    let allowed_key = hex::encode_upper(authorized_identity.peer_id_bytes());
+    let policy =
+        format!("allow_unauthenticated_jobs = true\nauthorized_submitters = [\"{allowed_key}\"]\n");
+    let mut bootstrap = Vec::new();
+    let mut peers = Vec::new();
+    for identity in [authorized_identity, NodeIdentity::generate()] {
+        let peer = Discovery::new(DiscoveryConfig {
+            identity: Some(identity),
+            ..DiscoveryConfig::default()
+        })
+        .unwrap();
+        peer.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let address = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(address) = peer.listen_addrs().await.unwrap().into_iter().next() {
+                    break address;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("loopback peer listening");
+        bootstrap.push(format!("{address}/p2p/{}", peer.local_peer_id()));
+        peers.push(peer);
+    }
+    let authorized_peer = peers[0].local_peer_id().to_string();
+    let other_peer = peers[1].local_peer_id().to_string();
+    let daemon = TestDaemon::spawn_with_bootstrap(&bootstrap, Some(&policy)).await;
+    let token = std::fs::read_to_string(daemon._temp.path().join("identity.key.control-token"))
+        .expect("read local control token");
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for path in ["/api/lucid/peers", "/api/lucid/cluster"] {
+        let response = client.get(daemon.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    for (path, field) in [
+        ("/api/lucid/peers", "peers"),
+        ("/api/lucid/cluster", "connected_peers"),
+    ] {
+        let status = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let status: Value = client
+                    .get(daemon.url(path))
+                    .bearer_auth(token.trim())
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let rows = status[field].as_array().expect("peer list");
+                if [&authorized_peer, &other_peer].into_iter().all(|id| {
+                    rows.iter()
+                        .any(|row| row["peer_id"].as_str() == Some(id.as_str()))
+                }) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both loopback peers connected");
+        let rows = status[field].as_array().unwrap();
+        for (id, authorized) in [(&authorized_peer, true), (&other_peer, false)] {
+            let peer = rows
+                .iter()
+                .find(|row| row["peer_id"].as_str() == Some(id.as_str()))
+                .unwrap();
+            assert_eq!(peer["authorized"], authorized, "{path}");
+            assert!(peer["path"].is_string());
+            assert_eq!(
+                peer.as_object().unwrap().len(),
+                3,
+                "only peer ID, path and authorization"
+            );
+        }
     }
 }
 

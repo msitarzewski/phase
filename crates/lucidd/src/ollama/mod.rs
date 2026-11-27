@@ -35,7 +35,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
-use phase_net::PeerId;
+use phase_net::{PeerId, ReachabilityConnection};
 use phase_protocol::{
     ChatMessage as PhaseChatMessage, ChatRole as PhaseChatRole, Completion, InferenceJobSpec,
     JobEvent, JobHandle, JobSpec, OutputChunk, SamplingParams,
@@ -699,6 +699,28 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
     )
 }
 
+#[derive(Serialize)]
+struct ControlPeer {
+    peer_id: String,
+    path: String,
+    authorized: bool,
+}
+
+fn control_peer_entries(
+    state: &AppState,
+    connections: Vec<ReachabilityConnection>,
+) -> Vec<ControlPeer> {
+    let authorized = state.consumer.authorized_circle_peers(&state.policy);
+    connections
+        .into_iter()
+        .map(|connection| ControlPeer {
+            peer_id: connection.peer_id.to_string(),
+            path: format!("{:?}", connection.path).to_ascii_lowercase(),
+            authorized: authorized.contains(&connection.peer_id),
+        })
+        .collect()
+}
+
 async fn handle_control_peers(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(response) = authorize_control(&state, &headers) {
         return response;
@@ -712,23 +734,11 @@ async fn handle_control_peers(State(state): State<AppState>, headers: HeaderMap)
     .and_then(|res| res.ok());
 
     let (active_path, nat, peers) = match snapshot {
-        Some(snap) => {
-            let list: Vec<serde_json::Value> = snap
-                .connections
-                .into_iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "peer_id": c.peer_id.to_string(),
-                        "path": format!("{:?}", c.path).to_ascii_lowercase(),
-                    })
-                })
-                .collect();
-            (
-                format!("{:?}", snap.active_path).to_ascii_lowercase(),
-                format!("{:?}", snap.nat).to_ascii_lowercase(),
-                list,
-            )
-        }
+        Some(snap) => (
+            format!("{:?}", snap.active_path).to_ascii_lowercase(),
+            format!("{:?}", snap.nat).to_ascii_lowercase(),
+            control_peer_entries(&state, snap.connections),
+        ),
         None => ("none".to_string(), "unknown".to_string(), Vec::new()),
     };
 
@@ -1326,18 +1336,8 @@ async fn handle_control_cluster(State(state): State<AppState>, headers: HeaderMa
     .ok()
     .and_then(|res| res.ok());
 
-    let connected_peers: Vec<serde_json::Value> = snapshot
-        .map(|snap| {
-            snap.connections
-                .into_iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "peer_id": c.peer_id.to_string(),
-                        "path": format!("{:?}", c.path).to_ascii_lowercase(),
-                    })
-                })
-                .collect()
-        })
+    let connected_peers = snapshot
+        .map(|snap| control_peer_entries(&state, snap.connections))
         .unwrap_or_default();
 
     let discovered_clone = probe.discovered_models.clone();

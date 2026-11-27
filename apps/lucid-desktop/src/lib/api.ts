@@ -95,6 +95,7 @@ export interface ModelEntry {
 export interface PeerEntry {
   peer_id: string;
   path?: string | null;
+  authorized?: boolean;
 }
 
 export interface OverviewPayload {
