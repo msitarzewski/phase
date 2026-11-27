@@ -20,9 +20,13 @@
 //! - no embeddings, adapters, draft models, remote model identifiers, or
 //!   `trust-remote-code`.
 //!
-//! This code is an adapter spike, not hardware acceptance.  No real Metal
-//! model run is implied by constructing or compiling this worker; callers can
-//! surface [`MLX_HARDWARE_ACCEPTANCE`] verbatim in status output.
+//! Real Apple Silicon Metal runs of this adapter (local loopback and over the
+//! WAN relay) are recorded in the LUCID v0.2 fleet qualification log, but
+//! formal release acceptance remains open and constructing or compiling this
+//! worker implies no run at all.  Callers surface [`MLX_HARDWARE_ACCEPTANCE`]
+//! verbatim in status output.  Receipts are this node's self-signed output
+//! commitments; they never prove to a third party which hardware computed
+//! the output.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -59,8 +63,14 @@ pub const TARGET_MLX_LM_VERSION: &str = "0.31.3";
 /// Compatibility target for the experimental adapter; see
 /// [`MLX_RUNTIME_ATTESTATION`].
 pub const TARGET_MLX_VERSION: &str = "0.31.2";
-pub const MLX_HARDWARE_ACCEPTANCE: &str =
-    "unverified: no real Metal/model acceptance run is recorded";
+/// Adapter-level hardware status. It describes the recorded qualification
+/// evidence for this adapter, not any individual job.
+pub const MLX_HARDWARE_ACCEPTANCE: &str = "fleet-recorded: real Apple Silicon Metal model runs of this adapter (local loopback and over the WAN relay) are recorded in LUCID v0.2 fleet qualification; formal release acceptance (pinned runtime versions, power/performance report) remains open; receipts are self-signed output commitments, not third-party proof of compute";
+/// Short machine-readable form of [`MLX_HARDWARE_ACCEPTANCE`] carried in
+/// receipt metadata.
+pub const MLX_HARDWARE_ACCEPTANCE_LABEL: &str = "fleet-recorded";
+/// What a receipt from this adapter proves about the computation itself.
+pub const MLX_COMPUTE_PROOF: &str = "none: self-signed output commitment";
 pub const MLX_RUNTIME_ATTESTATION: &str = "unverified: mlx_lm.server has no stable offline probe that binds the installed mlx-lm and mlx package versions to the launched entry point; only the entry-point bytes are pinned";
 pub const MLX_PORT_BINDING_STATUS: &str = "guarded, not race-free: Phase reserves the loopback port immediately before spawn, but mlx_lm.server cannot inherit that listener";
 /// Signed alias/provider format for the canonical bundle-root contract below.
@@ -171,6 +181,15 @@ struct Inner {
     client: reqwest::Client,
     server: Mutex<Option<Arc<MlxServer>>>,
     capacity: Arc<Semaphore>,
+    /// `true` once a backend has ended abnormally (or a restart failed)
+    /// without a later successful full re-hash; the next spawn then streams
+    /// every bundle byte through SHA-256 again instead of trusting the
+    /// identity-only check. Construction has just hashed, so it starts clear.
+    content_reverify_required: AtomicBool,
+    /// Test-only observation of how many spawn-time verifications streamed
+    /// the full bundle contents.
+    #[cfg(test)]
+    content_rehash_count: std::sync::atomic::AtomicUsize,
 }
 
 impl MlxWorker {
@@ -197,6 +216,9 @@ impl MlxWorker {
                 client,
                 server: Mutex::new(None),
                 capacity: Arc::new(Semaphore::new(1)),
+                content_reverify_required: AtomicBool::new(false),
+                #[cfg(test)]
+                content_rehash_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -252,26 +274,53 @@ impl MlxWorker {
             }
         }
         if let Some(stale) = slot.take() {
+            if stale.ended_abnormally() {
+                self.inner
+                    .content_reverify_required
+                    .store(true, Ordering::Release);
+            }
             stale.shutdown(self.inner.config.shutdown_timeout).await;
         }
 
         let attempts = u32::from(self.inner.config.max_start_retries) + 1;
         let mut last_failure = "MLX backend did not become ready";
         for attempt in 0..attempts {
+            // A clean, Phase-initiated restart (e.g. after cancelling a
+            // request) only re-proves the immutable bundle's identity; a
+            // multi-GB content re-hash is reserved for restarts after the
+            // backend ended abnormally, where on-disk corruption is a real
+            // suspect.
+            let mode = if self.inner.content_reverify_required.load(Ordering::Acquire) {
+                BundleScanMode::ContentHash
+            } else {
+                BundleScanMode::IdentityOnly
+            };
             let config = self.inner.config.clone();
             let expected_bundle = self.inner.bundle_snapshot.clone();
             let expected_runtime = self.inner.runtime_snapshot.clone();
             let reverified = tokio::task::spawn_blocking(move || {
-                reverify_spawn_inputs(&config, &expected_bundle, &expected_runtime)
+                reverify_spawn_inputs(&config, &expected_bundle, &expected_runtime, mode)
             })
             .await
             .map_err(|_| WorkerError::Other("MLX verification task failed".into()))?;
             reverified?;
+            if mode == BundleScanMode::ContentHash {
+                #[cfg(test)]
+                self.inner
+                    .content_rehash_count
+                    .fetch_add(1, Ordering::AcqRel);
+                self.inner
+                    .content_reverify_required
+                    .store(false, Ordering::Release);
+            }
 
             let server = match spawn_mlx_server(&self.inner.config) {
                 Ok(server) => Arc::new(server),
                 Err(error) => {
                     tracing::warn!(attempt, error = %error, "MLX backend spawn failed");
+                    self.inner
+                        .content_reverify_required
+                        .store(true, Ordering::Release);
                     last_failure = "failed to start MLX backend";
                     if attempt + 1 < attempts {
                         tokio::time::sleep(
@@ -294,6 +343,9 @@ impl MlxWorker {
                 Err(error) => {
                     tracing::warn!(attempt, error = %error, "MLX backend readiness failed");
                     last_failure = "MLX backend readiness failed";
+                    self.inner
+                        .content_reverify_required
+                        .store(true, Ordering::Release);
                     server.shutdown(self.inner.config.shutdown_timeout).await;
                     if attempt + 1 < attempts {
                         tokio::time::sleep(
@@ -655,7 +707,7 @@ fn scan_bundle(path: &Path) -> Result<(PathBuf, BundleSnapshot), WorkerError> {
         .symlink_metadata()
         .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
     let mut state = BundleScanState::default();
-    scan_bundle_directory(&root, &root, "", 0, &mut state)?;
+    scan_bundle_directory(&root, &root, "", 0, &mut state, BundleScanMode::ContentHash)?;
     let root_after = root
         .symlink_metadata()
         .map_err(|_| WorkerError::ArtifactUnavailable("model bundle changed during scan".into()))?;
@@ -724,12 +776,28 @@ fn scan_bundle(path: &Path) -> Result<(PathBuf, BundleSnapshot), WorkerError> {
     ))
 }
 
+/// How much of each bundle file a scan reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleScanMode {
+    /// Stream every byte through SHA-256 (construction, and any spawn after
+    /// the backend ended abnormally).
+    ContentHash,
+    /// Re-check structure, permissions, and every entry's filesystem
+    /// identity (device, inode, size, mode, link count, owner, mtime, ctime)
+    /// without reading file contents. Sufficient to prove an immutable,
+    /// already-hashed bundle is unchanged: writing or replacing a file
+    /// changes its ctime or inode, and the scan requires no write bits and no
+    /// hard links.
+    IdentityOnly,
+}
+
 fn scan_bundle_directory(
     root: &Path,
     directory: &Path,
     relative_directory: &str,
     depth: usize,
     state: &mut BundleScanState,
+    mode: BundleScanMode,
 ) -> Result<(), WorkerError> {
     if depth > MAX_BUNDLE_DEPTH {
         return Err(WorkerError::ArtifactUnavailable(
@@ -805,7 +873,7 @@ fn scan_bundle_directory(
                 kind: SnapshotEntryKind::Directory,
                 identity: file_identity(&metadata),
             });
-            scan_bundle_directory(root, &child_path, &relative_path, depth + 1, state)?;
+            scan_bundle_directory(root, &child_path, &relative_path, depth + 1, state, mode)?;
         } else if metadata.is_file() {
             reject_executable_bundle_entry(&relative_path, &metadata)?;
             state.total_bytes = state
@@ -815,32 +883,45 @@ fn scan_bundle_directory(
                 .ok_or_else(|| {
                     WorkerError::ArtifactUnavailable("model bundle exceeds byte limit".into())
                 })?;
-            let (sha256, identity) =
-                hash_regular_file(&child_path, &metadata, MAX_MODEL_SIZE_BYTES).map_err(
-                    |error| {
-                        WorkerError::ArtifactUnavailable(format!(
-                            "model bundle file verification failed: {error}"
-                        ))
-                    },
-                )?;
-            if relative_path == "config.json" {
-                state.context_length =
-                    read_verified_context_length(&child_path, &metadata, sha256, &identity)?;
-            }
             state.has_weights |= relative_path.ends_with(".safetensors");
             state.has_tokenizer |= matches!(
                 relative_path.as_str(),
                 "tokenizer.json" | "tokenizer.model" | "sentencepiece.bpe.model"
             );
+            let identity = match mode {
+                BundleScanMode::ContentHash => {
+                    let (sha256, identity) =
+                        hash_regular_file(&child_path, &metadata, MAX_MODEL_SIZE_BYTES).map_err(
+                            |error| {
+                                WorkerError::ArtifactUnavailable(format!(
+                                    "model bundle file verification failed: {error}"
+                                ))
+                            },
+                        )?;
+                    if relative_path == "config.json" {
+                        state.context_length = read_verified_context_length(
+                            &child_path,
+                            &metadata,
+                            sha256,
+                            &identity,
+                        )?;
+                    }
+                    state.files.push(BundleFileRecord {
+                        relative_path: relative_path.clone(),
+                        size: metadata.len(),
+                        sha256,
+                    });
+                    identity
+                }
+                // `hash_regular_file` returns exactly this identity (it
+                // fails unless the opened file still matches it), so the two
+                // modes record comparable snapshots.
+                BundleScanMode::IdentityOnly => file_identity(&metadata),
+            };
             state.entries.push(SnapshotEntry {
-                relative_path: relative_path.clone(),
+                relative_path,
                 kind: SnapshotEntryKind::File,
                 identity,
-            });
-            state.files.push(BundleFileRecord {
-                relative_path,
-                size: metadata.len(),
-                sha256,
             });
         } else {
             return Err(WorkerError::ArtifactUnavailable(
@@ -1049,25 +1130,79 @@ fn json_contains_forbidden_code_key(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Identity-only re-verification of an already content-hashed bundle: the
+/// same traversal, limits, and immutability checks as [`scan_bundle`], but no
+/// file contents are read. Fails unless the root and every entry match
+/// `expected` exactly.
+fn verify_bundle_identity(path: &Path, expected: &BundleSnapshot) -> Result<PathBuf, WorkerError> {
+    let changed = || {
+        WorkerError::ArtifactUnavailable(
+            "MLX model bundle changed after worker construction".into(),
+        )
+    };
+    let root = canonical_bundle_root(path)?;
+    let root_before = root
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    let mut state = BundleScanState::default();
+    scan_bundle_directory(
+        &root,
+        &root,
+        "",
+        0,
+        &mut state,
+        BundleScanMode::IdentityOnly,
+    )?;
+    let root_after = root.symlink_metadata().map_err(|_| changed())?;
+    let root_identity = file_identity(&root_after);
+    if file_identity(&root_before) != root_identity || root_identity != expected.root_identity {
+        return Err(changed());
+    }
+    state.entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    if state.entries != expected.entries || state.total_bytes != expected.total_bytes {
+        return Err(changed());
+    }
+    Ok(root)
+}
+
 fn reverify_spawn_inputs(
     config: &MlxConfig,
     expected_bundle: &BundleSnapshot,
     expected_runtime: &RuntimeSnapshot,
+    mode: BundleScanMode,
 ) -> Result<(), WorkerError> {
+    // The pinned entry point is small; always re-hash it.
     let (runtime_path, runtime) = inspect_runtime(&config.server_binary_path)?;
     if runtime_path != config.server_binary_path || &runtime != expected_runtime {
         return Err(WorkerError::Other(
             "MLX runtime changed after worker construction".into(),
         ));
     }
-    let (bundle_path, bundle) = scan_bundle(&config.verified_model_bundle_path)?;
-    if bundle_path != config.verified_model_bundle_path
-        || bundle.cid != config.model_cid
-        || &bundle != expected_bundle
-    {
-        return Err(WorkerError::ArtifactUnavailable(
-            "MLX model bundle changed after worker construction".into(),
-        ));
+    match mode {
+        BundleScanMode::ContentHash => {
+            let (bundle_path, bundle) = scan_bundle(&config.verified_model_bundle_path)?;
+            if bundle_path != config.verified_model_bundle_path
+                || bundle.cid != config.model_cid
+                || &bundle != expected_bundle
+            {
+                return Err(WorkerError::ArtifactUnavailable(
+                    "MLX model bundle changed after worker construction".into(),
+                ));
+            }
+        }
+        BundleScanMode::IdentityOnly => {
+            let bundle_path =
+                verify_bundle_identity(&config.verified_model_bundle_path, expected_bundle)?;
+            if bundle_path != config.verified_model_bundle_path {
+                return Err(WorkerError::ArtifactUnavailable(
+                    "MLX model bundle changed after worker construction".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1079,6 +1214,11 @@ fn reverify_spawn_inputs(
 struct MlxServer {
     port: u16,
     failed: Arc<AtomicBool>,
+    /// Set when the backend exited on its own or misbehaved (protocol error,
+    /// timeout). A Phase-initiated stop — request cancellation or a dropped
+    /// stream — leaves it clear. Decides whether the next spawn needs a full
+    /// content re-hash of the bundle.
+    abnormal: Arc<AtomicBool>,
     shutdown_tx: mpsc::Sender<ShutdownRequest>,
     supervisor: tokio::task::JoinHandle<()>,
 }
@@ -1090,6 +1230,18 @@ struct ShutdownRequest {
 impl MlxServer {
     fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    fn ended_abnormally(&self) -> bool {
+        self.abnormal.load(Ordering::Acquire)
+    }
+
+    /// Stop the backend because it misbehaved. Unlike a clean,
+    /// Phase-initiated [`shutdown`](Self::shutdown), this makes the next spawn
+    /// re-hash the bundle contents.
+    async fn shutdown_after_failure(&self, deadline: Duration) {
+        self.abnormal.store(true, Ordering::Release);
+        self.shutdown(deadline).await;
     }
 
     async fn shutdown(&self, deadline: Duration) {
@@ -1209,6 +1361,8 @@ fn supervise_child(mut child: Child, port: u16, shutdown_timeout: Duration) -> M
     let stderr = child.stderr.take();
     let failed = Arc::new(AtomicBool::new(false));
     let failed_task = failed.clone();
+    let abnormal = Arc::new(AtomicBool::new(false));
+    let abnormal_task = abnormal.clone();
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<ShutdownRequest>(1);
     let supervisor = tokio::spawn(async move {
         let stdout_task = stdout.map(|stream| tokio::spawn(discard_child_output(stream)));
@@ -1216,6 +1370,8 @@ fn supervise_child(mut child: Child, port: u16, shutdown_timeout: Duration) -> M
 
         tokio::select! {
             status = child.wait() => {
+                // Nobody asked it to stop: treat as a crash.
+                abnormal_task.store(true, Ordering::Release);
                 match status {
                     Ok(status) => tracing::warn!(%status, "MLX backend exited"),
                     Err(error) => tracing::warn!(%error, "failed waiting for MLX backend"),
@@ -1241,6 +1397,7 @@ fn supervise_child(mut child: Child, port: u16, shutdown_timeout: Duration) -> M
     MlxServer {
         port,
         failed,
+        abnormal,
         shutdown_tx,
         supervisor,
     }
@@ -1750,7 +1907,7 @@ fn run_inference(
             Ok(Ok(response)) => {
                 let status = response.status();
                 drop(response);
-                server.shutdown(config.shutdown_timeout).await;
+                server.shutdown_after_failure(config.shutdown_timeout).await;
                 yield finish_event(
                     &mut producer, &identity, manifest_hash, accumulator,
                     Completion::Error, Some(format!("MLX backend returned {status}")),
@@ -1759,7 +1916,7 @@ fn run_inference(
                 return;
             }
             Ok(Err(_)) => {
-                server.shutdown(config.shutdown_timeout).await;
+                server.shutdown_after_failure(config.shutdown_timeout).await;
                 yield finish_event(
                     &mut producer, &identity, manifest_hash, accumulator,
                     Completion::Error, Some("MLX backend request failed".into()),
@@ -1768,7 +1925,7 @@ fn run_inference(
                 return;
             }
             Err(_) => {
-                server.shutdown(config.shutdown_timeout).await;
+                server.shutdown_after_failure(config.shutdown_timeout).await;
                 yield finish_event(
                     &mut producer, &identity, manifest_hash, accumulator,
                     Completion::Error, Some("MLX backend response deadline exceeded".into()),
@@ -1785,7 +1942,7 @@ fn run_inference(
             .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
         if !content_type_ok {
             drop(response);
-            server.shutdown(config.shutdown_timeout).await;
+            server.shutdown_after_failure(config.shutdown_timeout).await;
             yield finish_event(
                 &mut producer, &identity, manifest_hash, accumulator,
                 Completion::Error, Some("MLX backend returned a non-SSE response".into()),
@@ -1808,7 +1965,7 @@ fn run_inference(
                 return;
             }
             let Some(remaining) = config.request_deadline.checked_sub(started_at.elapsed()) else {
-                server.shutdown(config.shutdown_timeout).await;
+                server.shutdown_after_failure(config.shutdown_timeout).await;
                 yield finish_event(
                     &mut producer, &identity, manifest_hash, accumulator,
                     Completion::Error, Some("MLX inference deadline exceeded".into()),
@@ -1832,7 +1989,7 @@ fn run_inference(
             let chunk = match next {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) => {
-                    server.shutdown(config.shutdown_timeout).await;
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
                     yield finish_event(
                         &mut producer, &identity, manifest_hash, accumulator,
                         Completion::Error, Some("MLX SSE transport failed".into()),
@@ -1841,7 +1998,7 @@ fn run_inference(
                     return;
                 }
                 Ok(None) => {
-                    server.shutdown(config.shutdown_timeout).await;
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
                     yield finish_event(
                         &mut producer, &identity, manifest_hash, accumulator,
                         Completion::Error, Some("MLX SSE ended before [DONE]".into()),
@@ -1850,7 +2007,7 @@ fn run_inference(
                     return;
                 }
                 Err(_) => {
-                    server.shutdown(config.shutdown_timeout).await;
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
                     yield finish_event(
                         &mut producer, &identity, manifest_hash, accumulator,
                         Completion::Error, Some("MLX SSE idle deadline exceeded".into()),
@@ -1862,7 +2019,7 @@ fn run_inference(
 
             for segment in chunk.chunks(SSE_INGEST_SLICE_BYTES) {
                 if append_sse_chunk(&mut buffer, segment).is_err() {
-                    server.shutdown(config.shutdown_timeout).await;
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
                     yield finish_event(
                         &mut producer, &identity, manifest_hash, accumulator,
                         Completion::Error, Some("MLX SSE frame exceeded its size limit".into()),
@@ -1875,7 +2032,7 @@ fn run_inference(
                         Ok(Some(frame)) => frame,
                         Ok(None) => break,
                         Err(_) => {
-                            server.shutdown(config.shutdown_timeout).await;
+                            server.shutdown_after_failure(config.shutdown_timeout).await;
                             yield finish_event(
                                 &mut producer, &identity, manifest_hash, accumulator,
                                 Completion::Error, Some("MLX SSE frame exceeded its size limit".into()),
@@ -1888,7 +2045,7 @@ fn run_inference(
                         Ok(action) => action,
                         Err(error) => {
                             tracing::warn!(error = %error, "rejected malformed MLX SSE frame");
-                            server.shutdown(config.shutdown_timeout).await;
+                            server.shutdown_after_failure(config.shutdown_timeout).await;
                             yield finish_event(
                                 &mut producer, &identity, manifest_hash, accumulator,
                                 Completion::Error, Some("MLX backend returned an invalid SSE frame".into()),
@@ -1904,7 +2061,7 @@ fn run_inference(
                         }
                         FrameAction::Delta { text, terminal } => {
                             if saw_finish && (!text.is_empty() || terminal.is_some()) {
-                                server.shutdown(config.shutdown_timeout).await;
+                                server.shutdown_after_failure(config.shutdown_timeout).await;
                                 yield finish_event(
                                     &mut producer, &identity, manifest_hash, accumulator,
                                     Completion::Error, Some("MLX backend emitted data after finish".into()),
@@ -1916,7 +2073,7 @@ fn run_inference(
                                 output_bytes = match output_bytes.checked_add(text.len()) {
                                     Some(total) if total <= MAX_STREAM_OUTPUT_BYTES => total,
                                     _ => {
-                                        server.shutdown(config.shutdown_timeout).await;
+                                        server.shutdown_after_failure(config.shutdown_timeout).await;
                                         yield finish_event(
                                             &mut producer, &identity, manifest_hash, accumulator,
                                             Completion::Error, Some("MLX output exceeded its byte limit".into()),
@@ -1926,7 +2083,7 @@ fn run_inference(
                                     }
                                 };
                                 if completion_chunks >= max_output_frames {
-                                    server.shutdown(config.shutdown_timeout).await;
+                                    server.shutdown_after_failure(config.shutdown_timeout).await;
                                     yield finish_event(
                                         &mut producer, &identity, manifest_hash, accumulator,
                                         Completion::Error, Some("MLX output exceeded its frame limit".into()),
@@ -1995,7 +2152,11 @@ fn finish_event(
         MLX_BUNDLE_ROOT_ALGORITHM.into(),
     );
     extra.insert("bundle_cid".into(), config.model_cid.to_hex());
-    extra.insert("hardware_acceptance".into(), "unverified".into());
+    extra.insert(
+        "hardware_acceptance".into(),
+        MLX_HARDWARE_ACCEPTANCE_LABEL.into(),
+    );
+    extra.insert("compute_proof".into(), MLX_COMPUTE_PROOF.into());
     let result = JobResult {
         job_spec_hash: manifest_hash,
         output_commitment,

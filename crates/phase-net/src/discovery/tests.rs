@@ -427,12 +427,31 @@ fn classify_runtime_recognises_wasmtime_prefix() {
     assert_eq!(classify_runtime("wasmtime-27"), Some(JobSpecKind::Wasm));
     assert_eq!(classify_runtime("wasmtime"), Some(JobSpecKind::Wasm));
     assert_eq!(classify_runtime("wasm3-0.5"), Some(JobSpecKind::Wasm));
-    assert_eq!(
-        classify_runtime("llama-cpp-b3000"),
-        Some(JobSpecKind::Inference)
-    );
+    assert_eq!(classify_runtime("wasm"), Some(JobSpecKind::Wasm));
     assert_eq!(classify_runtime("python-3.11"), None);
     assert_eq!(classify_runtime(""), None);
+}
+
+#[test]
+fn classify_runtime_uses_workload_kinds_not_backend_names() {
+    use phase_protocol::JobSpecKind;
+    // Substrate neutrality: kinds come from the protocol vocabulary.
+    assert_eq!(classify_runtime("inference"), Some(JobSpecKind::Inference));
+    assert_eq!(
+        classify_runtime("inference-v1"),
+        Some(JobSpecKind::Inference)
+    );
+    assert_eq!(classify_runtime("embedding"), Some(JobSpecKind::Embedding));
+    // Backend product names are not workload kinds and are not recognised.
+    for backend in [
+        "llama-cpp-b3000",
+        "mlx-0.31",
+        "ollama",
+        "Inference",
+        "-inference",
+    ] {
+        assert_eq!(classify_runtime(backend), None, "{backend}");
+    }
 }
 
 #[test]
@@ -969,17 +988,13 @@ async fn blob_stream_loopback_resumes_streams_rejects_and_bounds_frames() {
 
     let mut resume_request = blob_request(content_id, 3, b"resume".to_vec());
     resume_request.idle_timeout_ms = crate::protocol::BLOB_STREAM_MIN_IDLE_TIMEOUT_MS;
-    let control_guard = requester.job_relay_stream_control.lock().await;
-    let open_future = requester.open_blob_stream(server_peer, resume_request);
-    tokio::pin!(open_future);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(350), open_future.as_mut())
-            .await
-            .is_err(),
-        "valid blob idle timeout must not bound control-lock or transport negotiation"
-    );
-    drop(control_guard);
-    let mut resumed = open_future.await.expect("open resumed blob");
+    // That the minimum idle timeout never bounds negotiation itself is
+    // covered against a genuinely stalled peer in
+    // `stalled_peer_negotiation_does_not_block_streams_to_healthy_peers`.
+    let mut resumed = requester
+        .open_blob_stream(server_peer, resume_request)
+        .await
+        .expect("open resumed blob");
     assert_eq!(resumed.content_id(), &content_id);
     assert!(matches!(
         resumed.next_frame().await.unwrap().kind,
@@ -1148,26 +1163,22 @@ async fn live_relay_is_real_ordered_substream_with_cancellation() {
         .unwrap();
 
     let job_id = [21; 32];
-    let control_guard = node_a.job_relay_stream_control.lock().await;
-    let open_future = node_a.open_job_relay_stream(
-        b_peer,
-        JobRelayStreamOpen {
-            schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-            job_id,
-            payload: b"signed-manifest".to_vec(),
-            deadline_unix_ms: unix_time_ms() + 5_000,
-            idle_timeout_ms: crate::protocol::JOB_RELAY_STREAM_MIN_IDLE_TIMEOUT_MS,
-        },
-    );
-    tokio::pin!(open_future);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(350), open_future.as_mut())
-            .await
-            .is_err(),
-        "valid idle timeout must not bound control-lock or transport negotiation"
-    );
-    drop(control_guard);
-    let mut stream = open_future.await.expect("open live relay stream");
+    // That the minimum idle timeout never bounds negotiation itself is
+    // covered against a genuinely stalled peer in
+    // `stalled_peer_negotiation_does_not_block_streams_to_healthy_peers`.
+    let mut stream = node_a
+        .open_job_relay_stream(
+            b_peer,
+            JobRelayStreamOpen {
+                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
+                job_id,
+                payload: b"signed-manifest".to_vec(),
+                deadline_unix_ms: unix_time_ms() + 5_000,
+                idle_timeout_ms: crate::protocol::JOB_RELAY_STREAM_MIN_IDLE_TIMEOUT_MS,
+            },
+        )
+        .await
+        .expect("open live relay stream");
 
     assert!(matches!(
         stream.next_frame().await.unwrap().unwrap().kind,
@@ -1330,4 +1341,105 @@ async fn live_relay_is_real_ordered_substream_with_cancellation() {
         .await
         .expect("server handler receives cancellation and releases resources")
         .expect("cancel signal sender remains live");
+}
+
+/// A4: outbound stream negotiation must not be serialized across peers. A
+/// peer whose transport handshake stalls (here: a TCP listener that accepts
+/// and never speaks) must not delay opening a stream to a healthy peer.
+#[tokio::test]
+async fn stalled_peer_negotiation_does_not_block_streams_to_healthy_peers() {
+    let _loopback_test = acquire_loopback_test_gate().await;
+    let node_a = Arc::new(Discovery::new(DiscoveryConfig::default()).expect("node A"));
+    let node_b = Discovery::new(DiscoveryConfig::default()).expect("node B");
+    let b_peer = *node_b.local_peer_id();
+
+    node_b
+        .listen("/ip4/127.0.0.1/tcp/0")
+        .await
+        .expect("node B listen");
+    let mut b_addr = loopback_dial_addr(&node_b).await;
+    b_addr.push(libp2p::multiaddr::Protocol::P2p(b_peer));
+    node_a
+        .dial_peer(&b_addr.to_string())
+        .await
+        .expect("node A dials node B");
+    wait_for_peer_path(&node_a, b_peer, &[ReachabilityPath::Direct]).await;
+    node_b
+        .set_job_relay_stream_handler(Some(Arc::new(move |_peer, open, _controls, frames| {
+            Box::pin(async move {
+                let _ = frames
+                    .send(JobRelayStreamFrame {
+                        schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
+                        job_id: open.job_id,
+                        sequence: 0,
+                        kind: JobRelayStreamFrameKind::Accepted,
+                    })
+                    .await;
+            })
+        })))
+        .unwrap();
+
+    // A "dead" peer: TCP connects, but the security handshake never answers.
+    let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blackhole");
+    let blackhole_port = blackhole.local_addr().unwrap().port();
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = blackhole.accept().await {
+            sockets.push(socket);
+        }
+    });
+    let dead_peer = PeerId::random();
+    node_a
+        .dial_peer(&format!(
+            "/ip4/127.0.0.1/tcp/{blackhole_port}/p2p/{dead_peer}"
+        ))
+        .await
+        .expect("dial starts");
+
+    let open = |job_id: [u8; 32]| JobRelayStreamOpen {
+        schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
+        job_id,
+        payload: b"signed-manifest".to_vec(),
+        deadline_unix_ms: unix_time_ms() + 6_000,
+        idle_timeout_ms: crate::protocol::JOB_RELAY_STREAM_MIN_IDLE_TIMEOUT_MS,
+    };
+    let stalled_node = node_a.clone();
+    let stalled = tokio::spawn(async move {
+        stalled_node
+            .open_job_relay_stream(dead_peer, open([31; 32]))
+            .await
+    });
+    let stalled_blob_node = node_a.clone();
+    let stalled_blob = tokio::spawn(async move {
+        let mut request = blob_request([33; 32], 0, b"stalled".to_vec());
+        request.idle_timeout_ms = crate::protocol::BLOB_STREAM_MIN_IDLE_TIMEOUT_MS;
+        stalled_blob_node.open_blob_stream(dead_peer, request).await
+    });
+    // Let the stalled negotiations get in first. Both use the minimum idle
+    // timeout, so still being pending here also proves the idle budget does
+    // not bound negotiation (that is the total deadline's job).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !stalled.is_finished() && !stalled_blob.is_finished(),
+        "precondition: negotiation with the dead peer must still be pending"
+    );
+
+    let healthy = tokio::time::timeout(
+        Duration::from_secs(2),
+        node_a.open_job_relay_stream(b_peer, open([32; 32])),
+    )
+    .await
+    .expect("a stalled peer must not hold up negotiation with a healthy peer")
+    .expect("healthy stream opens");
+    drop(healthy);
+
+    assert!(
+        !stalled.is_finished(),
+        "the healthy open completed while the dead peer was still negotiating"
+    );
+    stalled.abort();
+    stalled_blob.abort();
+    held.abort();
 }

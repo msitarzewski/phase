@@ -25,9 +25,28 @@
 //!    Three failures within the rolling 60 s window stop the loop and emit
 //!    a "failed" sentinel.
 //!
-//! Per-request hang detection lives in [`stream_completion`]: if no SSE
-//! frame arrives for 30 s the request is aborted and the underlying model
-//! is signalled as suspect (next request triggers a health check).
+//! Per-request hang detection lives in [`run_inference`]: if no SSE frame
+//! arrives for 30 s the request is aborted and the model's supervisor is
+//! sent an explicit kill signal, so the wedged `llama-server` is SIGKILLed,
+//! reaped, and its port returned to the pool instead of silently pinning
+//! VRAM/RAM until the host runs out of memory.
+//!
+//! Port reservations are RAII ([`PortGuard`]): whichever task currently
+//! owns a spawned (or spawning) child also owns its port, so a failed or
+//! cancelled cold load can never leak a port from `server_port_range`.
+//! LRU eviction of a warm model is deferred until the replacement cold load
+//! has passed its `/health` gate, so a failed or cancelled cold load never
+//! evicts a healthy warm model.
+//!
+//! ## Loopback lockdown
+//!
+//! Loopback is not an authentication boundary: any local process — and any
+//! web page via DNS rebinding or `fetch()` to `127.0.0.1` — can reach the
+//! child's port. Every spawn therefore gets a fresh 256-bit API key passed
+//! through the `LLAMA_API_KEY` environment variable (never argv, which is
+//! world-readable through `ps`), every authenticated request carries
+//! `Authorization: Bearer <key>`, and the web UI, `/slots`, and credentialed
+//! CORS are disabled.
 //!
 //! ## Why `POST /completion` rather than `/v1/chat/completions`?
 //!
@@ -68,8 +87,30 @@ use phase_receipt::ReceiptBuilder;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify};
 use tokio::time::timeout;
+
+/// Environment variable `llama-server` reads its API key(s) from. Passing the
+/// key through the environment rather than `--api-key` keeps it out of the
+/// world-readable process argument list.
+const LLAMA_API_KEY_ENV: &str = "LLAMA_API_KEY";
+
+/// Hardening flags passed to every `llama-server` spawn (verified against the
+/// pinned `b12651` CLI). `--cors-origins localhost` is not a valid browser
+/// origin (`scheme://host[:port]`), so no page origin can read responses;
+/// credentialed CORS, the bundled web UI, and the `/slots` monitoring
+/// endpoint are disabled outright.
+const LLAMA_SERVER_HARDENING_ARGS: [&str; 5] = [
+    "--cors-origins",
+    "localhost",
+    "--no-cors-credentials",
+    "--no-webui",
+    "--no-slots",
+];
+
+/// Bounded wait for a killed supervisor to reap its child and release the
+/// port before the slot is reused. Kill + reap is normally milliseconds.
+const SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Defense-in-depth ceiling enforced by the worker even when a caller bypasses
 /// the router's operator-configured `max_tokens_ceiling`.
@@ -132,6 +173,11 @@ pub struct LlamaCppConfig {
     /// Port pool the worker draws from when spawning subprocesses. The
     /// caller decides the policy (small dev pool, large multi-tenant pool,
     /// etc.); the worker just allocates the next free port from this range.
+    ///
+    /// Because warm-model eviction is deferred until a replacement cold load
+    /// is healthy, a full worker briefly holds `max_loaded_models + 1`
+    /// children; the range must contain at least that many ports or a cold
+    /// load at cap returns [`WorkerError::Capacity`].
     pub server_port_range: Range<u16>,
 
     /// Maximum number of `llama-server` subprocesses (loaded models) kept
@@ -165,7 +211,44 @@ pub struct LlamaCppConfig {
     pub rpc_servers: Vec<String>,
 
     /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g. `"30,70"`).
+    /// Only meaningful together with `rpc_servers`.
     pub tensor_split: Option<String>,
+
+    /// Runtime opt-in check for Tier-1 Trusted-Circle RPC layer offload.
+    /// Consulted on every job (and before every supervisor respawn) whenever
+    /// `rpc_servers` is non-empty. `None` fails closed: an RPC-configured
+    /// worker without a gate refuses every job.
+    pub rpc_cluster_gate: Option<RpcClusterGate>,
+}
+
+/// Runtime gate for Tier-1 Trusted-Circle `ggml-rpc` layer offload. Layer
+/// offload ships activations — derived from the prompt — to other machines,
+/// so it must stay behind the operator's explicit `cluster_enabled = true`
+/// opt-in, which can be toggled at runtime from `node.toml` / the settings
+/// API.
+#[derive(Clone)]
+pub struct RpcClusterGate(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl RpcClusterGate {
+    /// Gate backed by an arbitrary predicate (tests, embedders).
+    pub fn new(is_open: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(is_open))
+    }
+
+    /// Gate backed by the live `cluster_enabled` flag of `node.toml`.
+    pub fn from_node_config(store: Arc<crate::node_config::NodeConfigStore>) -> Self {
+        Self::new(move || store.snapshot().cluster_enabled)
+    }
+
+    fn is_open(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for RpcClusterGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RpcClusterGate(..)")
+    }
 }
 
 impl Default for LlamaCppConfig {
@@ -182,8 +265,37 @@ impl Default for LlamaCppConfig {
             extra_env: Vec::new(),
             rpc_servers: Vec::new(),
             tensor_split: None,
+            rpc_cluster_gate: None,
         }
     }
+}
+
+fn rpc_offload_refused() -> WorkerError {
+    WorkerError::Other(
+        "trusted-circle RPC layer offload is configured but cluster_enabled is off; refusing to ship model activations to RPC peers"
+            .into(),
+    )
+}
+
+/// Validate the complete Tier-1 RPC offload flag set: every RPC endpoint is
+/// strictly loopback, `tensor_split` is well formed, and `tensor_split` is
+/// never supplied without `rpc_servers` (it would otherwise be silently
+/// ignored and the operator would believe layers are being split).
+pub fn validate_rpc_offload_flags(
+    rpc_servers: &[String],
+    tensor_split: Option<&str>,
+) -> std::io::Result<()> {
+    if tensor_split.is_some() && rpc_servers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--llama-tensor-split requires --llama-rpc-servers",
+        ));
+    }
+    validate_loopback_rpc_servers(rpc_servers)?;
+    if let Some(split) = tensor_split {
+        validate_tensor_split(split)?;
+    }
+    Ok(())
 }
 
 /// Validate that every configured `ggml-rpc` server address is strictly loopback
@@ -249,43 +361,120 @@ pub fn validate_tensor_split(spec: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Per-load `llama-server` API key: 256 bits from the OS CSPRNG, hex
+/// encoded. Never logged — `Debug` is redacted.
+#[derive(Clone)]
+struct LlamaApiKey(Arc<str>);
+
+impl LlamaApiKey {
+    fn generate() -> Result<Self, WorkerError> {
+        use ring::rand::SecureRandom as _;
+        let mut bytes = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| {
+                WorkerError::Other("OS CSPRNG unavailable for llama-server API key".into())
+            })?;
+        Ok(Self(Arc::from(hex::encode(bytes))))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LlamaApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LlamaApiKey(<redacted>)")
+    }
+}
+
+/// RAII reservation of one port from the worker's `llama-server` pool.
+/// Dropping the guard returns the port. The guard always travels with the
+/// child bound to that port — first the cold-load future, then the
+/// supervisor task — so every exit path (error, cancellation, kill, abort)
+/// releases it exactly once.
+struct PortGuard {
+    port: u16,
+    pool: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+}
+
+impl PortGuard {
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        // A poisoned pool only means another thread panicked mid-update; the
+        // set itself is still a valid `HashSet`, and leaking the port would
+        // be strictly worse.
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.remove(&self.port);
+    }
+}
+
 /// State of a single loaded model. Held inside the worker's `DashMap`
-/// keyed by `model_id`.
-///
-/// `child` is wrapped in `Mutex` because the supervisor task occasionally
-/// needs to `kill()` it (on crash beyond retry budget, on drop, on
-/// explicit unload), and we don't want to serialise reads behind a write
-/// lock the way a single `RwLock<Child>` would.
+/// keyed by `model_id`. The supervisor task owns the `llama-server` child
+/// and its [`PortGuard`]; this handle owns the kill switch.
 struct LoadedModel {
     /// Bound port — used to construct `http://127.0.0.1:{port}/completion`.
     port: u16,
+    /// API key the child was spawned with; attached as a bearer token to
+    /// every authenticated request (everything except `/health`).
+    api_key: LlamaApiKey,
     /// Updated on every successful inference for the current LRU eviction
     /// policy.
     last_used: Mutex<Instant>,
     /// Signalled when the supervisor task has given up (3 crashes in 60s,
     /// or unload requested). All in-flight requests should bail.
     failed: Arc<Notify>,
-    /// Set to true once the supervisor declared the model dead. Reads
-    /// under acquire/release ordering; a stale `false` just means one
-    /// extra retry that will hit `failed.notified()` immediately.
+    /// Set to true once the model is declared dead. Reads under
+    /// acquire/release ordering; a stale `false` just means one extra
+    /// request that the killed child refuses.
     failed_flag: Arc<std::sync::atomic::AtomicBool>,
-    /// Join handle for the supervisor task. Held so we can abort it on
-    /// `Drop` of the [`LlamaCppWorker`] or on LRU eviction.
+    /// Kill switch into the supervisor task. Sending `true` — or dropping
+    /// this handle — makes the supervisor SIGKILL and reap the child, then
+    /// release its port.
+    kill: watch::Sender<bool>,
+    /// Flips to `true` (or closes) once the supervisor has finished: the
+    /// child is reaped and the port is back in the pool.
+    stopped: watch::Receiver<bool>,
+    /// Join handle for the supervisor task. Held so `Drop` of the worker can
+    /// abort it (`kill_on_drop(true)` then terminates the child).
     supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl LoadedModel {
     /// Tear this model down: mark it failed (so any in-flight request
     /// bails and a concurrent `ensure_loaded` won't hand it out), then
-    /// abort the supervisor task. The supervisor owns the `llama-server`
-    /// `Child`, which carries `kill_on_drop(true)`, so aborting the task
-    /// drops the `Child` and the OS reaps the subprocess — the same kill
-    /// path used on `Drop` of the worker. Idempotent.
+    /// signal the supervisor to SIGKILL + reap the `llama-server` child and
+    /// release its port. Idempotent.
     fn shutdown(&self) {
         self.failed_flag
             .store(true, std::sync::atomic::Ordering::Release);
         self.failed.notify_waiters();
-        self.supervisor.abort();
+        self.kill.send_replace(true);
+    }
+
+    /// Wait (bounded) until the supervisor has reaped the child and released
+    /// the port. Returns `false` on timeout.
+    async fn wait_stopped(&self, deadline: Duration) -> bool {
+        let mut stopped = self.stopped.clone();
+        // `wait_for` errs once the supervisor's sender is gone, which also
+        // means it has stopped (finished or aborted).
+        let finished = timeout(deadline, stopped.wait_for(|done| *done))
+            .await
+            .is_ok();
+        finished
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed_flag.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -306,18 +495,33 @@ struct Inner {
     /// is preferable to allowing concurrent cold starts to bypass the
     /// resident-model cap or replace one another in `loaded_models`.
     load_gate: Mutex<()>,
-    /// Set of ports currently bound by live `llama-server` children. A
-    /// port is inserted in [`LlamaCppWorker::allocate_port`] and removed on
-    /// unload/evict so the range can't wrap onto a live port (SEC-07).
-    /// Guarded by a `Mutex` rather than a lock-free set so allocate +
-    /// "is the range full?" is one atomic decision.
-    ports_in_use: Mutex<std::collections::HashSet<u16>>,
+    /// Set of ports currently reserved for live or loading `llama-server`
+    /// children. A port is inserted by [`LlamaCppWorker::allocate_port`] and
+    /// removed only when its [`PortGuard`] drops, so the range can't wrap
+    /// onto a live port (SEC-07) and an aborted load can't leak one.
+    /// Guarded by a synchronous `Mutex` (never held across `.await`) so
+    /// allocate + "is the range full?" is one atomic decision and
+    /// `PortGuard::drop` can release without a runtime.
+    ports_in_use: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
 }
 
 impl LlamaCppWorker {
     /// Construct a fresh worker. No subprocesses are spawned until the
     /// first inference request for a given model.
     pub fn new(identity: NodeIdentity, config: LlamaCppConfig) -> Self {
+        let span = usize::from(
+            config
+                .server_port_range
+                .end
+                .saturating_sub(config.server_port_range.start),
+        );
+        if span <= config.max_loaded_models.max(1) {
+            tracing::warn!(
+                ports = span,
+                max_loaded_models = config.max_loaded_models,
+                "llama-server port range cannot hold max_loaded_models + 1 children; cold loads at the resident cap will be refused"
+            );
+        }
         let client = reqwest::Client::builder()
             // Loopback subprocess traffic must never inherit HTTP(S)_PROXY.
             // A hostile local proxy could impersonate `/health` or exfiltrate
@@ -340,9 +544,60 @@ impl LlamaCppWorker {
                 config,
                 client,
                 load_gate: Mutex::new(()),
-                ports_in_use: Mutex::new(std::collections::HashSet::new()),
+                ports_in_use: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             }),
         }
+    }
+
+    /// `true` when this worker offloads layers to `ggml-rpc` peers. All of
+    /// its models then execute on the Tier-1 trusted circle, not only on this
+    /// host — routing and privacy decisions must treat it accordingly.
+    pub fn uses_rpc_layer_offload(&self) -> bool {
+        !self.inner.config.rpc_servers.is_empty()
+    }
+
+    /// Honest execution label for jobs served by this worker:
+    /// `"trusted-circle-sharded"` when RPC layer offload is configured,
+    /// otherwise `"local"`.
+    pub fn execution_trust_label(&self) -> &'static str {
+        if self.uses_rpc_layer_offload() {
+            crate::shard_plan::ShardTrustTier::TrustedCircle.trust_label()
+        } else {
+            "local"
+        }
+    }
+
+    /// Fail closed unless RPC layer offload is currently opted in. When the
+    /// operator has turned `cluster_enabled` off, RPC-backed children are
+    /// torn down too, so remote layer links do not outlive the opt-in.
+    fn require_rpc_offload_allowed(&self) -> Result<(), WorkerError> {
+        if self.rpc_offload_permitted() {
+            return Ok(());
+        }
+        let resident: Vec<String> = self
+            .inner
+            .loaded_models
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in resident {
+            if let Some((_, model)) = self.inner.loaded_models.remove(&key) {
+                model.shutdown();
+            }
+        }
+        Err(rpc_offload_refused())
+    }
+
+    /// `true` unless RPC layer offload is configured and the trusted-circle
+    /// opt-in is currently off (or no gate was wired, which fails closed).
+    fn rpc_offload_permitted(&self) -> bool {
+        !self.uses_rpc_layer_offload()
+            || self
+                .inner
+                .config
+                .rpc_cluster_gate
+                .as_ref()
+                .is_some_and(RpcClusterGate::is_open)
     }
 
     /// Ensure a model is loaded. Idempotent — if the model is already
@@ -376,10 +631,7 @@ impl LlamaCppWorker {
         // Fast path: warm hits avoid serializing behind an unrelated cold
         // model load (which can hold `load_gate` for up to `model_load_timeout`).
         if let Some(existing) = self.inner.loaded_models.get(&load_key) {
-            if !existing
-                .failed_flag
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !existing.is_failed() {
                 return Ok(existing.clone());
             }
         }
@@ -391,19 +643,24 @@ impl LlamaCppWorker {
         // start can consume gigabytes of RAM.
         let _load_guard = self.inner.load_gate.lock().await;
 
-        if let Some(existing) = self.inner.loaded_models.get(&load_key) {
-            if !existing
-                .failed_flag
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Ok(existing.clone());
-            }
-            // The previous load has been declared dead; drop it and try
-            // again. The supervisor's `kill()` already ran.
-            let stale_port = existing.port;
-            drop(existing);
+        let stale = match self.inner.loaded_models.get(&load_key) {
+            Some(existing) if !existing.is_failed() => return Ok(existing.clone()),
+            Some(existing) => Some(existing.clone()),
+            None => None,
+        };
+        if let Some(stale) = stale {
+            // The previous instance was declared dead (crash budget spent,
+            // hang detected, or protocol violation). Make sure its child is
+            // killed and reaped and its port is back in the pool before the
+            // replacement allocates one.
             self.inner.loaded_models.remove(&load_key);
-            self.release_port(stale_port).await;
+            stale.shutdown();
+            if !stale.wait_stopped(SUPERVISOR_STOP_TIMEOUT).await {
+                tracing::warn!(
+                    model = %model_id,
+                    "stale llama-server supervisor did not stop in time; its port stays reserved until it does"
+                );
+            }
         }
 
         // SEC-04: confine the resolved path to `model_dir`. Any traversal
@@ -425,79 +682,92 @@ impl LlamaCppWorker {
             }
         };
 
-        // SEC-07: enforce the resident-model cap before spawning. If we're
-        // at the cap, evict the least-recently-used model first. Done
-        // before `allocate_port` so the freed port is available to the new
-        // model and we don't trip the range-full check unnecessarily. The
-        // incoming candidate is the composite key so a chat instance of the
-        // same model isn't mistaken for "already the incoming one".
-        self.evict_lru_if_at_cap(&load_key).await;
-
-        let port = self.allocate_port().await?;
-        let mut child = match spawn_llama_server(
+        // Everything from here to the map insert owns the child and its port
+        // through RAII: an error return, or the caller dropping this future
+        // mid-load (client disconnect), kills the child (`kill_on_drop`) and
+        // releases the port (`PortGuard`). No warm model has been touched
+        // yet — eviction is deferred until the new model is healthy.
+        let port_guard = self.allocate_port()?;
+        let port = port_guard.port();
+        let api_key = LlamaApiKey::generate()?;
+        let mut child = llama_server_command(
             &self.inner.config.server_binary_path,
             &model_path,
             port,
+            &api_key,
             self.inner.config.default_n_gpu_layers,
             self.inner.config.default_context_size,
             &self.inner.config.extra_env,
             embeddings,
             &self.inner.config.rpc_servers,
             self.inner.config.tensor_split.as_deref(),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                self.release_port(port).await;
-                return Err(WorkerError::Other(format!("spawn llama-server: {e}")));
-            }
-        };
+        )
+        .and_then(|mut cmd| cmd.spawn())
+        .map_err(|e| WorkerError::Other(format!("spawn llama-server: {e}")))?;
 
         // Wait for /health to go 200 before declaring the model loaded.
-        if let Err(e) = wait_for_health(
+        wait_for_health(
             &self.inner.client,
             port,
             self.inner.config.model_load_timeout,
             &mut child,
         )
         .await
-        {
-            self.release_port(port).await;
-            return Err(WorkerError::Other(format!(
-                "llama-server health check: {e}"
-            )));
+        .map_err(|e| WorkerError::Other(format!("llama-server health check: {e}")))?;
+
+        // An RPC cold load can take minutes; if the operator withdrew the
+        // trusted-circle opt-in meanwhile, refuse admission (dropping `child`
+        // kills it and `port_guard` releases its port).
+        if !self.rpc_offload_permitted() {
+            return Err(rpc_offload_refused());
         }
+
+        // Admission is committed: the replacement is spawned and healthy.
+        // Only now enforce the resident-model cap (SEC-07) by evicting the
+        // least-recently-used *other* model, so a failed or cancelled cold
+        // load can never cost a healthy warm model. The incoming candidate is
+        // the composite key so a chat instance of the same model isn't
+        // mistaken for "already the incoming one".
+        self.evict_lru_if_at_cap(&load_key).await;
 
         let failed = Arc::new(Notify::new());
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (kill_tx, kill_rx) = watch::channel(false);
+        let (stopped_tx, stopped_rx) = watch::channel(false);
 
         // The map entry is keyed by the composite `load_key`, but the
         // `model_id` carried into telemetry stays the bare alias so logs
         // read naturally. The supervisor re-spawns with the same
         // `embeddings` flag so a crashed embedding instance comes back as an
-        // embedding instance.
-        let model_id_owned = model_id.to_string();
+        // embedding instance, and with the same API key so in-flight handles
+        // stay valid across a restart.
         let supervisor_input = SupervisorInput {
-            model_id: model_id_owned.clone(),
-            port,
+            model_id: model_id.to_string(),
+            port_guard,
+            api_key: api_key.clone(),
             failed: failed.clone(),
             failed_flag: failed_flag.clone(),
+            kill: kill_rx,
+            stopped: stopped_tx,
             client: self.inner.client.clone(),
             config: self.inner.config.clone(),
-            model_path: model_path.clone(),
+            model_path,
             embeddings,
         };
 
-        // The supervisor task gets the child handle (so it can wait/kill).
-        // The `LoadedModel`'s `Mutex<Option<Child>>` starts empty — the
-        // supervisor "owns" the process for its lifetime. Re-spawned
-        // children are also held inside the supervisor.
+        // The supervisor task owns the child and its port for the model's
+        // lifetime (including respawned children); `LoadedModel` keeps only
+        // the kill switch.
         let supervisor = tokio::spawn(run_supervisor(supervisor_input, child));
 
         let loaded = Arc::new(LoadedModel {
             port,
+            api_key,
             last_used: Mutex::new(Instant::now()),
             failed,
             failed_flag,
+            kill: kill_tx,
+            stopped: stopped_rx,
             supervisor,
         });
         // `load_gate` makes this insert a single-flight commit. Keep the
@@ -506,20 +776,24 @@ impl LlamaCppWorker {
         if let Some(prev) = self.inner.loaded_models.insert(load_key, loaded.clone()) {
             if prev.port != port {
                 prev.shutdown();
-                self.release_port(prev.port).await;
             }
         }
         Ok(loaded)
     }
 
-    /// SEC-07: allocate a port not currently bound by a live child. Scans
-    /// the configured range for the first free slot and reserves it. When
-    /// every port in the range is in use, returns [`WorkerError::Capacity`]
-    /// rather than wrapping onto a live port (the old `fetch_add % span`
-    /// behaviour, which silently collided and churned spawn/fail).
-    async fn allocate_port(&self) -> Result<u16, WorkerError> {
+    /// SEC-07: reserve a port not currently bound by a live child. Scans
+    /// the configured range for the first free slot and reserves it behind
+    /// a [`PortGuard`]. When every port in the range is in use, returns
+    /// [`WorkerError::Capacity`] rather than wrapping onto a live port (the
+    /// old `fetch_add % span` behaviour, which silently collided and churned
+    /// spawn/fail).
+    fn allocate_port(&self) -> Result<PortGuard, WorkerError> {
         let range = self.inner.config.server_port_range.clone();
-        let mut in_use = self.inner.ports_in_use.lock().await;
+        let mut in_use = self
+            .inner
+            .ports_in_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for port in range.clone() {
             if in_use.contains(&port) {
                 continue;
@@ -529,10 +803,14 @@ impl LlamaCppWorker {
             // llama-server cannot inherit this listener, so a narrow
             // close-to-child-bind race remains; child liveness checks around
             // `/health` below prevent a normally failing child from accepting
-            // an unrelated listener as healthy.
+            // an unrelated listener as healthy, and the per-spawn API key
+            // means an impostor cannot answer authenticated requests.
             if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
                 in_use.insert(port);
-                return Ok(port);
+                return Ok(PortGuard {
+                    port,
+                    pool: Arc::clone(&self.inner.ports_in_use),
+                });
             }
         }
         tracing::warn!(
@@ -543,17 +821,11 @@ impl LlamaCppWorker {
         Err(WorkerError::Capacity)
     }
 
-    /// Release a previously-[`allocate_port`](Self::allocate_port)ed port
-    /// back into the pool on unload/evict/spawn-failure.
-    async fn release_port(&self, port: u16) {
-        self.inner.ports_in_use.lock().await.remove(&port);
-    }
-
     /// SEC-07: if the worker is already at `max_loaded_models`, evict the
     /// least-recently-used model (by `last_used`) to make room for a new
     /// one. The model currently being (re)loaded — `incoming` — is never a
-    /// candidate. The evicted model's subprocess is killed via
-    /// [`LoadedModel::shutdown`] and its port released.
+    /// candidate. The evicted model's subprocess is killed and reaped via
+    /// [`LoadedModel::shutdown`], which also releases its port.
     async fn evict_lru_if_at_cap(&self, incoming: &str) {
         let cap = self.inner.config.max_loaded_models.max(1);
         // Evict in a loop in case we're over cap (e.g. cap was lowered or
@@ -589,7 +861,14 @@ impl LlamaCppWorker {
             if let Some((_, model)) = self.inner.loaded_models.remove(&victim_id) {
                 tracing::info!(model = %victim_id, "evicting LRU model to honour max_loaded_models");
                 model.shutdown();
-                self.release_port(model.port).await;
+                // Wait for the reap so the victim's memory and port are
+                // actually free before the next cold load can count on them.
+                if !model.wait_stopped(SUPERVISOR_STOP_TIMEOUT).await {
+                    tracing::warn!(
+                        model = %victim_id,
+                        "evicted llama-server supervisor did not stop in time"
+                    );
+                }
             }
             // Re-check the cap; another concurrent loader may have changed
             // the map. The loop terminates because each iteration either
@@ -637,6 +916,7 @@ impl Worker for LlamaCppWorker {
                 // llama.cpp-specific permissive defaults.
                 let mut request = build_completion_request(&inference)
                     .map_err(|e| WorkerError::BadManifest(format!("invalid sampling: {e}")))?;
+                self.require_rpc_offload_allowed()?;
 
                 // Load the model up front so dispatch-time errors are
                 // returned through `WorkerError` rather than as a single
@@ -647,7 +927,7 @@ impl Worker for LlamaCppWorker {
                 if !inference.messages.is_empty() {
                     apply_chat_template(
                         &self.inner.client,
-                        model.port,
+                        &model,
                         &inference,
                         &mut request,
                         self.inner.config.per_request_idle_timeout,
@@ -674,6 +954,7 @@ impl Worker for LlamaCppWorker {
             JobSpec::Embedding(spec) => {
                 let embedding = spec.clone();
                 validate_embedding_spec(&embedding).map_err(WorkerError::BadManifest)?;
+                self.require_rpc_offload_allowed()?;
 
                 // Embedding loads spin up a *separate* llama-server with
                 // `--embeddings`, keyed apart from any chat instance of the
@@ -792,20 +1073,22 @@ fn resolve_model_path(model_dir: &Path, model_id: &str) -> Result<PathBuf, Strin
     Ok(canon)
 }
 
-/// Spawn the actual subprocess. Returns immediately — caller waits on
-/// `/health` separately.
+/// Build the fully configured `llama-server` command for one spawn. Kept
+/// separate from spawning so the exact argv/env contract is unit-testable.
+/// Callers spawn it immediately and wait on `/health` separately.
 #[allow(clippy::too_many_arguments)]
-fn spawn_llama_server(
+fn llama_server_command(
     binary: &Path,
     model: &Path,
     port: u16,
+    api_key: &LlamaApiKey,
     n_gpu_layers: i32,
     ctx_size: usize,
     extra_env: &[(String, String)],
     embeddings: bool,
     rpc_servers: &[String],
     tensor_split: Option<&str>,
-) -> std::io::Result<Child> {
+) -> std::io::Result<Command> {
     // SEC-04 (L8): require an absolute binary path. Resolving `llama-server`
     // via the inherited `$PATH` is a binary-hijack vector (an attacker who
     // can prepend a dir to PATH gets code execution as lucidd). The startup
@@ -853,18 +1136,21 @@ fn spawn_llama_server(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    // Set after `extra_env` so no configured variable can replace or clear
+    // the per-spawn key. Environment, not argv: argv is world-readable.
+    cmd.env(LLAMA_API_KEY_ENV, api_key.as_str());
+    cmd.args(LLAMA_SERVER_HARDENING_ARGS);
     // `--jinja` enables modern chat templates + tool calling. `--cache-reuse 256`
     // enables KV-cache prompt-prefix shifting reuse across multi-turn chats and
     // concurrent batch slots.
     cmd.arg("--jinja");
     cmd.arg("--cache-reuse").arg("256");
+    validate_rpc_offload_flags(rpc_servers, tensor_split)?;
     if !rpc_servers.is_empty() {
-        validate_loopback_rpc_servers(rpc_servers)?;
         let normalized: Vec<String> = rpc_servers.iter().map(|s| s.trim().to_string()).collect();
         cmd.arg("--rpc").arg(normalized.join(","));
         cmd.arg("--split-mode").arg("layer");
         if let Some(split) = tensor_split {
-            validate_tensor_split(split)?;
             cmd.arg("--tensor-split").arg(split.trim());
         }
     }
@@ -880,7 +1166,7 @@ fn spawn_llama_server(
     // `child.kill()` in the supervisor already handles every failure
     // mode we care about in practice.
     cmd.kill_on_drop(true);
-    cmd.spawn()
+    Ok(cmd)
 }
 
 /// Block (asynchronously) until `GET /health` returns 200 or `timeout`
@@ -947,9 +1233,17 @@ async fn wait_for_health(
 /// Inputs the supervisor task needs to do its work.
 struct SupervisorInput {
     model_id: String,
-    port: u16,
+    /// Owned for the supervisor's lifetime: the port returns to the pool
+    /// only after the last child bound to it has been reaped.
+    port_guard: PortGuard,
+    api_key: LlamaApiKey,
     failed: Arc<Notify>,
     failed_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Kill switch from [`LoadedModel`]: `true`, or the sender being
+    /// dropped, ends supervision with a SIGKILL + reap.
+    kill: watch::Receiver<bool>,
+    /// Dropped (closing the channel) or set when supervision has ended.
+    stopped: watch::Sender<bool>,
     client: reqwest::Client,
     config: LlamaCppConfig,
     model_path: PathBuf,
@@ -959,46 +1253,99 @@ struct SupervisorInput {
 }
 
 /// Long-running task: watch the child, restart on crash up to 3 times in
-/// 60 s, periodically poll `/health`. Owns the `Child` for the lifetime
-/// of the loaded model.
+/// 60 s, periodically poll `/health`, and obey the kill switch. Owns the
+/// `Child` and its [`PortGuard`] for the lifetime of the loaded model.
+///
+/// The child lives in `slot` *outside* the supervision future, so when the
+/// kill switch wins the race the child is still reachable here and can be
+/// SIGKILLed **and reaped** before the port is released — the next owner of
+/// the port never races a dying process for it.
 async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
     let SupervisorInput {
         model_id,
-        port,
+        port_guard,
+        api_key,
         failed,
         failed_flag,
+        mut kill,
+        stopped,
         client,
         config,
         model_path,
         embeddings,
     } = input;
+    let port = port_guard.port();
+    let mut slot = Some(initial_child);
+    drain_child_io(&mut slot);
 
+    let killed = tokio::select! {
+        biased;
+        // `Err` means the `LoadedModel` handle was dropped: nobody can reach
+        // this child any more, so it must not outlive the handle.
+        _ = kill.wait_for(|requested| *requested) => true,
+        () = supervise(
+            &mut slot,
+            &model_id,
+            port,
+            &api_key,
+            &client,
+            &config,
+            &model_path,
+            embeddings,
+        ) => false,
+    };
+
+    if let Some(mut child) = slot.take() {
+        if killed {
+            tracing::info!(model = %model_id, port, "killing llama-server on request");
+        }
+        // `kill()` sends SIGKILL and then waits, so the process is reaped
+        // (and its listener closed) before `port_guard` drops below.
+        if let Err(error) = child.kill().await {
+            tracing::warn!(model = %model_id, %error, "failed to kill llama-server child");
+        }
+    }
+    failed_flag.store(true, std::sync::atomic::Ordering::Release);
+    failed.notify_waiters();
+    drop(port_guard);
+    stopped.send_replace(true);
+}
+
+/// The supervision loop proper. Returns once the model is terminally dead
+/// (clean exit, crash budget exhausted, failed respawn, or the cluster gate
+/// closed). On return `slot` holds no live child, or a child the caller
+/// must kill.
+#[allow(clippy::too_many_arguments)]
+async fn supervise(
+    slot: &mut Option<Child>,
+    model_id: &str,
+    port: u16,
+    api_key: &LlamaApiKey,
+    client: &reqwest::Client,
+    config: &LlamaCppConfig,
+    model_path: &Path,
+    embeddings: bool,
+) {
     // Sliding window of recent crash timestamps. If we accumulate three
     // entries inside a 60 s window, give up.
     let mut crash_times: Vec<Instant> = Vec::new();
     let crash_window = Duration::from_secs(60);
-    let mut current_child: Option<Child> = Some(initial_child);
-
-    // Drain stdout/stderr so the child doesn't block on a full pipe.
-    // We re-create these drainers on every restart.
-    drain_child_io(&mut current_child);
+    let health_url = format!("http://127.0.0.1:{port}/health");
 
     loop {
-        // Two concurrent things: wait for the child to exit, and run
-        // periodic /health checks. Whichever fires first decides what
-        // happens next.
-        let mut child = match current_child.take() {
-            Some(c) => c,
-            None => break,
+        let Some(child) = slot.as_mut() else {
+            return;
         };
 
-        let health_url = format!("http://127.0.0.1:{port}/health");
         let mut consecutive_health_fail: u32 = 0;
         let health_interval = Duration::from_secs(30);
         let mut health_timer = tokio::time::interval(health_interval);
         // Tick once immediately to clear the "first tick is now" behaviour.
         health_timer.tick().await;
 
+        // Two concurrent things: wait for the child to exit, and run
+        // periodic /health checks. Whichever fires first decides what
+        // happens next.
         let exit_kind: ChildExit = loop {
             tokio::select! {
                 biased;
@@ -1037,14 +1384,14 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                 }
             }
         };
+        // The child has exited (or was killed and reaped) either way.
+        *slot = None;
 
         match exit_kind {
             ChildExit::CleanExit => {
-                // Caller explicitly killed it via Drop or unload. Don't
-                // restart.
+                // Nothing in Phase asks llama-server to exit cleanly, so a
+                // zero exit is treated as terminal rather than restarted.
                 tracing::info!(model = %model_id, "llama-server exited cleanly");
-                failed_flag.store(true, std::sync::atomic::Ordering::Release);
-                failed.notify_waiters();
                 return;
             }
             ChildExit::Crash | ChildExit::HealthDead => {
@@ -1057,8 +1404,6 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                         crashes = crash_times.len(),
                         "model crashed 3 times in 60s; giving up"
                     );
-                    failed_flag.store(true, std::sync::atomic::Ordering::Release);
-                    failed.notify_waiters();
                     return;
                 }
                 // Exponential backoff: 1s, 2s, 4s.
@@ -1066,47 +1411,56 @@ async fn run_supervisor(input: SupervisorInput, initial_child: Child) {
                 let backoff = Duration::from_secs(backoff_secs).min(Duration::from_secs(8));
                 tracing::info!(model = %model_id, backoff_ms = backoff.as_millis() as u64, "restarting llama-server");
                 tokio::time::sleep(backoff).await;
-                let respawned = spawn_llama_server(
+                // A crash must not silently re-establish remote layer links
+                // after the operator has withdrawn the trusted-circle opt-in.
+                if !config.rpc_servers.is_empty()
+                    && !config
+                        .rpc_cluster_gate
+                        .as_ref()
+                        .is_some_and(RpcClusterGate::is_open)
+                {
+                    tracing::warn!(
+                        model = %model_id,
+                        "cluster_enabled is off; not respawning RPC-backed llama-server"
+                    );
+                    return;
+                }
+                match llama_server_command(
                     &config.server_binary_path,
-                    &model_path,
+                    model_path,
                     port,
+                    api_key,
                     config.default_n_gpu_layers,
                     config.default_context_size,
                     &config.extra_env,
                     embeddings,
                     &config.rpc_servers,
                     config.tensor_split.as_deref(),
-                );
-                match respawned {
-                    Ok(c) => {
-                        let mut respawned_opt = Some(c);
-                        drain_child_io(&mut respawned_opt);
-                        let mut c = respawned_opt.expect("respawned child remains present");
+                )
+                .and_then(|mut cmd| cmd.spawn())
+                {
+                    Ok(respawned) => {
+                        *slot = Some(respawned);
+                        drain_child_io(slot);
+                        let Some(respawned) = slot.as_mut() else {
+                            return;
+                        };
                         if let Err(e) =
-                            wait_for_health(&client, port, config.model_load_timeout, &mut c).await
+                            wait_for_health(client, port, config.model_load_timeout, respawned)
+                                .await
                         {
                             tracing::warn!(
                                 model = %model_id,
                                 error = %e,
                                 "respawned llama-server failed health check"
                             );
-                            let _ = c.kill().await;
-                            crash_times.push(Instant::now());
-                            if crash_times.len() >= 3 {
-                                failed_flag.store(true, std::sync::atomic::Ordering::Release);
-                                failed.notify_waiters();
-                                return;
-                            }
-                            failed_flag.store(true, std::sync::atomic::Ordering::Release);
-                            failed.notify_waiters();
+                            // The caller kills and reaps the child still in
+                            // `slot`.
                             return;
                         }
-                        current_child = Some(c);
                     }
                     Err(e) => {
                         tracing::error!(model = %model_id, error = %e, "failed to respawn");
-                        failed_flag.store(true, std::sync::atomic::Ordering::Release);
-                        failed.notify_waiters();
                         return;
                     }
                 }
@@ -1383,7 +1737,12 @@ fn run_inference(
         let CompletionRequest { body, prompt_chars } = request;
         let url = format!("http://127.0.0.1:{}/completion", model.port);
 
-        let response = client.post(&url).json(&body).send().await;
+        let response = client
+            .post(&url)
+            .bearer_auth(model.api_key.as_str())
+            .json(&body)
+            .send()
+            .await;
         let resp = match response {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
@@ -1493,6 +1852,18 @@ fn run_inference(
                     return;
                 }
                 Err(_elapsed) => {
+                    // A wedged llama-server keeps its VRAM/RAM and port
+                    // forever if merely flagged. Kill it now: the supervisor
+                    // SIGKILLs and reaps the child and releases the port, and
+                    // the next request cold-loads a fresh instance. This must
+                    // happen BEFORE the terminal yield — consumers stop
+                    // polling at `Final`, so code after it may never run.
+                    tracing::warn!(
+                        port = model.port,
+                        idle_timeout_ms = idle_timeout.as_millis() as u64,
+                        "llama-server stream hung; killing child"
+                    );
+                    model.shutdown();
                     yield emit_final_error_with_output(
                         &mut producer,
                         &identity,
@@ -1503,13 +1874,6 @@ fn run_inference(
                         format!("no token within {:?} (hang detected)", idle_timeout),
                         acc.peek(),
                     );
-                    // Mark the model suspect so the next request will
-                    // re-check health rather than reusing a wedged
-                    // subprocess.
-                    model
-                        .failed_flag
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    model.failed.notify_waiters();
                     return;
                 }
             };
@@ -1698,6 +2062,7 @@ fn run_embedding(
             let body = serde_json::json!({ "content": text });
             let response = client
                 .post(&url)
+                .bearer_auth(model.api_key.as_str())
                 .json(&body)
                 .timeout(request_timeout)
                 .send()
@@ -2017,7 +2382,7 @@ fn strip_sse_data_prefix(frame: &[u8]) -> Option<&[u8]> {
 /// role markers when the backend cannot format this conversation.
 async fn apply_chat_template(
     client: &reqwest::Client,
-    port: u16,
+    model: &LoadedModel,
     inference: &InferenceJobSpec,
     request: &mut CompletionRequest,
     deadline: Duration,
@@ -2026,9 +2391,11 @@ async fn apply_chat_template(
     struct TemplateResponse {
         prompt: String,
     }
+    let port = model.port;
     let formatted = timeout(deadline, async {
         let response = client
             .post(format!("http://127.0.0.1:{port}/apply-template"))
+            .bearer_auth(model.api_key.as_str())
             // This backend exports plain text, without a reasoning-channel
             // parser. Ask the model template for its supported non-thinking
             // path rather than leaking raw reasoning control tokens.

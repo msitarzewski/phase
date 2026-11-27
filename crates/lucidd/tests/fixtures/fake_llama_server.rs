@@ -26,6 +26,12 @@
 //! | `FAKE_LLAMA_HANG_AFTER=N` | Stop emitting after N tokens, hold socket. |
 //! | `FAKE_LLAMA_CRASH_AFTER_MS=N` | `std::process::exit(2)` after N ms. |
 //! | `FAKE_LLAMA_FAIL_HEALTH=1` | Always return 500 from `/health`. |
+//! | `FAKE_LLAMA_FAIL_HEALTH_FOR_MODEL=stem` | Return 500 from `/health` only when `--model` has this file stem. |
+//!
+//! Like the real `llama-server` started with `LLAMA_API_KEY`, the fixture
+//! refuses to start without a key in its environment and answers every
+//! endpoint except `GET /health` with `401` unless the request carries
+//! `Authorization: Bearer <key>`.
 //!
 //! The worker only ever cares about the SSE chunk shape and the `/health`
 //! semantics, so the fixture stays small.
@@ -36,8 +42,9 @@ use std::time::Duration;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -55,6 +62,7 @@ struct Config {
     boot_at: std::time::Instant,
     template_mode: String,
     required_prompt: Option<String>,
+    api_key: String,
 }
 
 pub(crate) fn run() -> ! {
@@ -71,6 +79,23 @@ async fn run_server() -> ! {
         .parse()
         .expect("fixture port must be a u16");
     let host = std::env::var("PHASE_FAKE_LLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Mirror llama-server's `LLAMA_API_KEY` contract. A worker that forgets
+    // to pass the key must fail loudly rather than serve unauthenticated.
+    let api_key = match std::env::var("LLAMA_API_KEY") {
+        Ok(key) if !key.is_empty() => key,
+        _ => {
+            eprintln!("fake-llama-server: LLAMA_API_KEY missing from environment");
+            std::process::exit(64);
+        }
+    };
+    let model_stem = std::env::var("PHASE_FAKE_LLAMA_MODEL")
+        .ok()
+        .and_then(|model| {
+            std::path::Path::new(&model)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
 
     let cfg = Config {
         tokens: std::env::var("FAKE_LLAMA_TOKENS")
@@ -100,10 +125,13 @@ async fn run_server() -> ! {
         hang_after: std::env::var("FAKE_LLAMA_HANG_AFTER")
             .ok()
             .and_then(|s| s.parse().ok()),
-        fail_health: std::env::var("FAKE_LLAMA_FAIL_HEALTH").is_ok(),
+        fail_health: std::env::var("FAKE_LLAMA_FAIL_HEALTH").is_ok()
+            || std::env::var("FAKE_LLAMA_FAIL_HEALTH_FOR_MODEL")
+                .is_ok_and(|stem| !stem.is_empty() && stem == model_stem),
         boot_at: std::time::Instant::now(),
         template_mode: std::env::var("FAKE_LLAMA_TEMPLATE_MODE").unwrap_or_default(),
         required_prompt: std::env::var("FAKE_LLAMA_REQUIRED_PROMPT").ok(),
+        api_key,
     };
 
     // Optional self-destruct used to simulate a crash mid-stream.
@@ -119,13 +147,16 @@ async fn run_server() -> ! {
         });
     }
 
+    let cfg = Arc::new(cfg);
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/completion", post(handle_completion))
         .route("/apply-template", post(handle_apply_template))
         .route("/v1/chat/completions", post(handle_completion))
         .route("/embedding", post(handle_embedding))
-        .with_state(Arc::new(cfg));
+        .route("/slots", get(handle_health))
+        .layer(middleware::from_fn_with_state(cfg.clone(), require_api_key))
+        .with_state(cfg);
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -168,6 +199,30 @@ async fn run_server() -> ! {
         std::process::exit(1);
     }
     std::process::exit(0)
+}
+
+/// `llama-server` exempts only its health endpoints from API-key checks.
+async fn require_api_key(State(cfg): State<Arc<Config>>, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| presented == cfg.api_key);
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"code": 401, "message": "Invalid API Key", "type": "authentication_error"}
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn handle_health(State(cfg): State<Arc<Config>>) -> Response {

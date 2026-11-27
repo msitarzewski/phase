@@ -829,7 +829,13 @@ pub struct Discovery {
     signing_key: SigningKey,
     capabilities: PeerCapabilities,
     cmd_tx: mpsc::Sender<Command>,
-    job_relay_stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
+    /// Prototype for outbound substream negotiation. `Control` is `Clone`;
+    /// every outbound open takes its own clone so negotiation with one slow
+    /// or dead peer never serializes opens to other peers. Each clone gets a
+    /// guaranteed slot in libp2p-stream's per-peer channel and is dropped as
+    /// soon as its substream is negotiated, so buffering stays bounded by the
+    /// number of concurrent callers.
+    job_relay_stream_control: libp2p_stream::Control,
     job_relay_stream_handler: Arc<RwLock<Option<JobRelayStreamHandler>>>,
     blob_stream_handler: Arc<RwLock<Option<BlobStreamHandler>>>,
     shard_stage_handler: Arc<RwLock<Option<ShardStageHandler>>>,
@@ -1052,7 +1058,6 @@ impl Discovery {
             shard_stage_handler.clone(),
             inbound_stream_admission,
         ));
-        let job_relay_stream_control = Arc::new(tokio::sync::Mutex::new(job_relay_stream_control));
 
         // Wire up bootstrap peers. Format expected:
         //   /ip4/x.x.x.x/tcp/<port>/p2p/<peer-id>
@@ -1471,14 +1476,11 @@ impl Discovery {
         let idle_timeout = Duration::from_millis(open.idle_timeout_ms);
         let negotiation_deadline = outbound_stream_negotiation_deadline(deadline);
 
-        // `libp2p_stream::Control::open_stream` takes `&mut self`. A single
-        // mutex preserves the crate's intended control backpressure without
-        // cloning one control per job; the lock is released as soon as the
-        // substream is negotiated.
-        let mut control =
-            tokio::time::timeout_at(negotiation_deadline, self.job_relay_stream_control.lock())
-                .await
-                .map_err(|_| anyhow!("live relay negotiation timed out"))?;
+        // `libp2p_stream::Control::open_stream` takes `&mut self`; a private
+        // clone per open keeps a dead peer's stalled dial from blocking
+        // negotiation with every other peer (a shared lock did, for up to the
+        // full negotiation timeout).
+        let mut control = self.job_relay_stream_control.clone();
         let mut stream = tokio::time::timeout_at(
             negotiation_deadline,
             control.open_stream(peer, StreamProtocol::new(JOB_RELAY_STREAM_PROTOCOL)),
@@ -1548,10 +1550,7 @@ impl Discovery {
         let idle_timeout = Duration::from_millis(request.idle_timeout_ms);
         let negotiation_deadline = outbound_stream_negotiation_deadline(deadline);
 
-        let mut control =
-            tokio::time::timeout_at(negotiation_deadline, self.job_relay_stream_control.lock())
-                .await
-                .map_err(|_| anyhow!("blob stream negotiation timed out"))?;
+        let mut control = self.job_relay_stream_control.clone();
         let mut stream = tokio::time::timeout_at(
             negotiation_deadline,
             control.open_stream(peer, StreamProtocol::new(BLOB_STREAM_PROTOCOL)),
@@ -1604,10 +1603,7 @@ impl Discovery {
         let idle_timeout = Duration::from_millis(request.idle_timeout_ms);
         let negotiation_deadline = outbound_stream_negotiation_deadline(deadline);
 
-        let mut control =
-            tokio::time::timeout_at(negotiation_deadline, self.job_relay_stream_control.lock())
-                .await
-                .map_err(|_| anyhow!("shard stage negotiation timed out"))?;
+        let mut control = self.job_relay_stream_control.clone();
         let mut stream = tokio::time::timeout_at(
             negotiation_deadline,
             control.open_stream(peer, StreamProtocol::new(SHARD_STAGE_PROTOCOL)),
@@ -3717,16 +3713,18 @@ impl Driver {
 /// anything we don't recognise comes back as `None`, which the caller
 /// treats as `RuntimeNotSupported`.
 ///
-/// This bridge keeps the November 2025 wire format intact while letting
-/// `PeerCapabilities` advertise capabilities in the new workload-agnostic
-/// `JobSpecKind` vocabulary.
+/// The prefix (text before the first `-`) must be a canonical `JobSpecKind`
+/// wire name (`wasm`, `inference`, `embedding`, …), resolved through the
+/// protocol's own serde vocabulary so phase-net never names an inference
+/// backend. The only aliases are the November 2025 MVP's WASM runtime names
+/// (`wasmtime-27`, `wasm3-…`), kept so that wire format stays intact.
 fn classify_runtime(runtime: &str) -> Option<phase_protocol::JobSpecKind> {
     use phase_protocol::JobSpecKind;
     let prefix = runtime.split('-').next().unwrap_or("");
     match prefix {
-        "wasmtime" | "wasm" | "wasm3" => Some(JobSpecKind::Wasm),
-        "llama" | "mlx" | "ollama" | "inference" => Some(JobSpecKind::Inference),
-        _ => None,
+        "wasmtime" | "wasm3" => Some(JobSpecKind::Wasm),
+        "" => None,
+        kind => serde_json::from_value(serde_json::Value::String(kind.to_owned())).ok(),
     }
 }
 
