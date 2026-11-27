@@ -111,6 +111,124 @@ impl TestDaemon {
 }
 
 #[tokio::test]
+async fn ps_reports_the_current_worker_snapshot_over_http() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use lucidd::consumer::ConsumerControl;
+    use lucidd::dht_transport::PhaseNetDhtTransport;
+    use lucidd::node_config::NodeConfigStore;
+    use lucidd::ollama::{AppState, ResidentModel, ResidentModelsProvider};
+    use lucidd::policy::PolicyEngine;
+    use lucidd::registry::ModelRegistry;
+    use lucidd::router::Router;
+    use phase_identity::NodeIdentity;
+    use phase_net::{Discovery, DiscoveryConfig};
+
+    let temp = tempfile::tempdir().unwrap();
+    let identity = NodeIdentity::generate();
+    let discovery = Arc::new(
+        Discovery::new(DiscoveryConfig {
+            identity: Some(identity.clone()),
+            ..DiscoveryConfig::default()
+        })
+        .unwrap(),
+    );
+    let transport = Arc::new(PhaseNetDhtTransport::new(discovery.clone()));
+    let registry = Arc::new(ModelRegistry::new(identity.clone(), transport.clone()));
+    let policy = Arc::new(
+        PolicyEngine::load_or_default(Some(temp.path().join("policy.toml")))
+            .await
+            .unwrap(),
+    );
+    let consumer = ConsumerControl::open(
+        identity.clone(),
+        transport,
+        policy.clone(),
+        temp.path().join("grants.json"),
+        temp.path().join("control.token"),
+    )
+    .unwrap();
+    let state = AppState {
+        router: Arc::new(Router::new(
+            None,
+            registry.clone(),
+            policy.clone(),
+            identity.clone(),
+            discovery.clone(),
+        )),
+        client_identity: identity,
+        registry,
+        model_dir: None,
+        artifact_store: None,
+        verified_model_dir: None,
+        content_plane: None,
+        consumer,
+        discovery,
+        policy,
+        node_config: NodeConfigStore::load_or_default(Some(temp.path().join("node.toml"))).unwrap(),
+        cached_probe: Default::default(),
+        runtime_lock: Default::default(),
+        started_at: tokio::time::Instant::now(),
+        shard_stage_bridge_port: None,
+    };
+    let loaded = Arc::new(AtomicBool::new(true));
+    let resident_models_provider: ResidentModelsProvider = {
+        let loaded = loaded.clone();
+        Arc::new(move || {
+            let loaded = loaded.clone();
+            Box::pin(async move {
+                if !loaded.load(Ordering::SeqCst) {
+                    return Vec::new();
+                }
+                vec![ResidentModel {
+                    name: "resident:latest".to_string(),
+                    model: "resident:latest".to_string(),
+                    digest: None,
+                    size: None,
+                    size_vram: Some(6144),
+                    expires_at: None,
+                }]
+            })
+        })
+    };
+    let app = state.router_with_resident_models_provider(true, resident_models_provider);
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}/api/ps", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    for expected in [
+        json!({"models": [{
+            "name": "resident:latest",
+            "model": "resident:latest",
+            "size_vram": 6144,
+        }]}),
+        json!({"models": []}),
+    ] {
+        let actual: Value = client
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        loaded.store(false, Ordering::SeqCst);
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn peer_and_cluster_status_distinguish_explicit_authorization_from_open_mode() {
     use phase_identity::NodeIdentity;
     use phase_net::{Discovery, DiscoveryConfig};
@@ -475,6 +593,18 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
             .await
             .expect("tags JSON");
         assert_eq!(tags["models"][0]["name"], "echo:latest");
+
+        let ps: Value = client
+            .get(daemon.url("/api/ps"))
+            .send()
+            .await
+            .expect("residency request")
+            .error_for_status()
+            .expect("residency success")
+            .json()
+            .await
+            .expect("residency JSON");
+        assert_eq!(ps, json!({"models": []}));
 
         let show: Value = client
             .post(daemon.url("/api/show"))

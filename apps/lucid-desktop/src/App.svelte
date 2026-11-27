@@ -934,11 +934,11 @@
   </div>
 {/if}
 
-<!-- Built-in Local Chat Modal -->
+<!-- Built-in chat modal -->
 {#if showChatModal}
   <div class="backdrop">
-    <div class="modal wide">
-      <ChatPanel models={chatModels} initialModel={chatInitialModel} />
+    <div class="modal wide chat-modal" role="dialog" aria-modal="true" aria-labelledby="lucid-chat-title">
+      <ChatPanel models={chatModels} initialModel={chatInitialModel} onCopy={copyText} />
       <div class="modal-actions">
         <button onclick={() => (showChatModal = false)}>Close</button>
       </div>
@@ -1398,6 +1398,11 @@
 
   .modal.wide {
     max-width: 560px;
+  }
+
+  .chat-modal {
+    height: min(680px, 100%);
+    min-height: 0;
   }
 
   .cluster-modal,

@@ -121,8 +121,32 @@ async fn loopback_host_guard_requires_one_host_header() {
 
 #[tokio::test]
 async fn ps_does_not_invent_runtime_residency_records() {
-    let Json(response) = handle_ps().await;
+    let Json(response) = handle_ps(State(None)).await;
     assert!(response.models.is_empty());
+}
+
+#[tokio::test]
+async fn ps_omits_residency_fields_the_worker_does_not_report() {
+    let provider: ResidentModelsProvider = Arc::new(|| {
+        Box::pin(async {
+            vec![ResidentModel {
+                name: "qwen3:latest".to_string(),
+                model: "qwen3:latest".to_string(),
+                digest: None,
+                size: None,
+                size_vram: None,
+                expires_at: None,
+            }]
+        })
+    });
+    let Json(response) = handle_ps(State(Some(provider))).await;
+    let listing = serde_json::to_value(response).unwrap();
+    assert_eq!(
+        listing,
+        serde_json::json!({
+            "models": [{ "name": "qwen3:latest", "model": "qwen3:latest" }]
+        })
+    );
 }
 
 #[test]

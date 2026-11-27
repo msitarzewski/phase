@@ -9,7 +9,7 @@
 //! - `GET /api/tags` — list the registry's verified local models.
 //! - `GET /api/version` — clients capability-sniff here on startup.
 //! - `POST /api/show` — registry-backed metadata for a requested alias/CID.
-//! - `GET /api/ps` — an honest empty list until worker residency is tracked.
+//! - `GET /api/ps` — worker-reported residency, or an empty list without telemetry.
 //! - `POST /api/embed` / `POST /api/embeddings` — embedding vectors over the
 //!   same router/manifest/receipt pipeline as `/api/chat` (the legacy
 //!   `/api/embeddings` is the singular-`prompt` shape Ollama shipped first).
@@ -169,10 +169,30 @@ struct ShowResponse {
     model_info: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+/// A model the worker currently holds in memory. Report optional values
+/// only when the worker can measure them or knows its actual eviction deadline.
+#[derive(Debug, Serialize)]
+pub struct ResidentModel {
+    pub name: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_vram: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Serialize)]
 struct PsResponse {
-    models: Vec<TagModel>,
+    models: Vec<ResidentModel>,
 }
+
+/// Obtain a fresh snapshot of local worker residency for each `GET /api/ps`.
+pub type ResidentModelsProvider =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Vec<ResidentModel>> + Send + Sync>;
 
 /// `/api/embed` request. Ollama accepts `input` as either a single string or
 /// an array of strings. Controls that the signed embedding job cannot yet
@@ -283,6 +303,17 @@ pub struct AppState {
     /// bridge (`--shard-stage-bridge-port`). Used only when `cluster_enabled` is
     /// explicitly enabled in `node.toml`.
     pub shard_stage_bridge_port: Option<u16>,
+}
+
+impl AppState {
+    /// Build the HTTP router with worker-supplied residency telemetry.
+    pub fn router_with_resident_models_provider(
+        self,
+        loopback_bind: bool,
+        resident_models_provider: ResidentModelsProvider,
+    ) -> Router {
+        build_router(self, loopback_bind, Some(resident_models_provider))
+    }
 }
 
 /// HTTP header that flips this request to local-only mode. Honored on
@@ -450,13 +481,24 @@ async fn require_loopback_host(request: Request, next: Next) -> Response {
 }
 
 pub fn router(state: AppState, loopback_bind: bool) -> Router {
+    build_router(state, loopback_bind, None)
+}
+
+fn build_router(
+    state: AppState,
+    loopback_bind: bool,
+    resident_models_provider: Option<ResidentModelsProvider>,
+) -> Router {
     let app = Router::new()
         .route("/api/chat", post(handle_chat))
         .route("/api/generate", post(handle_generate))
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))
         .route("/api/show", post(handle_show))
-        .route("/api/ps", get(handle_ps))
+        .route(
+            "/api/ps",
+            get(handle_ps).with_state(resident_models_provider),
+        )
         // Embeddings — non-streaming; both the current (`/api/embed`) and the
         // legacy singular-prompt (`/api/embeddings`) request shapes.
         .route("/api/embed", post(handle_embed))
@@ -1974,12 +2016,14 @@ fn tag_model_from_installed(model: &crate::registry::InstalledModel) -> TagModel
     }
 }
 
-/// `/api/ps` can only report models known to be resident in worker memory.
-/// The registry tracks verified availability, not runtime residency, so an
-/// empty list is the only truthful response until the worker exports that
-/// telemetry. In particular, do not synthesize zero-sized/all-zero entries.
-async fn handle_ps() -> Json<PsResponse> {
-    Json(PsResponse { models: Vec::new() })
+/// The model registry tracks availability. Only the worker snapshot can
+/// establish residency for this endpoint.
+async fn handle_ps(State(provider): State<Option<ResidentModelsProvider>>) -> Json<PsResponse> {
+    let models = match provider {
+        Some(provider) => provider().await,
+        None => Vec::new(),
+    };
+    Json(PsResponse { models })
 }
 
 async fn tag_model_from_caps_async(

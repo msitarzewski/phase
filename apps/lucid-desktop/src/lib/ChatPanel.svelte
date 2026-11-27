@@ -1,30 +1,37 @@
 <script lang="ts">
-  import {
-    sendChatMessage,
-    type ChatReply,
-    type ChatRequestMessage,
-  } from "./chatClient";
+  import { onDestroy } from "svelte";
+  import { streamChatMessage, type ChatEvidence, type ChatRequestMessage } from "./chatClient";
 
   interface ChatMessage extends ChatRequestMessage {
-    evidence?: Pick<
-      ChatReply,
-      "routed_via" | "receipt_verified" | "trust_label"
-    >;
+    inHistory: boolean;
+    evidence?: ChatEvidence | null;
+    status?: "streaming" | "complete" | "stopped" | "interrupted";
   }
 
   interface Props {
     models: string[];
     initialModel?: string | null;
+    onCopy: (text: string, label: string) => Promise<void>;
   }
 
-  let { models, initialModel = null }: Props = $props();
+  let { models, initialModel = null, onCopy }: Props = $props();
   let selectedModel = $state("");
   let initializedModel = $state(false);
   let messages = $state<ChatMessage[]>([]);
   let draft = $state("");
   let localOnly = $state(false);
   let busy = $state(false);
+  let stopping = $state(false);
   let error = $state<string | null>(null);
+  let messageList: HTMLDivElement;
+  let followReply = true;
+  let activeRequest: AbortController | undefined;
+  let destroyed = false;
+
+  onDestroy(() => {
+    destroyed = true;
+    activeRequest?.abort();
+  });
 
   $effect(() => {
     if (models.length === 0) return;
@@ -42,38 +49,76 @@
     }
   });
 
+  $effect(() => {
+    const lastMessage = messages.at(-1);
+    // Follow both text deltas and the badges/status added to the last reply.
+    void lastMessage?.content;
+    void lastMessage?.evidence;
+    void lastMessage?.status;
+    if (!messageList || !followReply) return;
+
+    const frame = requestAnimationFrame(() => {
+      if (followReply) messageList.scrollTop = messageList.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  });
+
+  function trackScroll() {
+    followReply = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight <= 48;
+  }
+
+  function stop() {
+    if (!activeRequest) return;
+    stopping = true;
+    activeRequest.abort();
+  }
+
   async function send() {
     const content = draft.trim();
     if (!content || !selectedModel || busy) return;
 
+    const request = new AbortController();
+    activeRequest = request;
     busy = true;
     error = null;
-    messages = [...messages, { role: "user", content }];
+    followReply = true;
+    const requestMessages = messages
+      .filter((message) => message.inHistory)
+      .map(({ role, content }) => ({ role, content }));
+    requestMessages.push({ role: "user", content });
+
+    const turn = messages.length;
+    messages.push(
+      { role: "user", content, inHistory: false },
+      { role: "assistant", content: "", inHistory: false, status: "streaming" },
+    );
+    const assistant = messages[turn + 1]!;
     draft = "";
 
-    const requestMessages = messages.map(({ role, content: message }) => ({
-      role,
-      content: message,
-    }));
-
     try {
-      const reply = await sendChatMessage(selectedModel, requestMessages, localOnly);
-      messages = [
-        ...messages,
-        {
-          role: "assistant",
-          content: reply.reply,
-          evidence: {
-            routed_via: reply.routed_via,
-            receipt_verified: reply.receipt_verified,
-            trust_label: reply.trust_label,
-          },
-        },
-      ];
+      const reply = await streamChatMessage(selectedModel, requestMessages, localOnly, request.signal, (chunk) => {
+        if (destroyed) return;
+        if (chunk.delta) assistant.content += chunk.delta;
+        if (chunk.evidence) assistant.evidence = chunk.evidence;
+      });
+      if (destroyed) return;
+      assistant.status = reply.cancelled ? "stopped" : "complete";
+      assistant.evidence = reply.evidence;
+      if (!reply.cancelled) {
+        messages[turn]!.inHistory = true;
+        assistant.inHistory = true;
+      }
     } catch (cause) {
+      if (destroyed) return;
+      assistant.status = "interrupted";
+      assistant.evidence = null;
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
-      busy = false;
+      activeRequest = undefined;
+      if (!destroyed) {
+        busy = false;
+        stopping = false;
+      }
     }
   }
 
@@ -93,7 +138,7 @@
 <section class="chat-panel" aria-label="LUCID chat">
   <header class="chat-header">
     <div>
-      <h2>Chat</h2>
+      <h2 id="lucid-chat-title">Chat</h2>
       <p class="subtitle">Conversation history stays in memory for this session only.</p>
     </div>
     <button class="ghost" onclick={clearHistory} disabled={busy || messages.length === 0}>
@@ -125,12 +170,16 @@
     <div class="error-banner" role="alert">{error}</div>
   {/if}
 
-  <div class="messages" aria-live="polite">
+  <div class="messages" bind:this={messageList} onscroll={trackScroll}>
     {#if messages.length === 0}
       <div class="empty-state">
         {#if localOnly}
           <strong>Local-only chat</strong>
-          <span>Requests stay strictly on this device (X-Lucid-Local-Only). History is kept in memory only.</span>
+          {#if models.length === 0}
+            <span>Add a local model in Models to start a chat.</span>
+          {:else}
+            <span>Choose a model on this device to keep your prompts here.</span>
+          {/if}
         {:else}
           <strong>Start a chat</strong>
           <span>History is kept in memory only and sent with each turn to whichever local or enrolled circle device serves the selected model. Check "Local Only" to keep prompts on this device.</span>
@@ -139,8 +188,24 @@
     {:else}
       {#each messages as message}
         <article class:user={message.role === "user"} class="message">
-          <div class="message-role">{message.role === "user" ? "You" : "Assistant"}</div>
-          <div class="message-content">{message.content}</div>
+          <div class="message-header">
+            <span class="message-role">{message.role === "user" ? "You" : "Assistant"}</span>
+            {#if message.role === "assistant" && message.content}
+              <button class="ghost copy" onclick={() => onCopy(message.content, "reply")} aria-label="Copy assistant reply">
+                Copy
+              </button>
+            {/if}
+          </div>
+          {#if message.content}
+            <div class="message-content">{message.content}</div>
+          {/if}
+          {#if message.status === "streaming" && !message.content}
+            <div class="reply-status" role="status">Waiting for the model…</div>
+          {:else if message.status === "stopped"}
+            <div class="reply-status" role="status">Reply stopped</div>
+          {:else if message.status === "interrupted"}
+            <div class="reply-status">Reply interrupted</div>
+          {/if}
           {#if message.role === "assistant" && message.evidence}
             <div class="evidence" aria-label="Response provenance">
               {#if message.evidence.routed_via}
@@ -174,17 +239,21 @@
       onkeydown={handleKeydown}
       disabled={busy || !selectedModel}
     ></textarea>
-    <button class="primary" onclick={send} disabled={busy || !draft.trim() || !selectedModel}>
-      {busy ? "Sending…" : "Send"}
-    </button>
+    {#if busy}
+      <button class="primary" onclick={stop} disabled={stopping}>
+        {stopping ? "Stopping…" : "Stop"}
+      </button>
+    {:else}
+      <button class="primary" onclick={send} disabled={!draft.trim() || !selectedModel}>Send</button>
+    {/if}
   </div>
 </section>
 
 <style>
   .chat-panel {
     display: flex;
-    min-height: 480px;
-    max-height: 100%;
+    min-height: 0;
+    flex: 1;
     flex-direction: column;
     overflow: hidden;
     background: var(--bg-elevated);
@@ -291,8 +360,25 @@
     background: var(--bg-elevated);
   }
 
-  .message-role {
+  .message-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
     margin-bottom: 5px;
+  }
+
+  .copy {
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+
+  .reply-status {
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  .message-role {
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.04em;

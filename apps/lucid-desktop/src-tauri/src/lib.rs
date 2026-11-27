@@ -45,6 +45,10 @@ fn response_trust_label(headers: &reqwest::header::HeaderMap) -> Option<&'static
     if values.next().is_some() {
         return None;
     }
+    parse_trust_label(value)
+}
+
+fn parse_trust_label(value: &str) -> Option<&'static str> {
     match value {
         "local" => Some("local"),
         "remote-pending" => Some("remote-pending"),
@@ -83,6 +87,7 @@ struct AppController {
     daemon: Mutex<Option<ManagedDaemon>>,
     prefs: Mutex<DesktopPrefs>,
     http: reqwest::Client,
+    active_chat: Mutex<Option<chat::ActiveChat>>,
 }
 
 impl AppController {
@@ -101,6 +106,7 @@ impl AppController {
             daemon: Mutex::new(None),
             prefs: Mutex::new(prefs),
             http,
+            active_chat: Mutex::new(None),
         })
     }
 
@@ -840,6 +846,7 @@ pub fn run() {
             join_invite,
             open_chat,
             chat::send_chat_message,
+            chat::cancel_chat_message,
             restart_daemon,
             get_cluster_status,
             preview_cluster_plan,
