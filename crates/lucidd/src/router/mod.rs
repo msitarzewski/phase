@@ -20,7 +20,7 @@
 //! 2. Operator policy ([`PolicyEngine::should_serve`]) says pause →
 //!    `Refused(PauseReason)`.
 //! 3. Local worker has the model loaded → `Local`.
-//! 4. Otherwise: DHT lookup; first valid peer → `Peer { peer_id }`.
+//! 4. Otherwise: DHT lookup; first authorized peer → `Peer { peer_id }`.
 //! 5. No peers → `Refused("no peers serving model X")`.
 //!
 //! ## Compatibility and admission boundaries
@@ -36,7 +36,7 @@
 //!   its own admission control via `WorkerError::Capacity`. The router
 //!   surfaces that as a 503 to the client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -52,7 +52,7 @@ use phase_net::{
 };
 use phase_protocol::{
     CommitmentAccumulator, Completion, DynWorker, JobEvent, JobHandle, JobId, JobMetrics,
-    JobResult, JobSpec, JobStream, SignedManifest, SignedReceipt, WorkerError,
+    JobResult, JobSpec, JobStream, ProgressUpdate, SignedManifest, SignedReceipt, WorkerError,
 };
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -71,6 +71,7 @@ const MAX_EMBEDDING_ENTRY_CHARS: usize = 64 * 1024;
 const MAX_REMOTE_REPLAY_ENTRIES: usize = 65_536;
 const INBOUND_RELAY_JOB_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+use crate::consumer::ConsumerControl;
 use crate::policy::{PauseReason, PolicyDecision, PolicyEngine};
 use crate::registry::{normalize_model_alias, ModelCapabilities, ModelCid, ModelRegistry};
 use crate::reputation::{
@@ -242,6 +243,8 @@ pub struct Router {
     identity: NodeIdentity,
     phase_net: Arc<Discovery>,
     evidence: Option<Arc<EvidenceRuntime>>,
+    consumer: Option<Arc<ConsumerControl>>,
+    allow_open_peers: bool,
     redundant_config: RedundantVerificationConfig,
     redundant_gate: Arc<Semaphore>,
     /// Live count of active remote jobs dispatched to each peer, used to spread
@@ -252,6 +255,26 @@ pub struct Router {
 struct InFlightPeerGuard {
     peer_id: PeerId,
     counts: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>,
+}
+
+pub(crate) fn find_local_model_by_alias<'a>(
+    models: &'a [ModelCapabilities],
+    alias: &str,
+) -> Option<&'a ModelCapabilities> {
+    models
+        .iter()
+        .find(|caps| caps.model_id == alias)
+        .or_else(|| {
+            if let Some(bare) = alias.strip_suffix(":latest") {
+                models.iter().find(|caps| caps.model_id == bare)
+            } else if !alias.contains(':') {
+                models
+                    .iter()
+                    .find(|caps| caps.model_id.strip_suffix(":latest") == Some(alias))
+            } else {
+                None
+            }
+        })
 }
 
 impl Drop for InFlightPeerGuard {
@@ -288,10 +311,23 @@ impl Router {
             identity,
             phase_net,
             evidence: None,
+            consumer: None,
+            allow_open_peers: false,
             redundant_config: RedundantVerificationConfig::default(),
             redundant_gate: Arc::new(Semaphore::new(1)),
             in_flight_by_peer: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Attach live enrollment grants and the operator's open-network opt-in.
+    pub fn with_remote_access(
+        mut self,
+        consumer: Option<Arc<ConsumerControl>>,
+        allow_open_peers: bool,
+    ) -> Self {
+        self.consumer = consumer;
+        self.allow_open_peers = allow_open_peers;
+        self
     }
 
     /// Attach local evidence-based ordering without changing existing callers.
@@ -320,14 +356,24 @@ impl Router {
     /// Choose where to serve `model_id`. Pure decision step — no side
     /// effects, no worker dispatch.
     pub async fn route(&self, model_id: &str, local_only: bool) -> RouteDecision {
+        self.route_with_cid(model_id, local_only).await.0
+    }
+
+    pub(crate) async fn route_with_cid(
+        &self,
+        model_id: &str,
+        local_only: bool,
+    ) -> (RouteDecision, Option<ModelCid>) {
         let has_local_worker = self.local_worker.is_some();
         let local_models = self.registry.local_models_async().await;
         let requested_cid = ModelCid::from_hex(model_id).ok();
         let normalized_alias = normalize_model_alias(model_id).ok();
-        let local_model = local_models.iter().find(|caps| {
-            requested_cid == Some(caps.model_cid)
-                || normalized_alias.as_deref() == Some(caps.model_id.as_str())
-        });
+        let local_model = match requested_cid {
+            Some(cid) => local_models.iter().find(|caps| caps.model_cid == cid),
+            None => normalized_alias
+                .as_deref()
+                .and_then(|alias| find_local_model_by_alias(&local_models, alias)),
+        };
         let local_has_model = local_model.is_some();
         let policy_model_id = local_model
             .map(|caps| caps.model_id.as_str())
@@ -336,16 +382,19 @@ impl Router {
 
         // 1. Local-only privacy posture wins over everything else.
         if local_only && !(has_local_worker && local_has_model) {
-            return RouteDecision {
-                via: RouteVia::Refused {
-                    reason: format!(
-                        "local-only requested but model '{model_id}' not loaded locally"
-                    ),
+            return (
+                RouteDecision {
+                    via: RouteVia::Refused {
+                        reason: format!(
+                            "local-only requested but model '{model_id}' not loaded locally"
+                        ),
+                    },
+                    model_id: model_id.to_string(),
+                    fallback_peers: Vec::new(),
+                    explanation: "local-only privacy policy refused remote routing".to_string(),
                 },
-                model_id: model_id.to_string(),
-                fallback_peers: Vec::new(),
-                explanation: "local-only privacy policy refused remote routing".to_string(),
-            };
+                None,
+            );
         }
 
         // 2. Policy gate. The policy engine returns Allow on the happy
@@ -364,37 +413,53 @@ impl Router {
         match self.policy.should_serve_self(policy_model_id) {
             PolicyDecision::Allow => {}
             PolicyDecision::Pause { reason } => {
-                return RouteDecision {
-                    via: RouteVia::Refused {
-                        reason: pause_reason_string(&reason),
+                return (
+                    RouteDecision {
+                        via: RouteVia::Refused {
+                            reason: pause_reason_string(&reason),
+                        },
+                        model_id: model_id.to_string(),
+                        fallback_peers: Vec::new(),
+                        explanation:
+                            "operator policy refused this request before candidate selection"
+                                .to_string(),
                     },
-                    model_id: model_id.to_string(),
-                    fallback_peers: Vec::new(),
-                    explanation: "operator policy refused this request before candidate selection"
-                        .to_string(),
-                };
+                    None,
+                );
             }
         }
 
         // 3. Local has the model — fast path.
-        if has_local_worker && local_has_model {
-            return RouteDecision {
-                via: RouteVia::Local,
-                model_id: model_id.to_string(),
-                fallback_peers: Vec::new(),
-                explanation: "local worker is loaded; remote reputation was not consulted"
-                    .to_string(),
-            };
+        if let Some(local_model) = local_model.filter(|_| has_local_worker) {
+            return (
+                RouteDecision {
+                    via: RouteVia::Local,
+                    model_id: model_id.to_string(),
+                    fallback_peers: Vec::new(),
+                    explanation: "local worker is loaded; remote reputation was not consulted"
+                        .to_string(),
+                },
+                Some(local_model.model_cid),
+            );
         }
 
-        // 4. Look up peers on the DHT.
-        let peers = match self.registry.find_peers_by_model_id(model_id).await {
+        // 4. Preserve Ollama's bare alias lookup after checking both local names.
+        let remote_alias = normalized_alias.as_deref().unwrap_or(model_id);
+        let remote_alias = remote_alias.strip_suffix(":latest").unwrap_or(remote_alias);
+        let peers = match self.registry.find_peers_by_model_id(remote_alias).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "registry lookup failed");
                 Vec::new()
             }
         };
+        let authorized_issuers = self.authorized_issuers();
+        let advertised = peers.len();
+        let peers: Vec<_> = peers
+            .into_iter()
+            .filter(|(peer, _)| self.remote_peer_allowed(peer, &authorized_issuers))
+            .collect();
+        let filtered = advertised > peers.len();
         let (peers, ranking_explanation) = self.rank_remote_candidates(peers).await;
         let mut iter = peers.into_iter();
         if let Some((peer_id, caps)) = iter.next() {
@@ -408,23 +473,55 @@ impl Router {
             // failover chain — `execute()` walks them if the primary relay
             // fails.
             let fallback_peers: Vec<PeerId> = iter.map(|(p, _)| p).collect();
-            return RouteDecision {
-                via: RouteVia::Peer { peer_id },
-                model_id: model_id.to_string(),
-                fallback_peers,
-                explanation: ranking_explanation,
-            };
+            return (
+                RouteDecision {
+                    via: RouteVia::Peer { peer_id },
+                    model_id: model_id.to_string(),
+                    fallback_peers,
+                    explanation: ranking_explanation,
+                },
+                Some(caps.model_cid),
+            );
         }
 
         // 5. Nobody can serve.
-        RouteDecision {
-            via: RouteVia::Refused {
-                reason: format!("no peers serving model '{model_id}'"),
+        (
+            RouteDecision {
+                via: RouteVia::Refused {
+                    reason: if filtered {
+                        format!("no authorized peers serving model '{model_id}'")
+                    } else {
+                        format!("no peers serving model '{model_id}'")
+                    },
+                },
+                model_id: model_id.to_string(),
+                fallback_peers: Vec::new(),
+                explanation: ranking_explanation,
             },
-            model_id: model_id.to_string(),
-            fallback_peers: Vec::new(),
-            explanation: ranking_explanation,
-        }
+            None,
+        )
+    }
+
+    fn authorized_issuers(&self) -> HashSet<PeerId> {
+        self.consumer
+            .iter()
+            .flat_map(|consumer| consumer.authorized_issuer_peers())
+            .collect()
+    }
+
+    fn remote_peer_allowed(&self, peer: &PeerId, authorized_issuers: &HashSet<PeerId>) -> bool {
+        let operator = match &self.evidence {
+            Some(runtime) => match runtime.operator_override(peer) {
+                Ok(operator) => operator,
+                Err(error) => {
+                    tracing::error!(%error, "could not read peer routing overrides");
+                    return false;
+                }
+            },
+            None => Default::default(),
+        };
+        !operator.blocked
+            && (operator.pinned || self.allow_open_peers || authorized_issuers.contains(peer))
     }
 
     async fn rank_remote_candidates(
@@ -734,6 +831,11 @@ impl Router {
         peer_id: PeerId,
         job: SignedManifest<JobSpec>,
     ) -> Result<(JobHandle, JobStream, ReceiptVerification), RouterError> {
+        if !self.remote_peer_allowed(&peer_id, &self.authorized_issuers()) {
+            return Err(RouterError::Refused {
+                reason: "serving peer is no longer authorized for remote requests".to_string(),
+            });
+        }
         match self.execute_via_peer_live(peer_id, job.clone()).await {
             Ok(stream) => Ok(stream),
             Err(RouterError::Relay(reason))
@@ -1962,12 +2064,12 @@ fn validate_remote_embedding_input(input: &[String]) -> Result<usize, String> {
     Ok(total_chars)
 }
 
-async fn validate_and_execute_inbound_relay(
+async fn prepare_inbound_relay(
     delivering_peer: PeerId,
     bytes: Vec<u8>,
     expected_job_id: Option<[u8; 32]>,
-    context: InboundRelayContext,
-) -> Result<(RemoteExecutionPermit, JobHandle, JobStream), String> {
+    context: &InboundRelayContext,
+) -> Result<(RemoteExecutionPermit, SignedManifest<JobSpec>), String> {
     let job: SignedManifest<JobSpec> =
         serde_json::from_slice(&bytes).map_err(|e| format!("decode SignedManifest: {e}"))?;
     job.verify_for_remote_execution()
@@ -2035,12 +2137,7 @@ async fn validate_and_execute_inbound_relay(
         .ok_or_else(|| "busy: max concurrent remote jobs reached".to_string())?;
     context.replay_cache.admit(&job, manifest_hash).await?;
 
-    let (handle, stream) = context
-        .worker
-        .execute_boxed(job)
-        .await
-        .map_err(|e| format!("local worker dispatch failed: {e}"))?;
-    Ok((permit, handle, stream))
+    Ok((permit, job))
 }
 
 /// Both inbound relay protocol handlers, backed by one remote-execution
@@ -2088,19 +2185,14 @@ fn make_inbound_relay_stream_handler_with_context(
             let deadline = TokioInstant::now() + deadline_after;
             let execution = match timeout_at(
                 deadline,
-                validate_and_execute_inbound_relay(
-                    delivering_peer,
-                    open.payload,
-                    Some(open.job_id),
-                    context,
-                ),
+                prepare_inbound_relay(delivering_peer, open.payload, Some(open.job_id), &context),
             )
             .await
             {
                 Ok(execution) => execution,
                 Err(_) => Err("remote job deadline reached before acceptance".to_string()),
             };
-            let (_permit, handle, mut stream) = match execution {
+            let (_permit, job) = match execution {
                 Ok(execution) => execution,
                 Err(reason) => {
                     let reason = bounded_reason(&reason);
@@ -2119,23 +2211,75 @@ fn make_inbound_relay_stream_handler_with_context(
                 }
             };
 
-            if !send_live_handler_frame_before(
-                &frames,
-                JobRelayStreamFrame {
-                    schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
-                    job_id: open.job_id,
-                    sequence: 0,
-                    kind: JobRelayStreamFrameKind::Accepted,
-                },
-                deadline,
-            )
-            .await
-            {
-                handle.cancel();
-                return;
+            let frame = |sequence, kind| JobRelayStreamFrame {
+                schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
+                job_id: open.job_id,
+                sequence,
+                kind,
+            };
+            // Keep the usual rejection behavior for fast dispatch failures.
+            // If cold loading takes longer, accept once and then send progress
+            // events until dispatch returns. The absolute deadline still applies.
+            let interval = Duration::from_millis((open.idle_timeout_ms / 2).max(1));
+            let mut loading = tokio::time::interval_at(TokioInstant::now() + interval, interval);
+            loading.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let dispatch = timeout_at(deadline, context.worker.execute_boxed(job));
+            tokio::pin!(dispatch);
+            let mut sequence = 0;
+            let (handle, mut stream) = loop {
+                let kind = tokio::select! {
+                    biased;
+                    _ = controls.recv() => return,
+                    _ = frames.closed() => return,
+                    result = &mut dispatch => {
+                        let reason = match result {
+                            Ok(Ok(execution)) => break execution,
+                            Ok(Err(error)) => bounded_reason(&format!("local worker dispatch failed: {error}")),
+                            Err(_) => "remote job deadline reached during dispatch".to_string(),
+                        };
+                        let kind = if sequence == 0 {
+                            JobRelayStreamFrameKind::Rejected { reason }
+                        } else {
+                            JobRelayStreamFrameKind::Failed { reason }
+                        };
+                        let _ = send_live_handler_frame_before(&frames, frame(sequence, kind), deadline).await;
+                        return;
+                    }
+                    _ = loading.tick() => {
+                        if sequence == 0 {
+                            JobRelayStreamFrameKind::Accepted
+                        } else {
+                            let progress = JobEvent::Progress(ProgressUpdate {
+                                kind: "model_load".to_string(),
+                                fraction: None,
+                                message: None,
+                            });
+                            let Ok(payload) = serde_json::to_vec(&progress) else {
+                                return;
+                            };
+                            JobRelayStreamFrameKind::Event { payload, terminal: false }
+                        }
+                    }
+                };
+                if !send_live_handler_frame_before(&frames, frame(sequence, kind), deadline).await {
+                    return;
+                }
+                sequence += 1;
+            };
+            if sequence == 0 {
+                if !send_live_handler_frame_before(
+                    &frames,
+                    frame(sequence, JobRelayStreamFrameKind::Accepted),
+                    deadline,
+                )
+                .await
+                {
+                    handle.cancel();
+                    return;
+                }
+                sequence = 1;
             }
 
-            let mut sequence = 1_u64;
             let mut saw_terminal = false;
             loop {
                 tokio::select! {
@@ -2340,12 +2484,18 @@ fn make_inbound_relay_handler_with_context_and_timeout(
         let context = context.clone();
         Box::pin(async move {
             let deadline = TokioInstant::now() + job_timeout;
-            let execution = match timeout_at(
-                deadline,
-                validate_and_execute_inbound_relay(delivering_peer, bytes, None, context),
-            )
-            .await
-            {
+            let execution = timeout_at(deadline, async {
+                let (permit, job) =
+                    prepare_inbound_relay(delivering_peer, bytes, None, &context).await?;
+                let (handle, stream) = context
+                    .worker
+                    .execute_boxed(job)
+                    .await
+                    .map_err(|error| format!("local worker dispatch failed: {error}"))?;
+                Ok((permit, handle, stream))
+            })
+            .await;
+            let execution = match execution {
                 Ok(execution) => execution,
                 Err(_) => Err("remote batch job deadline reached before dispatch".to_string()),
             };

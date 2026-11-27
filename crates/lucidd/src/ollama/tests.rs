@@ -101,6 +101,25 @@ fn ollama_latest_suffix_routes_to_verified_base_alias() {
 }
 
 #[tokio::test]
+async fn loopback_host_guard_requires_one_host_header() {
+    use tower::ServiceExt as _;
+
+    let app = Router::new()
+        .route("/", get(|| async { StatusCode::OK }))
+        .layer(middleware::from_fn(require_loopback_host));
+    for hosts in [Vec::new(), vec!["localhost", "127.0.0.1"]] {
+        let mut request = Request::new(Body::empty());
+        for host in hosts {
+            request
+                .headers_mut()
+                .append(header::HOST, HeaderValue::from_static(host));
+        }
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
 async fn ps_does_not_invent_runtime_residency_records() {
     let Json(response) = handle_ps().await;
     assert!(response.models.is_empty());

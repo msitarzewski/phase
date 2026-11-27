@@ -40,6 +40,8 @@ pub struct BenchSample {
     pub http_status: u16,
     pub routed_via: String,
     pub receipt_verified: bool,
+    #[serde(default)]
+    pub local_commitment: bool,
     pub ttft_ms: Option<f64>,
     pub total_ms: f64,
     pub chunks: usize,
@@ -57,10 +59,14 @@ pub struct BenchReport {
     pub succeeded: usize,
     pub failed: usize,
     pub receipt_verified_count: usize,
+    #[serde(default)]
+    pub local_commitments: usize,
     pub jobs_per_second: f64,
     pub total_chunks: usize,
     pub chunks_per_second: f64,
     pub total_eval_tokens: u64,
+    #[serde(default)]
+    pub eval_count_source: String,
     pub tokens_per_second: f64,
     pub ttft_p50_ms: Option<f64>,
     pub ttft_p95_ms: Option<f64>,
@@ -147,6 +153,7 @@ async fn execute_single_sample(
                 http_status: 0,
                 routed_via: "none".to_string(),
                 receipt_verified: false,
+                local_commitment: false,
                 ttft_ms: None,
                 total_ms: started.elapsed().as_secs_f64() * 1000.0,
                 chunks: 0,
@@ -177,6 +184,7 @@ async fn execute_single_sample(
             http_status,
             routed_via,
             receipt_verified: false,
+            local_commitment: false,
             ttft_ms: None,
             total_ms: started.elapsed().as_secs_f64() * 1000.0,
             chunks: 0,
@@ -192,6 +200,7 @@ async fn execute_single_sample(
     let mut eval_tokens = 0u64;
     let mut done_seen = false;
     let mut terminal_verified = false;
+    let mut terminal_commitment = false;
     let mut stream_err: Option<String> = None;
 
     while let Some(item) = stream.next().await {
@@ -235,15 +244,23 @@ async fn execute_single_sample(
                             terminal_verified = true;
                         }
                     }
+                    terminal_commitment = frame
+                        .get("x_phase_commitment")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|digest| {
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        });
                 }
             }
         }
     }
 
-    let is_local = routed_via == "local";
-    let receipt_verified =
-        terminal_verified || header_verified.as_deref() == Some("true") || (is_local && done_seen);
     let ok = done_seen && stream_err.is_none();
+    let receipt_verified = ok
+        && is_peer_route(&routed_via)
+        && (terminal_verified || header_verified.as_deref() == Some("true"));
+    let local_commitment = ok && routed_via == "local" && terminal_commitment;
 
     BenchSample {
         index,
@@ -251,12 +268,17 @@ async fn execute_single_sample(
         http_status,
         routed_via,
         receipt_verified,
+        local_commitment,
         ttft_ms,
         total_ms: started.elapsed().as_secs_f64() * 1000.0,
         chunks,
         eval_tokens,
         error: stream_err,
     }
+}
+
+fn is_peer_route(route: &str) -> bool {
+    route == "peer" || route.starts_with("peer:")
 }
 
 pub fn summarize_samples(
@@ -267,6 +289,7 @@ pub fn summarize_samples(
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut receipt_verified_count = 0usize;
+    let mut local_commitments = 0usize;
     let mut total_chunks = 0usize;
     let mut total_eval_tokens = 0u64;
     let mut ttfts = Vec::new();
@@ -282,8 +305,11 @@ pub fn summarize_samples(
             }
             total_chunks += s.chunks;
             total_eval_tokens = total_eval_tokens.saturating_add(s.eval_tokens);
-            if s.receipt_verified {
+            if s.receipt_verified && is_peer_route(&s.routed_via) {
                 receipt_verified_count += 1;
+            }
+            if s.local_commitment && s.routed_via == "local" {
+                local_commitments += 1;
             }
             *route_distribution.entry(s.routed_via.clone()).or_insert(0) += 1;
         } else {
@@ -300,10 +326,12 @@ pub fn summarize_samples(
         succeeded,
         failed,
         receipt_verified_count,
+        local_commitments,
         jobs_per_second: (succeeded as f64) / wall_seconds,
         total_chunks,
         chunks_per_second: (total_chunks as f64) / wall_seconds,
         total_eval_tokens,
+        eval_count_source: "self_reported".to_string(),
         tokens_per_second: (total_eval_tokens as f64) / wall_seconds,
         ttft_p50_ms: percentile(&mut ttfts, 0.50),
         ttft_p95_ms: percentile(&mut ttfts, 0.95),
@@ -344,6 +372,7 @@ mod tests {
                 http_status: 200,
                 routed_via: "peer:peerA".to_string(),
                 receipt_verified: true,
+                local_commitment: false,
                 ttft_ms: Some(120.0),
                 total_ms: 800.0,
                 chunks: 30,
@@ -354,8 +383,11 @@ mod tests {
                 index: 1,
                 ok: true,
                 http_status: 200,
-                routed_via: "peer:peerB".to_string(),
+                routed_via: "local".to_string(),
+                // Even reports with a stale verification flag count local work
+                // exclusively as a local commitment.
                 receipt_verified: true,
+                local_commitment: true,
                 ttft_ms: Some(180.0),
                 total_ms: 1000.0,
                 chunks: 32,
@@ -368,6 +400,7 @@ mod tests {
                 http_status: 200,
                 routed_via: "peer:peerA".to_string(),
                 receipt_verified: true,
+                local_commitment: false,
                 ttft_ms: Some(150.0),
                 total_ms: 900.0,
                 chunks: 28,
@@ -380,6 +413,7 @@ mod tests {
                 http_status: 503,
                 routed_via: "none".to_string(),
                 receipt_verified: false,
+                local_commitment: false,
                 ttft_ms: None,
                 total_ms: 50.0,
                 chunks: 0,
@@ -391,13 +425,15 @@ mod tests {
         let report = summarize_samples(&cfg, samples, 2.0);
         assert_eq!(report.succeeded, 3);
         assert_eq!(report.failed, 1);
-        assert_eq!(report.receipt_verified_count, 3);
+        assert_eq!(report.receipt_verified_count, 2);
+        assert_eq!(report.local_commitments, 1);
+        assert_eq!(report.eval_count_source, "self_reported");
         assert_eq!(report.total_chunks, 90);
         assert_eq!(report.total_eval_tokens, 90);
         assert!((report.tokens_per_second - 45.0).abs() < 1e-6);
         assert_eq!(report.ttft_p50_ms, Some(150.0));
         assert_eq!(report.duration_p50_ms, Some(900.0));
         assert_eq!(report.route_distribution.get("peer:peerA"), Some(&2));
-        assert_eq!(report.route_distribution.get("peer:peerB"), Some(&1));
+        assert_eq!(report.route_distribution.get("local"), Some(&1));
     }
 }

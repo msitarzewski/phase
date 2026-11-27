@@ -19,12 +19,13 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures::stream::{self, StreamExt};
 use phase_identity::NodeIdentity;
+use phase_net::PeerId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 
 use crate::policy::PolicyEngine;
-use crate::registry::DhtTransport;
+use crate::registry::{peer_id_from_ed25519_pubkey, DhtTransport};
 
 const SCHEMA: u32 = 1;
 const MAX_INVITATION_BYTES: usize = 8 * 1024;
@@ -413,6 +414,13 @@ impl ConsumerControl {
             .filter(|a| a.body.expires_at > now)
             .filter_map(|a| decode_key(&a.body.issuer).ok())
             .collect()
+    }
+
+    /// Network peers identified by the current, persisted enrollment grants.
+    pub(crate) fn authorized_issuer_peers(&self) -> impl Iterator<Item = PeerId> {
+        self.authorized_issuers()
+            .into_iter()
+            .filter_map(|issuer| peer_id_from_ed25519_pubkey(&issuer).ok())
     }
 
     fn set_status(&self, state: &str, message: &str) {
@@ -1108,6 +1116,10 @@ mod tests {
         let (reopened, _) = setup(client, Arc::clone(&dht), &tmp.path().join("client"));
         assert_eq!(reopened.enrollment_status().state, "authorized");
         assert_eq!(reopened.authorized_issuers(), vec![issuer.peer_id_bytes()]);
+        assert_eq!(
+            reopened.authorized_issuer_peers().collect::<Vec<_>>(),
+            vec![peer_id_from_ed25519_pubkey(&issuer.peer_id_bytes()).unwrap()]
+        );
     }
 
     #[tokio::test]

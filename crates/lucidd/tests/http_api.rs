@@ -7,10 +7,12 @@
 //! test protects the binary wiring, Axum routes, streaming framing, response
 //! headers, malformed-input behavior, and browser preflight contract together.
 
+use std::collections::HashSet;
 use std::fs::File;
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, StatusCode};
@@ -29,10 +31,8 @@ impl TestDaemon {
         let log_path = temp.path().join("lucidd.log");
         let log = File::create(&log_path).expect("create daemon log");
         let stderr = log.try_clone().expect("clone daemon log handle");
-        let port = free_port();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let child = Command::new(env!("CARGO_BIN_EXE_lucidd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lucidd"));
+        command
             .args([
                 "--worker",
                 "echo",
@@ -45,13 +45,10 @@ impl TestDaemon {
             .arg(temp.path().join("identity.key"))
             .arg("--policy-config")
             .arg(temp.path().join("policy.toml"))
-            .env("LUCIDD_HOST", "127.0.0.1")
-            .env("LUCIDD_PORT", port.to_string())
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn compiled lucidd binary");
+            .stderr(Stdio::from(stderr));
+        let (child, base_url) = spawn_on_disjoint_port(&mut command);
 
         let mut daemon = Self {
             child,
@@ -65,6 +62,7 @@ impl TestDaemon {
 
     async fn wait_until_ready(&mut self) {
         let client = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(300))
             .build()
             .expect("build readiness client");
@@ -105,9 +103,31 @@ impl Drop for TestDaemon {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral probe");
-    listener.local_addr().expect("read probe address").port()
+fn spawn_on_disjoint_port(command: &mut Command) -> (Child, String) {
+    static RESERVED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    // Serialize probe-to-spawn so a concurrent child cannot inherit a probe
+    // listener. Use a range below ephemeral ports and separate from llama_worker.
+    let mut reserved = RESERVED.get_or_init(Mutex::default).lock().unwrap();
+    for _ in 0..128 {
+        let ephemeral = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral probe");
+        let port = 12_000 + ephemeral.local_addr().expect("read probe address").port() % 6_000;
+        if reserved.contains(&port) {
+            continue;
+        }
+        let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
+            continue;
+        };
+        reserved.insert(port);
+        drop(probe);
+        drop(ephemeral);
+        let child = command
+            .env("LUCIDD_HOST", "127.0.0.1")
+            .env("LUCIDD_PORT", port.to_string())
+            .spawn()
+            .expect("spawn compiled lucidd binary");
+        return (child, format!("http://127.0.0.1:{port}"));
+    }
+    panic!("could not allocate a disjoint daemon port");
 }
 
 fn read_log(path: &Path) -> String {
@@ -282,6 +302,7 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let daemon = TestDaemon::spawn().await;
         let client = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("build API client");
@@ -293,6 +314,35 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
             .expect("root request");
         assert_eq!(root.status(), StatusCode::OK);
         assert!(root.text().await.expect("root body").contains("lucidd"));
+
+        for host in [
+            "127.0.0.1:11434",
+            "localhost:11434",
+            "[::1]:11434",
+            "localhost",
+        ] {
+            let response = client
+                .get(daemon.url("/api/version"))
+                .header(reqwest::header::HOST, host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{host}");
+        }
+        for host in [
+            "evil.example:11434",
+            "localhost:",
+            "localhost:65536",
+            "127.0.0.2",
+        ] {
+            let response = client
+                .get(daemon.url("/api/version"))
+                .header(reqwest::header::HOST, host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{host}");
+        }
 
         let version: Value = client
             .get(daemon.url("/api/version"))
@@ -348,6 +398,21 @@ async fn echo_mode_binary_serves_advertised_http_and_browser_contract() {
         let chat_body: Value = chat.json().await.expect("non-streaming chat JSON");
         assert_eq!(chat_body["message"]["content"], "cba");
         assert_eq!(chat_body["done"], true);
+
+        let report = lucidd::bench::run_benchmark(lucidd::bench::BenchConfig {
+            api_base: daemon.base_url.clone(),
+            model: "echo:latest".into(),
+            total_requests: 1,
+            concurrency: 1,
+            max_tokens: 8,
+            timeout_secs: 5,
+        })
+        .await
+        .unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.local_commitments, 1);
+        assert_eq!(report.receipt_verified_count, 0);
+        assert_eq!(report.eval_count_source, "self_reported");
 
         let chat_stream = client
             .post(daemon.url("/api/chat"))
@@ -693,12 +758,11 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
     let log_path = temp.path().join("lucidd.log");
     let log = File::create(&log_path).expect("create daemon log");
     let stderr = log.try_clone().expect("clone daemon log");
-    let port = free_port();
-    let base_url = format!("http://127.0.0.1:{port}");
     let token_path = temp.path().join("control.token");
     let node_cfg_path = temp.path().join("node.toml");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lucidd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lucidd"));
+    command
         .args([
             "--mode",
             "consume-only",
@@ -717,13 +781,16 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
         .arg(&token_path)
         .arg("--artifact-dir")
         .arg(temp.path().join("artifacts"))
-        .env("LUCIDD_HOST", "127.0.0.1")
-        .env("LUCIDD_PORT", port.to_string())
         .env("RUST_LOG", "warn")
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("spawn consume-only lucidd");
+        .stderr(Stdio::from(stderr));
+    let (child, base_url) = spawn_on_disjoint_port(&mut command);
+    let mut daemon = TestDaemon {
+        child,
+        _temp: temp,
+        log_path,
+        base_url: base_url.clone(),
+    };
 
     let client = Client::builder()
         .no_proxy()
@@ -731,17 +798,7 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
         .build()
         .unwrap();
 
-    // Wait for readiness
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(resp) = client.get(&base_url).send().await {
-            if resp.status() == StatusCode::OK {
-                break;
-            }
-        }
-        assert!(Instant::now() < deadline, "daemon failed to become ready");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    daemon.wait_until_ready().await;
 
     let token = std::fs::read_to_string(&token_path)
         .expect("read auto-created private control token")
@@ -820,7 +877,7 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
     assert_eq!(blocked_folder.status(), StatusCode::BAD_REQUEST);
 
     // 6. Valid model folder with a real GGUF header is discovered read-only.
-    let model_dir = temp.path().join("my-models");
+    let model_dir = daemon._temp.path().join("my-models");
     std::fs::create_dir_all(&model_dir).unwrap();
     std::fs::write(
         model_dir.join("tiny-q4_k_m.gguf"),
@@ -964,7 +1021,4 @@ async fn permission_first_control_api_enforces_auth_consent_and_folder_sandbox()
             .len(),
         2
     );
-
-    let _ = child.kill();
-    let _ = child.wait();
 }

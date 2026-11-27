@@ -114,6 +114,125 @@ async fn route_local_when_model_loaded_locally() {
 }
 
 #[tokio::test]
+async fn latest_and_bare_aliases_select_the_exact_local_cid_before_discovery() {
+    let identity = NodeIdentity::generate();
+    let transport = Arc::new(MockDht::default());
+    let registry = Arc::new(ModelRegistry::new(identity.clone(), transport.clone()));
+    let remote = ModelRegistry::new(NodeIdentity::generate(), transport);
+    let policy = Arc::new(PolicyEngine::new_for_tests(
+        PolicyConfig::default(),
+        PolicyState::default(),
+    ));
+    let router = Router::new(
+        Some(Arc::new(EchoWorker::new())),
+        registry.clone(),
+        policy,
+        identity,
+        build_test_discovery(),
+    )
+    .with_remote_access(None, true);
+    let tagged = sample_caps("local-tag:latest", 2);
+    let bare = sample_caps("local-tag", 3);
+    remote.advertise_loaded(bare.clone()).await.unwrap();
+    registry.advertise_loaded(tagged.clone()).await.unwrap();
+    registry
+        .advertise_loaded(sample_caps("qwen3-mini", 1))
+        .await
+        .unwrap();
+
+    for local_only in [true, false] {
+        for (requested, cid) in [
+            ("local-tag", tagged.model_cid),
+            ("LOCAL-TAG:latest", tagged.model_cid),
+            ("qwen3-mini:latest", ModelCid([1; 32])),
+        ] {
+            let (decision, selected) = router.route_with_cid(requested, local_only).await;
+            assert!(matches!(decision.via, RouteVia::Local));
+            assert_eq!(selected, Some(cid));
+        }
+    }
+
+    registry.advertise_loaded(bare.clone()).await.unwrap();
+    for (requested, cid) in [
+        ("local-tag", bare.model_cid),
+        ("local-tag:latest", tagged.model_cid),
+    ] {
+        let (decision, selected) = router.route_with_cid(requested, false).await;
+        assert!(matches!(decision.via, RouteVia::Local));
+        assert_eq!(selected, Some(cid));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn enrollment_allows_its_issuer_to_serve_the_consumers_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let consumer_identity = NodeIdentity::generate();
+    let issuer_identity = NodeIdentity::generate();
+    let issuer_peer = peer_id_of(&issuer_identity);
+    let transport = Arc::new(MockDht::default());
+    let policy = Arc::new(PolicyEngine::new_for_tests(
+        PolicyConfig::default(),
+        PolicyState::default(),
+    ));
+    let consumer = ConsumerControl::open(
+        consumer_identity.clone(),
+        transport.clone(),
+        policy.clone(),
+        temp.path().join("consumer.json"),
+        temp.path().join("consumer.token"),
+    )
+    .unwrap();
+    let issuer = ConsumerControl::open(
+        issuer_identity.clone(),
+        transport.clone(),
+        Arc::new(PolicyEngine::new_for_tests(
+            PolicyConfig::default(),
+            PolicyState::default(),
+        )),
+        temp.path().join("issuer.json"),
+        temp.path().join("issuer.token"),
+    )
+    .unwrap();
+    let issuer_registry = ModelRegistry::new(issuer_identity, transport.clone());
+    let caps = sample_caps("enrolled-model", 4);
+    issuer_registry
+        .advertise_loaded(caps.clone())
+        .await
+        .unwrap();
+    let registry = Arc::new(ModelRegistry::new(consumer_identity.clone(), transport));
+    let router = Router::new(
+        None,
+        registry,
+        policy,
+        consumer_identity,
+        build_test_discovery(),
+    )
+    .with_remote_access(Some(consumer.clone()), false);
+    let cid = caps.model_cid.to_hex();
+    assert!(matches!(
+        router.route(&cid, false).await.via,
+        RouteVia::Refused { .. }
+    ));
+
+    let invitation = issuer.create_invitation(900).await.unwrap();
+    let server = issuer.spawn_server();
+    let status = consumer.enroll(&invitation.invitation).await.unwrap();
+    assert_eq!(status.state, "pending");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while consumer.enrollment_status().state != "authorized" {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("issuer approves enrollment");
+    server.abort();
+
+    let decision = router.route(&cid, false).await;
+    assert!(matches!(decision.via, RouteVia::Peer { peer_id } if peer_id == issuer_peer));
+    assert!(decision.fallback_peers.is_empty());
+}
+
+#[tokio::test]
 async fn route_refused_when_local_only_and_model_not_local() {
     let (router, _registry) = make_router_with_local_model().await;
     let decision = router.route("qwen3-big", true).await;
@@ -161,7 +280,7 @@ async fn route_refused_when_policy_pauses() {
 }
 
 #[tokio::test]
-async fn route_peer_when_dht_has_advertisement_and_local_does_not() {
+async fn open_network_opt_in_allows_dht_advertisers_that_are_refused_by_default() {
     // Build a registry whose DHT mock contains a third-party
     // advertisement for "qwen3-big" but does NOT have the model
     // locally loaded. The router should pick the peer.
@@ -204,17 +323,30 @@ async fn route_peer_when_dht_has_advertisement_and_local_does_not() {
     // through the peer branch even though the registry knows about
     // the model.
     let router = Router::new(None, registry, policy, identity, build_test_discovery());
+    let refused = router.route("qwen3-big", false).await;
+    assert!(matches!(
+        refused.via,
+        RouteVia::Refused { reason } if reason.contains("no authorized peers")
+    ));
+    assert!(refused.fallback_peers.is_empty());
 
+    let expected = peer_id_of(&foreign);
+    let stale_decision = RouteDecision {
+        via: RouteVia::Peer { peer_id: expected },
+        model_id: "qwen3-big".to_string(),
+        fallback_peers: Vec::new(),
+        explanation: String::new(),
+    };
+    let job = inference_manifest(&foreign, &cid.to_hex(), Some(4));
+    assert!(matches!(
+        router.execute(&stale_decision, job).await,
+        Err(RouterError::Refused { .. })
+    ));
+
+    let router = router.with_remote_access(None, true);
     let decision = router.route("qwen3-big", false).await;
     match &decision.via {
         RouteVia::Peer { peer_id } => {
-            // Re-derive the expected peer-id from the foreign
-            // identity to assert we picked the right one.
-            use phase_net::libp2p_identity::{ed25519, PublicKey};
-            let ed =
-                ed25519::PublicKey::try_from_bytes(&foreign.verifying_key().to_bytes()).unwrap();
-            let pk: PublicKey = ed.into();
-            let expected = PeerId::from(pk);
             assert_eq!(*peer_id, expected);
             // Header value should be "peer:<short>".
             let hv = decision.header_value().unwrap();
@@ -235,9 +367,10 @@ async fn route_carries_fallback_peers() {
     // Two foreign nodes both advertise "qwen3-big" under the same CID.
     let foreign_a = NodeIdentity::generate();
     let foreign_b = NodeIdentity::generate();
+    let unapproved = NodeIdentity::generate();
     let caps = sample_caps("qwen3-big", 9);
     let cid = caps.model_cid;
-    for foreign in [&foreign_a, &foreign_b] {
+    for foreign in [&foreign_a, &foreign_b, &unapproved] {
         let ad =
             crate::registry::SignedModelAdvertisement::sign(sample_caps("qwen3-big", 9), foreign)
                 .unwrap();
@@ -264,19 +397,51 @@ async fn route_carries_fallback_peers() {
         PolicyConfig::default(),
         PolicyState::default(),
     ));
-    let router = Router::new(None, registry, policy, identity, build_test_discovery());
+    let temp = tempfile::tempdir().unwrap();
+    let evidence = Arc::new(
+        EvidenceRuntime::open(temp.path().join("evidence.log"), peer_id_of(&identity)).unwrap(),
+    );
+    let approved = [peer_id_of(&foreign_a), peer_id_of(&foreign_b)];
+    for peer in approved {
+        evidence
+            .set_operator_override(
+                peer,
+                OperatorOverride {
+                    pinned: true,
+                    blocked: false,
+                },
+            )
+            .unwrap();
+    }
+    let router = Router::new(None, registry, policy, identity, build_test_discovery())
+        .with_evidence_runtime(evidence.clone());
 
     let decision = router.route("qwen3-big", false).await;
     match &decision.via {
-        RouteVia::Peer { .. } => {
-            assert!(
-                !decision.fallback_peers.is_empty(),
-                "two advertisements should yield at least one fallback peer, got {:?}",
-                decision.fallback_peers
+        RouteVia::Peer { peer_id } => {
+            assert!(approved.contains(peer_id));
+            assert_eq!(
+                decision.fallback_peers,
+                approved
+                    .into_iter()
+                    .filter(|id| id != peer_id)
+                    .collect::<Vec<_>>()
             );
         }
         other => panic!("expected Peer, got {:?}", other),
     }
+    evidence
+        .set_operator_override(
+            approved[0],
+            OperatorOverride {
+                pinned: true,
+                blocked: true,
+            },
+        )
+        .unwrap();
+    let decision = router.route("qwen3-big", false).await;
+    assert!(matches!(decision.via, RouteVia::Peer { peer_id } if peer_id == approved[1]));
+    assert!(decision.fallback_peers.is_empty());
 }
 
 #[tokio::test]
@@ -1505,7 +1670,7 @@ async fn sec06_concurrency_cap_rejects_n_plus_one() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn v1_and_v2_share_one_remote_concurrency_gate() {
     #[derive(Clone)]
     struct BlockingWorker {
@@ -1562,8 +1727,8 @@ async fn v1_and_v2_share_one_remote_concurrency_gate() {
                 schema_version: JOB_RELAY_STREAM_SCHEMA_VERSION,
                 job_id: v2_job_id,
                 payload: v2_payload,
-                deadline_unix_ms: unix_time_ms() + 5_000,
-                idle_timeout_ms: 1_000,
+                deadline_unix_ms: unix_time_ms() + 60_000,
+                idle_timeout_ms: 30_000,
             },
             controls_rx,
             frames_tx,
@@ -1578,13 +1743,36 @@ async fn v1_and_v2_share_one_remote_concurrency_gate() {
         JobRelayResponse::Err { ref reason } if reason.contains("busy")
     ));
 
-    worker_gate.add_permits(1);
-    let accepted = tokio::time::timeout(Duration::from_secs(1), frames_rx.recv())
+    let accepted = tokio::time::timeout(Duration::from_secs(16), frames_rx.recv())
         .await
         .expect("v2 unblocks")
         .expect("v2 sends decision");
     assert!(matches!(accepted.kind, JobRelayStreamFrameKind::Accepted));
-    while frames_rx.recv().await.is_some() {}
+    assert_eq!(accepted.sequence, 0);
+    for sequence in 1..=2 {
+        let frame = tokio::time::timeout(Duration::from_secs(16), frames_rx.recv())
+            .await
+            .expect("keepalive arrives before the idle deadline")
+            .expect("v2 emits a loading update");
+        assert_eq!(frame.sequence, sequence);
+        let JobRelayStreamFrameKind::Event {
+            payload,
+            terminal: false,
+        } = frame.kind
+        else {
+            panic!("expected nonterminal progress, got {:?}", frame.kind);
+        };
+        assert!(matches!(
+            serde_json::from_slice::<JobEvent>(&payload).unwrap(),
+            JobEvent::Progress(progress) if progress.kind == "model_load"
+        ));
+    }
+    worker_gate.add_permits(1);
+    let mut receipt_seen = false;
+    while let Some(frame) = frames_rx.recv().await {
+        receipt_seen |= matches!(frame.kind, JobRelayStreamFrameKind::Receipt { .. });
+    }
+    assert!(receipt_seen, "cold load should finish with a receipt");
     v2_task.await.expect("v2 handler exits and releases permit");
 }
 
@@ -1825,7 +2013,8 @@ async fn v2_two_peer_router_streams_before_completion_and_verifies_receipt() {
         client_policy,
         client_identity.clone(),
         client_net,
-    );
+    )
+    .with_remote_access(None, true);
     let manifest = {
         use phase_manifest::ManifestBuilder;
         use phase_protocol::{ChatMessage, ChatRole, InferenceJobSpec, SamplingParams};

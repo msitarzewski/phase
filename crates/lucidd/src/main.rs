@@ -297,10 +297,13 @@ struct Cli {
     #[arg(long = "block-peer", value_name = "PEER_ID")]
     blocked_peers: Vec<String>,
 
-    /// Locally pin a serving PeerId in reputation assessment. Repeatable;
-    /// an explicit block always wins if both are configured.
+    /// Authorize and prefer a serving PeerId. Repeatable; an explicit block wins.
     #[arg(long = "pin-peer", value_name = "PEER_ID")]
     pinned_peers: Vec<String>,
+
+    /// Allow sending jobs to unenrolled, unpinned peers for open-network testing.
+    #[arg(long)]
+    allow_open_peers: bool,
 
     /// Durable signed-alias rollback/equivocation checkpoint. Defaults to a
     /// private sidecar of the persistent identity path.
@@ -1596,6 +1599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_identity.clone(),
             discovery.clone(),
         )
+        .with_remote_access(Some(consumer.clone()), cli.allow_open_peers)
         .with_evidence_runtime(evidence)
         .with_redundant_verification(redundant_config),
     );
@@ -1681,7 +1685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: tokio::time::Instant::now(),
         shard_stage_bridge_port: cli.shard_stage_bridge_port,
     };
-    let app = ollama_router(state);
+    let app = ollama_router(state, addr.ip().to_canonical().is_loopback());
 
     tracing::info!(%addr, "lucidd listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1869,11 +1873,12 @@ async fn run_cli_subcommand(
             })
             .await?;
             println!(
-                "Model: {} | Requests: {}/{} ok | Verified receipts: {} | Throughput: {:.2} jobs/s ({:.1} tok/s, {:.1} chunks/s)",
+                "Model: {} | Requests: {}/{} ok | Peer-verified receipts: {} | Local commitments: {} | Throughput: {:.2} jobs/s ({:.1} self-reported tok/s, {:.1} chunks/s)",
                 report.model,
                 report.succeeded,
                 report.total_requests,
                 report.receipt_verified_count,
+                report.local_commitments,
                 report.jobs_per_second,
                 report.tokens_per_second,
                 report.chunks_per_second

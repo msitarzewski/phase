@@ -23,8 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_stream::stream;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    extract::{DefaultBodyLimit, Request, State},
+    http::{header, uri::Authority, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -44,7 +45,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::content::{ContentError, PullProgress, PullSelection};
 use crate::router::{
-    ReceiptVerification, RouteDecision, RouteVia, Router as LucidRouter, RouterError,
+    find_local_model_by_alias, ReceiptVerification, RouteDecision, RouteVia, Router as LucidRouter,
+    RouterError,
 };
 
 /// Explicit caller-signed generation bound for Ollama requests that omit
@@ -363,52 +365,52 @@ fn refused_response(reason: &str) -> Response {
         .into_response()
 }
 
-async fn resolve_job_model_cid(state: &AppState, model: &str) -> Result<String, Box<Response>> {
-    match state.registry.resolve_model_cid(model).await {
-        Ok(Some(cid)) => return Ok(cid.to_hex()),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                model = %sanitize_for_log(model),
-                error = %error,
-                "verified model CID resolution failed"
-            );
-            return Err(Box::new(refused_response("model CID resolution failed")));
-        }
+async fn route_job(
+    state: &AppState,
+    model: &str,
+    local_only: bool,
+) -> Result<(RouteDecision, String), Box<Response>> {
+    let (decision, cid) = state.router.route_with_cid(model, local_only).await;
+    if let RouteVia::Refused { reason } = &decision.via {
+        tracing::info!(model = %sanitize_for_log(model), "router refused HTTP model request");
+        return Err(Box::new(refused_response(reason)));
     }
-    // Ollama-imported models often carry an explicit `:latest` tag in their
-    // manifest alias while Ollama routing normalizes `:latest` away. Check
-    // both `<model>:latest` and the verified network model cache before refusing.
-    if !model.contains(':') {
-        let with_latest = format!("{model}:latest");
-        if let Ok(Some(cid)) = state.registry.resolve_model_cid(&with_latest).await {
-            return Ok(cid.to_hex());
-        }
-        if let Some(net) = state
-            .registry
-            .cached_network_models()
-            .await
-            .into_iter()
-            .find(|m| m.caps.model_id == model || m.caps.model_id == with_latest)
-        {
-            return Ok(net.caps.model_cid.to_hex());
-        }
-    } else if let Some(net) = state
-        .registry
-        .cached_network_models()
-        .await
-        .into_iter()
-        .find(|m| m.caps.model_id == model)
-    {
-        return Ok(net.caps.model_cid.to_hex());
-    }
-    Err(Box::new(refused_response(&format!(
-        "model '{model}' has no verified local or signed network CID mapping"
-    ))))
+    let cid = cid.ok_or_else(|| Box::new(refused_response("model CID resolution failed")))?;
+    Ok((decision, cid.to_hex()))
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
+fn is_loopback_authority(authority: &Authority) -> bool {
+    let host = authority.host();
+    if !host.eq_ignore_ascii_case("localhost") && !matches!(host, "127.0.0.1" | "[::1]") {
+        return false;
+    }
+    match authority.as_str().strip_prefix(host) {
+        Some("") => true,
+        Some(suffix) => suffix.starts_with(':') && authority.port_u16().is_some(),
+        None => false,
+    }
+}
+
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host_allowed = hosts
+        .next()
+        .and_then(|host| Authority::try_from(host.as_bytes()).ok())
+        .is_some_and(|host| is_loopback_authority(&host));
+    if !host_allowed
+        || hosts.next().is_some()
+        || request
+            .uri()
+            .authority()
+            .is_some_and(|authority| !is_loopback_authority(authority))
+    {
+        return (StatusCode::FORBIDDEN, "A loopback Host header is required").into_response();
+    }
+    next.run(request).await
+}
+
+pub fn router(state: AppState, loopback_bind: bool) -> Router {
+    let app = Router::new()
         .route("/api/chat", post(handle_chat))
         .route("/api/generate", post(handle_generate))
         .route("/api/version", get(handle_version))
@@ -472,7 +474,12 @@ pub fn router(state: AppState) -> Router {
         .fallback(unknown)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(loopback_cors())
-        .with_state(state)
+        .with_state(state);
+    if loopback_bind {
+        app.layer(middleware::from_fn(require_loopback_host))
+    } else {
+        app
+    }
 }
 
 /// Max length of a sanitized log field (SEC-10). A 10 KB request path
@@ -2117,7 +2124,7 @@ async fn resolve_local_model_caps(
                 Err(_) => return Ok(None),
             };
             let alias = normalized.strip_suffix(":latest").unwrap_or(&normalized);
-            if let Some(caps) = local_models.iter().find(|caps| caps.model_id == alias) {
+            if let Some(caps) = find_local_model_by_alias(&local_models, &normalized) {
                 return Ok(Some(caps.clone()));
             }
             state.registry.resolve_model_cid(alias).await?
@@ -2310,13 +2317,10 @@ async fn handle_generate(
 
     // Route decision. Refusals short-circuit to 503 without ever
     // touching the worker.
-    let routing_model = ollama_routing_model_name(&model);
-    let decision = state.router.route(&routing_model, local_only).await;
-    if let RouteVia::Refused { reason } = &decision.via {
-        // SEC-10: model is attacker-controlled (request body); sanitize.
-        tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/generate");
-        return refused_response(reason);
-    }
+    let (decision, model_cid) = match route_job(&state, &model, local_only).await {
+        Ok(route) => route,
+        Err(response) => return *response,
+    };
     let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
@@ -2324,10 +2328,6 @@ async fn handle_generate(
         route_explanation = %route_explanation,
         "HTTP generate route selected"
     );
-    let model_cid = match resolve_job_model_cid(&state, &routing_model).await {
-        Ok(cid) => cid,
-        Err(response) => return *response,
-    };
     let (sampling, max_tokens) = match parse_ollama_options(req.options.as_ref()) {
         Ok(options) => options,
         Err(error) => return invalid_request_response(&error),
@@ -2536,13 +2536,10 @@ async fn handle_chat(
 
     // Route decision (M5). Refusals short-circuit to 503 before we
     // build a manifest or touch a worker.
-    let routing_model = ollama_routing_model_name(&model);
-    let decision: RouteDecision = state.router.route(&routing_model, local_only).await;
-    if let RouteVia::Refused { reason } = &decision.via {
-        // SEC-10: model is attacker-controlled (request body); sanitize.
-        tracing::info!(model = %sanitize_for_log(&model), reason = %reason, "router refused /api/chat");
-        return refused_response(reason);
-    }
+    let (decision, model_cid) = match route_job(&state, &model, local_only).await {
+        Ok(route) => route,
+        Err(response) => return *response,
+    };
     let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
@@ -2550,10 +2547,6 @@ async fn handle_chat(
         route_explanation = %route_explanation,
         "HTTP chat route selected"
     );
-    let model_cid = match resolve_job_model_cid(&state, &routing_model).await {
-        Ok(cid) => cid,
-        Err(response) => return *response,
-    };
     let (sampling, max_tokens) = match parse_ollama_options(req.options.as_ref()) {
         Ok(options) => options,
         Err(error) => return invalid_request_response(&error),
@@ -2898,13 +2891,7 @@ async fn run_embedding(
 
     // Route decision. Refusals short-circuit to 503 before we build a
     // manifest or touch a worker — identical to handle_chat.
-    let routing_model = ollama_routing_model_name(model);
-    let decision: RouteDecision = state.router.route(&routing_model, local_only).await;
-    if let RouteVia::Refused { reason } = &decision.via {
-        // SEC-10: model is attacker-controlled (request body); sanitize.
-        tracing::info!(model = %sanitize_for_log(model), reason = %reason, "router refused /api/embed");
-        return Err(Box::new(refused_response(reason)));
-    }
+    let (decision, model_cid) = route_job(state, model, local_only).await?;
     let routed_via = public_routed_via(&decision);
     let route_explanation = public_route_explanation(&decision.explanation);
     tracing::info!(
@@ -2912,8 +2899,6 @@ async fn run_embedding(
         route_explanation = %route_explanation,
         "HTTP embedding route selected"
     );
-    let model_cid = resolve_job_model_cid(state, &routing_model).await?;
-
     let expected_output_count = input.len();
     let job_spec = JobSpec::Embedding(phase_protocol::EmbeddingJobSpec { model_cid, input });
 
