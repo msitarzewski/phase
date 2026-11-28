@@ -191,12 +191,25 @@ impl AppController {
             token_path,
             daemon_sha256,
         });
-        drop(guard);
 
-        // Wait up to 20s for loopback /api/version to respond.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // Hold `guard` while waiting for loopback `/api/version` so concurrent
+        // UI polls wait cleanly instead of racing an unready socket. Allow up
+        // to 120s because initial startup may SHA-256 verify multi-GB local
+        // GGUF models before binding HTTP, while failing fast if the child exits.
+        let log_path = self.state_dir.join("lucidd.log");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let health_url = format!("http://127.0.0.1:{port}/api/version");
         while tokio::time::Instant::now() < deadline {
+            if let Some(d) = guard.as_mut() {
+                if let Some(status) = d.child.try_wait()? {
+                    drop(guard);
+                    self.stop_daemon().await;
+                    bail!(
+                        "LUCID local engine exited during startup ({status}). See {}",
+                        log_path.display()
+                    );
+                }
+            }
             if let Ok(resp) = self.http.get(&health_url).send().await {
                 if resp.status().is_success() {
                     return Ok((port, token));
@@ -204,8 +217,12 @@ impl AppController {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        drop(guard);
         self.stop_daemon().await;
-        bail!("LUCID local engine did not become ready in time");
+        bail!(
+            "LUCID local engine did not become ready in time. See {}",
+            log_path.display()
+        );
     }
 
     async fn stop_daemon(&self) {
