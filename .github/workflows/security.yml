@@ -188,6 +188,7 @@ jobs:
               'Contents/Info.plist', 'Contents/MacOS/Lucid',
               'Contents/Helpers/lucidd', 'Contents/Resources/build-info.json',
               'Contents/Resources/Phase-LICENSE', 'Contents/Resources/AppIcon.icns',
+              'Contents/Resources/Assets.car',
               'Contents/_CodeSignature/CodeResources',
           }
           assert {str(p.relative_to(app)) for p in app.rglob('*') if p.is_file()} == expected_files
