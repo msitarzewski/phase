@@ -516,6 +516,37 @@ fn validate_llama_rpc_cli(cli: &Cli) -> Result<Vec<PeerId>, String> {
     .map_err(|error| error.to_string())
 }
 
+/// Resolve the effective Tier-1 RPC peer list and tensor split.
+/// Explicit CLI offload flags always win; otherwise, when the local worker is
+/// `llama-cpp` and `node.toml` has `cluster_enabled = true` plus saved
+/// `cluster_rpc_peers`, those persisted settings activate automatically.
+fn resolve_effective_rpc_offload(
+    cli: &Cli,
+    node_cfg: &lucidd::node_config::NodeConfig,
+    worker_choice: Option<WorkerChoice>,
+) -> Result<(Vec<PeerId>, Option<String>), String> {
+    let cli_peers = validate_llama_rpc_cli(cli)?;
+    let has_cli_offload = !cli.llama_rpc_servers.is_empty()
+        || !cli.llama_rpc_peers.is_empty()
+        || cli.llama_tensor_split.is_some();
+    if has_cli_offload {
+        return Ok((cli_peers, cli.llama_tensor_split.clone()));
+    }
+    if worker_choice == Some(WorkerChoice::LlamaCpp)
+        && node_cfg.cluster_enabled
+        && !node_cfg.cluster_rpc_peers.is_empty()
+    {
+        let peers = lucidd::worker_llama::rpc_peers::validate_rpc_offload_cli(
+            &[],
+            &node_cfg.cluster_rpc_peers,
+            node_cfg.cluster_tensor_split.as_deref(),
+        )
+        .map_err(|error| format!("invalid persisted cluster_rpc_peers in node.toml: {error}"))?;
+        return Ok((peers, node_cfg.cluster_tensor_split.clone()));
+    }
+    Ok((Vec::new(), None))
+}
+
 /// SEC-09: validate one TXT-derived bootstrap string. Returns `Some` only
 /// for a multiaddr that (a) starts with `/` (multiaddr shape) and (b)
 /// pins a `/p2p/<peer-id>` component. The PeerID pin is what makes a
@@ -1055,8 +1086,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     // Tier-1 RPC offload flags fail fast, before any identity, DNS, libp2p,
-    // or HTTP listener is opened.
-    let llama_rpc_peers = validate_llama_rpc_cli(&cli)?;
+    // or HTTP listener is opened. Explicit CLI flags always win; otherwise,
+    // when the operator opted into `cluster_enabled = true` and saved helper
+    // peers in `node.toml`, load them for the local `llama-cpp` worker.
+    let (llama_rpc_peers, effective_tensor_split) =
+        resolve_effective_rpc_offload(&cli, &node_cfg, worker_choice)?;
     if !llama_rpc_peers.is_empty() && worker_choice != Some(WorkerChoice::LlamaCpp) {
         return Err("--llama-rpc-peers requires a llama-cpp worker (--worker llama-cpp)".into());
     }
@@ -1569,7 +1603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     extra_env,
                     rpc_servers: cli.llama_rpc_servers.clone(),
                     rpc_peer_offload,
-                    tensor_split: cli.llama_tensor_split.clone(),
+                    tensor_split: effective_tensor_split.clone(),
                     // Layer offload ships prompt-derived activations to RPC
                     // peers, so it follows the live `cluster_enabled` opt-in.
                     rpc_cluster_gate: Some(lucidd::worker_llama::RpcClusterGate::from_node_config(
@@ -2775,5 +2809,47 @@ mod tests {
         assert_eq!(cfg.approved_model_sources[1].name, "gemma3");
         // Idempotent on second call.
         assert_eq!(backfill_legacy_approved_sources(&mut cfg, &discovered), 0);
+    }
+
+    #[test]
+    fn resolve_effective_rpc_offload_uses_node_config_only_when_cluster_enabled_and_cli_unset() {
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let cli = Cli::try_parse_from(["lucidd"]).unwrap();
+
+        // Disabled cluster_enabled keeps local-only mode even with saved peers.
+        let mut cfg = lucidd::node_config::NodeConfig {
+            cluster_enabled: false,
+            cluster_rpc_peers: vec![peer_a.to_string(), peer_b.to_string()],
+            cluster_tensor_split: Some("10,10,80".into()),
+            ..Default::default()
+        };
+        let (peers, split) =
+            resolve_effective_rpc_offload(&cli, &cfg, Some(WorkerChoice::LlamaCpp)).unwrap();
+        assert!(peers.is_empty());
+        assert!(split.is_none());
+
+        // Enabled cluster_enabled activates persisted peers + split for llama-cpp.
+        cfg.cluster_enabled = true;
+        let (peers, split) =
+            resolve_effective_rpc_offload(&cli, &cfg, Some(WorkerChoice::LlamaCpp)).unwrap();
+        assert_eq!(peers, vec![peer_a, peer_b]);
+        assert_eq!(split.as_deref(), Some("10,10,80"));
+
+        // Explicit CLI flag overrides node.toml.
+        let peer_c = PeerId::random();
+        let cli_override = Cli::try_parse_from([
+            "lucidd",
+            "--llama-rpc-peers",
+            &peer_c.to_string(),
+            "--llama-tensor-split",
+            "20,80",
+        ])
+        .unwrap();
+        let (peers, split) =
+            resolve_effective_rpc_offload(&cli_override, &cfg, Some(WorkerChoice::LlamaCpp))
+                .unwrap();
+        assert_eq!(peers, vec![peer_c]);
+        assert_eq!(split.as_deref(), Some("20,80"));
     }
 }

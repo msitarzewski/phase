@@ -43,7 +43,23 @@
   let clusterLoading = $state(false);
   let clusterError = $state<string | null>(null);
   let clusterRequest = 0;
+  let clusterSelectedPeers = $state<Record<string, boolean>>({});
+  let clusterSplitDraft = $state("");
   let clusterStatus = $derived(clusterResponse?.status ?? null);
+  let clusterHelperCandidates = $derived.by(() => {
+    const map = new Map<string, PeerEntry>();
+    for (const peer of clusterStatus?.connected_peers ?? []) {
+      if (peer.authorized === true) {
+        map.set(peer.peer_id, peer);
+      }
+    }
+    for (const savedId of clusterStatus?.cluster_rpc_peers ?? []) {
+      if (!map.has(savedId)) {
+        map.set(savedId, { peer_id: savedId, path: null, authorized: true });
+      }
+    }
+    return [...map.values()];
+  });
   let clusterMemory = $derived(formatBytes(clusterStatus?.local_node?.available_memory_bytes ?? 0, true));
   let deviceEnrollment = $derived(enrollmentLabel(overview?.status.enrollment?.state));
   let showSettingsModal = $state(false);
@@ -339,7 +355,15 @@
     clusterLoading = true;
     try {
       const response = await lucidApi.getClusterStatus();
-      if (request === clusterRequest) clusterResponse = response;
+      if (request === clusterRequest) {
+        clusterResponse = response;
+        const selected: Record<string, boolean> = {};
+        for (const id of response.status.cluster_rpc_peers ?? []) {
+          selected[id] = true;
+        }
+        clusterSelectedPeers = selected;
+        clusterSplitDraft = response.status.cluster_tensor_split ?? "";
+      }
     } catch {
       if (request === clusterRequest) clusterError = "Cluster status could not be loaded.";
     } finally {
@@ -354,12 +378,48 @@
       busy = true;
       clusterError = null;
       const next = !enabled;
+      const hasSavedHelpers = (clusterStatus?.cluster_rpc_peers?.length ?? 0) > 0;
       await lucidApi.updateSettings({ cluster_enabled: next });
+      if (hasSavedHelpers) {
+        overview = await lucidApi.restartDaemon();
+      } else {
+        await refresh();
+      }
       if (showClusterModal) await loadClusterStatus();
-      await refresh();
       showToast(next ? "Trusted-Circle cluster enabled" : "Trusted-Circle cluster disabled");
     } catch {
       if (showClusterModal) clusterError = "The cluster setting could not be changed.";
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function handleSaveClusterHelpers() {
+    try {
+      busy = true;
+      clusterError = null;
+      const peers = clusterHelperCandidates
+        .map((p) => p.peer_id)
+        .filter((id) => Boolean(clusterSelectedPeers[id]));
+      const split = peers.length > 0 && clusterSplitDraft.trim().length > 0
+        ? clusterSplitDraft.trim()
+        : null;
+      await lucidApi.updateSettings({
+        cluster_enabled: peers.length > 0 ? true : (clusterStatus?.cluster_enabled ?? false),
+        cluster_rpc_peers: peers,
+        cluster_tensor_split: split,
+      });
+      overview = await lucidApi.restartDaemon();
+      if (showClusterModal) await loadClusterStatus();
+      showToast(
+        peers.length > 0
+          ? `Sliced cluster active with ${peers.length} helper${peers.length === 1 ? "" : "s"}`
+          : "Returned to single-device mode"
+      );
+    } catch (err) {
+      if (showClusterModal) {
+        clusterError = err instanceof Error ? err.message : "Could not save GPU helper settings.";
+      }
     } finally {
       busy = false;
     }
@@ -909,14 +969,77 @@
             {/if}
           </div>
 
-          {#if clusterStatus.trust_label === "trusted-circle-sharded" || clusterResponse?.response_trust_label}
+          {#if clusterStatus.trust_label === "trusted-circle-sharded" || clusterResponse?.response_trust_label || clusterStatus.active_rpc_offload}
             <div class="cluster-labels">
+              {#if clusterStatus.active_rpc_offload}
+                <span>Worker offload <span class="chip sharing">Active ({clusterStatus.cluster_rpc_peers?.length ?? 0} helper{(clusterStatus.cluster_rpc_peers?.length ?? 0) === 1 ? "" : "s"})</span></span>
+              {/if}
               {#if clusterStatus.trust_label === "trusted-circle-sharded"}
                 <span>Cluster mode <span class="chip">{clusterStatus.trust_label}</span></span>
               {/if}
               {#if clusterResponse?.response_trust_label}
                 <span>API response <span class="chip">{clusterResponse.response_trust_label}</span></span>
               {/if}
+            </div>
+          {/if}
+        </section>
+
+        <section class="card compact" aria-labelledby="cluster-helpers-title">
+          <h3 class="row-label" id="cluster-helpers-title">GPU helpers for sliced chat</h3>
+          <p class="row-help">
+            Select authorized circle devices to split one model across multiple GPUs over
+            encrypted peer tunnels. Helpers must also have Tier 1 enabled.
+          </p>
+          {#if clusterHelperCandidates.length === 0}
+            <p class="row-help">
+              No authorized circle devices connected yet. Use Join Invite or Share Invite to pair
+              your other machines first.
+            </p>
+          {:else}
+            <ul class="peer-list connection-list">
+              {#each clusterHelperCandidates as peer (peer.peer_id)}
+                <li class="peer-row">
+                  <label class="toggle-row" style="gap: 8px; cursor: pointer;">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(clusterSelectedPeers[peer.peer_id])}
+                      onchange={(e) => {
+                        clusterSelectedPeers = {
+                          ...clusterSelectedPeers,
+                          [peer.peer_id]: e.currentTarget.checked,
+                        };
+                      }}
+                      disabled={busy}
+                    />
+                    <span class="mono">{shortPeerId(peer.peer_id)}</span>
+                  </label>
+                  <span class="peer-badges">
+                    <span class="chip sharing">Circle authorized</span>
+                    {#if peer.path}
+                      <span class="chip">{connectionPathLabel(peer.path)}</span>
+                    {:else}
+                      <span class="chip">Saved</span>
+                    {/if}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+            <div class="field-row" style="margin-top: 10px;">
+              <label class="row-help" for="cluster-split-input">
+                Optional tensor split (helpers in order, then this device — e.g. 10,10,80)
+              </label>
+              <input
+                id="cluster-split-input"
+                type="text"
+                placeholder="Auto (or e.g. 10,10,80)"
+                bind:value={clusterSplitDraft}
+                disabled={busy}
+              />
+            </div>
+            <div style="margin-top: 10px; display: flex; justify-content: flex-end;">
+              <button class="primary" disabled={busy} onclick={handleSaveClusterHelpers}>
+                Save Helpers &amp; Restart Service
+              </button>
             </div>
           {/if}
         </section>

@@ -128,6 +128,9 @@ export interface ClusterNodeInfo {
 
 export interface ClusterStatus {
   cluster_enabled?: boolean | null;
+  cluster_rpc_peers?: string[] | null;
+  cluster_tensor_split?: string | null;
+  active_rpc_offload?: boolean | null;
   trust_label?: string | null;
   local_node?: ClusterNodeInfo | null;
   connected_peers?: PeerEntry[] | null;
@@ -180,6 +183,8 @@ export const lucidApi = {
     auto_pause_on_battery?: boolean;
     thermal_limit_c?: number | null;
     cluster_enabled?: boolean;
+    cluster_rpc_peers?: string[];
+    cluster_tensor_split?: string | null;
     chat_app_url?: string;
   }) => invoke<DaemonStatus>("update_settings", { settings }),
   createInvite: (ttlSeconds = 1800) => invoke<InviteResponse>("create_invite", { ttlSeconds }),

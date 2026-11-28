@@ -313,6 +313,8 @@ struct SettingsPatch {
     auto_pause_on_battery: Option<bool>,
     thermal_limit_c: Option<Option<f32>>,
     cluster_enabled: Option<bool>,
+    cluster_rpc_peers: Option<Vec<String>>,
+    cluster_tensor_split: Option<Option<String>>,
     chat_app_url: Option<String>,
 }
 
@@ -496,6 +498,8 @@ async fn update_settings(
             "auto_pause_on_battery": settings.auto_pause_on_battery,
             "thermal_limit_c": settings.thermal_limit_c,
             "cluster_enabled": settings.cluster_enabled,
+            "cluster_rpc_peers": settings.cluster_rpc_peers,
+            "cluster_tensor_split": settings.cluster_tensor_split,
         }),
         Duration::from_secs(10),
     )

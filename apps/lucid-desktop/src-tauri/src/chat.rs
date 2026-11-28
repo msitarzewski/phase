@@ -310,7 +310,9 @@ async fn read_chat_stream(
     let initial = ChatEvidence {
         routed_via,
         trust_label: match response_trust_label(headers) {
-            label @ (Some("local") | Some("remote-pending")) => label,
+            label @ (Some("local") | Some("remote-pending") | Some("trusted-circle-sharded")) => {
+                label
+            }
             _ => None,
         },
         // Only the terminal frame can report a verified receipt.

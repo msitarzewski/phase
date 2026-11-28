@@ -1352,6 +1352,10 @@ struct SettingsUpdateRequest {
     serve_model_content: Option<bool>,
     #[serde(default)]
     cluster_enabled: Option<bool>,
+    #[serde(default)]
+    cluster_rpc_peers: Option<Vec<String>>,
+    #[serde(default)]
+    cluster_tensor_split: Option<Option<String>>,
 }
 
 async fn handle_control_settings(
@@ -1371,6 +1375,8 @@ async fn handle_control_settings(
         }
     }
 
+    let local_peer_id = state.discovery.local_peer_id().to_string();
+    let prev_cfg = state.node_config.snapshot();
     let node_cfg = match state.node_config.update(|cfg| {
         if let Some(done) = req.onboarding_completed {
             cfg.onboarding_completed = done;
@@ -1380,6 +1386,25 @@ async fn handle_control_settings(
         }
         if let Some(cluster) = req.cluster_enabled {
             cfg.cluster_enabled = cluster;
+        }
+        if let Some(peers) = req.cluster_rpc_peers.clone() {
+            let cleaned: Vec<String> = peers
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if cleaned.iter().any(|p| p == &local_peer_id) {
+                anyhow::bail!("cluster_rpc_peers must not include this device's own PeerId");
+            }
+            if cleaned.is_empty() && req.cluster_tensor_split.is_none() {
+                cfg.cluster_tensor_split = None;
+            }
+            cfg.cluster_rpc_peers = cleaned;
+        }
+        if let Some(split_opt) = req.cluster_tensor_split.clone() {
+            cfg.cluster_tensor_split = split_opt
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
         }
         Ok(())
     }) {
@@ -1391,6 +1416,10 @@ async fn handle_control_settings(
             );
         }
     };
+    let rpc_config_changed = node_cfg.cluster_rpc_peers != prev_cfg.cluster_rpc_peers
+        || node_cfg.cluster_tensor_split != prev_cfg.cluster_tensor_split
+        || (node_cfg.cluster_enabled != prev_cfg.cluster_enabled
+            && !node_cfg.cluster_rpc_peers.is_empty());
 
     let pol_cfg = match state.policy.update_config(|pol| {
         if let Some(pause) = req.manual_pause {
@@ -1418,6 +1447,9 @@ async fn handle_control_settings(
             "onboarding_completed": node_cfg.onboarding_completed,
             "serve_model_content": node_cfg.serve_model_content,
             "cluster_enabled": node_cfg.cluster_enabled,
+            "cluster_rpc_peers": node_cfg.cluster_rpc_peers,
+            "cluster_tensor_split": node_cfg.cluster_tensor_split,
+            "restart_required": rpc_config_changed,
             "policy": {
                 "manual_pause": pol_cfg.manual_pause,
                 "auto_pause_on_battery": pol_cfg.auto_pause_on_battery,
@@ -1491,6 +1523,9 @@ async fn handle_control_cluster(State(state): State<AppState>, headers: HeaderMa
         StatusCode::OK,
         serde_json::json!({
             "cluster_enabled": node_cfg.cluster_enabled,
+            "cluster_rpc_peers": node_cfg.cluster_rpc_peers,
+            "cluster_tensor_split": node_cfg.cluster_tensor_split,
+            "active_rpc_offload": state.router.local_worker_uses_rpc_offload(),
             "shard_stage_bridge_configured": state.shard_stage_bridge_port.is_some(),
             "trust_tier": "trusted-circle",
             "trust_label": crate::shard_plan::ShardTrustTier::TrustedCircle.trust_label(),

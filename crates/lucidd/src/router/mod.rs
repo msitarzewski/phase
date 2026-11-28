@@ -377,6 +377,10 @@ impl Router {
         self
     }
 
+    pub fn local_worker_uses_rpc_offload(&self) -> bool {
+        self.local_worker_uses_rpc_offload
+    }
+
     /// Attach local evidence-based ordering without changing existing callers.
     pub fn with_evidence_runtime(mut self, evidence: Arc<EvidenceRuntime>) -> Self {
         let expected_observer = node_identity_peer_id(&self.identity);

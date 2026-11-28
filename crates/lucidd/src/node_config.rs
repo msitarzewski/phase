@@ -72,6 +72,13 @@ pub struct NodeConfig {
     /// Explicit opt-in for Tier-1 Trusted-Circle pipeline sharding (`ShardWorker`).
     /// Always `false` on a brand-new machine until the operator consents.
     pub cluster_enabled: bool,
+    /// Ordered list of enrolled PeerIds to use as Tier-1 Trusted-Circle GPU
+    /// helpers over `/phase/shard-rpc/1.0.0` when `cluster_enabled` is `true`
+    /// and no explicit CLI `--llama-rpc-peers` / `--llama-rpc-servers` are set.
+    pub cluster_rpc_peers: Vec<String>,
+    /// Optional comma-separated GPU layer split ratios (`--tensor-split`, e.g.
+    /// `10,10,80`) paired with `cluster_rpc_peers` (RPC peers first, then local).
+    pub cluster_tensor_split: Option<String>,
     /// Optional custom relay/bootstrap multiaddrs (empty = use default
     /// `bootstrap.phasebased.net` DNS TXT discovery).
     pub bootstrap_peers: Vec<String>,
@@ -91,6 +98,8 @@ impl Default for NodeConfig {
             llama_server_sha256: None,
             serve_model_content: false,
             cluster_enabled: false,
+            cluster_rpc_peers: Vec::new(),
+            cluster_tensor_split: None,
             bootstrap_peers: Vec::new(),
         }
     }
@@ -290,6 +299,12 @@ fn validate_node_config(cfg: &NodeConfig) -> Result<()> {
             bail!("llama_server_binary must be an absolute path");
         }
     }
+    crate::worker_llama::rpc_peers::validate_rpc_offload_cli(
+        &[],
+        &cfg.cluster_rpc_peers,
+        cfg.cluster_tensor_split.as_deref(),
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))?;
     Ok(())
 }
 
