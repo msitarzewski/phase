@@ -16,6 +16,7 @@ export interface DaemonStatus {
   running: boolean;
   state: string;
   peer_count: number;
+  authorized_peer_count?: number;
   active_path: string;
   model_count: number;
   api_address: string;
@@ -88,6 +89,7 @@ export interface ModelEntry {
   available_locally: boolean;
   providing: boolean;
   can_request: boolean;
+  needs_restart?: boolean;
   fits_hardware: boolean;
   local_path: string | null;
 }

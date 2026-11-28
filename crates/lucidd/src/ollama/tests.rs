@@ -100,6 +100,51 @@ fn ollama_latest_suffix_routes_to_verified_base_alias() {
     assert_eq!(ollama_routing_model_name("qwen3:q4"), "qwen3:q4");
 }
 
+#[test]
+fn dedupe_peer_connections_collapses_duplicate_peer_ids_keeping_best_path() {
+    let peer_a = PeerId::random();
+    let peer_b = PeerId::random();
+    let peer_c = PeerId::random();
+    let raw = vec![
+        ReachabilityConnection {
+            peer_id: peer_a,
+            path: ReachabilityPath::Relayed,
+        },
+        ReachabilityConnection {
+            peer_id: peer_a,
+            path: ReachabilityPath::Direct,
+        },
+        ReachabilityConnection {
+            peer_id: peer_a,
+            path: ReachabilityPath::Dcutr,
+        },
+        ReachabilityConnection {
+            peer_id: peer_b,
+            path: ReachabilityPath::Unknown,
+        },
+        ReachabilityConnection {
+            peer_id: peer_b,
+            path: ReachabilityPath::Dcutr,
+        },
+        ReachabilityConnection {
+            peer_id: peer_c,
+            path: ReachabilityPath::Relayed,
+        },
+        ReachabilityConnection {
+            peer_id: peer_c,
+            path: ReachabilityPath::Relayed,
+        },
+    ];
+
+    let deduped = dedupe_peer_connections(raw);
+    assert_eq!(deduped.len(), 3, "7 raw connections across 3 peers must collapse to 3");
+    let by_peer: std::collections::HashMap<_, _> =
+        deduped.into_iter().map(|c| (c.peer_id, c.path)).collect();
+    assert_eq!(by_peer.get(&peer_a), Some(&ReachabilityPath::Direct));
+    assert_eq!(by_peer.get(&peer_b), Some(&ReachabilityPath::Dcutr));
+    assert_eq!(by_peer.get(&peer_c), Some(&ReachabilityPath::Relayed));
+}
+
 #[tokio::test]
 async fn loopback_host_guard_requires_one_host_header() {
     use tower::ServiceExt as _;

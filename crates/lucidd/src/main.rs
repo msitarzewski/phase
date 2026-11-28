@@ -908,7 +908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_config_store =
         lucidd::node_config::NodeConfigStore::load_or_default(cli.node_config.clone())?;
-    let node_cfg = node_config_store.snapshot();
+    let mut node_cfg = node_config_store.snapshot();
 
     if cli.redundant_verification_permille > 1_000 {
         return Err("--redundant-verification-permille must be in 0..=1000".into());
@@ -955,6 +955,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             false
         }
     });
+    // Migrate legacy `node.toml` files that recorded `approved_provide_models`
+    // before `approved_model_sources` existed: resolve the user's already-
+    // approved model names from read-only disk discovery so Auto mode boots
+    // the local worker instead of silently dropping to ConsumeOnly.
+    if cli.mode == NodeMode::Auto
+        && !cli.no_local_worker
+        && cli.worker.is_none()
+        && node_cfg.providing_enabled
+        && node_llama_binary_ready
+        && node_cfg.model_dirs.is_empty()
+        && node_cfg.approved_model_sources.is_empty()
+        && !node_cfg.approved_provide_models.is_empty()
+    {
+        let probe = lucidd::runtime_manager::probe_system(&node_cfg).await;
+        let mut backfilled = 0usize;
+        match node_config_store.update(|cfg| {
+            backfilled = backfill_legacy_approved_sources(cfg, &probe.discovered_models);
+            Ok(())
+        }) {
+            Ok(updated) => {
+                if backfilled > 0 {
+                    tracing::info!(
+                        count = backfilled,
+                        "backfilled approved_model_sources for legacy node.toml"
+                    );
+                }
+                node_cfg = updated;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not persist backfilled approved_model_sources; continuing with existing node.toml"
+                );
+            }
+        }
+    }
     let effective_mode = match cli.mode {
         NodeMode::Auto => {
             if cli.no_local_worker {
@@ -2350,6 +2386,46 @@ fn validate_http_bind_addr(addr: SocketAddr) -> Result<(), String> {
     Ok(())
 }
 
+/// Backfill `approved_model_sources` for legacy `node.toml` files that stored
+/// `approved_provide_models` before per-model source paths were persisted.
+/// Matches exact names or `:latest`-normalized names against read-only disk
+/// discovery and returns how many sources were added.
+fn backfill_legacy_approved_sources(
+    cfg: &mut lucidd::node_config::NodeConfig,
+    discovered: &[lucidd::runtime_manager::DiscoveredLocalModel],
+) -> usize {
+    let mut added = 0usize;
+    for approved_name in &cfg.approved_provide_models {
+        if cfg
+            .approved_model_sources
+            .iter()
+            .any(|s| s.name == *approved_name)
+        {
+            continue;
+        }
+        let approved_norm = approved_name
+            .strip_suffix(":latest")
+            .unwrap_or(approved_name);
+        let found = discovered.iter().find(|m| {
+            m.name == *approved_name
+                || m.name.strip_suffix(":latest").unwrap_or(&m.name) == approved_norm
+        });
+        if let Some(found) = found {
+            let path = PathBuf::from(&found.path);
+            if path.is_absolute() {
+                cfg.approved_model_sources
+                    .push(lucidd::node_config::ApprovedModelSource {
+                        name: approved_name.clone(),
+                        path,
+                        source: found.source.clone(),
+                    });
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2652,5 +2728,52 @@ mod tests {
         assert!(validate_loopback_api_base("http://localhost:11435/").is_ok());
         assert!(validate_loopback_api_base("http://example.com:11435").is_err());
         assert!(validate_loopback_api_base("https://127.0.0.1:11435").is_err());
+    }
+
+    #[test]
+    fn backfill_legacy_approved_sources_resolves_exact_and_latest_models() {
+        let mut cfg = lucidd::node_config::NodeConfig {
+            providing_enabled: true,
+            approved_provide_models: vec!["qwen3-vl:8b".into(), "gemma3".into(), "missing".into()],
+            ..Default::default()
+        };
+        let discovered = vec![
+            lucidd::runtime_manager::DiscoveredLocalModel {
+                name: "qwen3-vl:8b".into(),
+                path: "/tmp/ollama/blobs/sha256-abc".into(),
+                size_bytes: 5_000_000_000,
+                source: "ollama".into(),
+                quantization: None,
+                fits_hardware: true,
+            },
+            lucidd::runtime_manager::DiscoveredLocalModel {
+                name: "gemma3:latest".into(),
+                path: "/tmp/ollama/blobs/sha256-def".into(),
+                size_bytes: 4_000_000_000,
+                source: "ollama".into(),
+                quantization: None,
+                fits_hardware: true,
+            },
+            lucidd::runtime_manager::DiscoveredLocalModel {
+                name: "missing".into(),
+                path: "relative/not-allowed.gguf".into(),
+                size_bytes: 1_000,
+                source: "local".into(),
+                quantization: None,
+                fits_hardware: true,
+            },
+        ];
+
+        let added = backfill_legacy_approved_sources(&mut cfg, &discovered);
+        assert_eq!(added, 2);
+        assert_eq!(cfg.approved_model_sources.len(), 2);
+        assert_eq!(cfg.approved_model_sources[0].name, "qwen3-vl:8b");
+        assert_eq!(
+            cfg.approved_model_sources[0].path,
+            PathBuf::from("/tmp/ollama/blobs/sha256-abc")
+        );
+        assert_eq!(cfg.approved_model_sources[1].name, "gemma3");
+        // Idempotent on second call.
+        assert_eq!(backfill_legacy_approved_sources(&mut cfg, &discovered), 0);
     }
 }

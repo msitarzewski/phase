@@ -51,7 +51,7 @@
   let chatInitialModel = $state<string | null>(null);
   let chatModels = $derived(
     (overview?.models ?? [])
-      .filter((m) => m.can_request || m.providing || m.on_device)
+      .filter((m) => m.can_request || m.available_locally)
       .map((m) => m.name),
   );
 
@@ -365,6 +365,19 @@
     }
   }
 
+  async function handleRestartService() {
+    try {
+      busy = true;
+      errorBanner = null;
+      overview = await lucidApi.restartDaemon();
+      showToast("LUCID service restarted");
+    } catch (err) {
+      errorBanner = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function handlePullModel(model: ModelEntry) {
     try {
       busy = true;
@@ -393,7 +406,8 @@
           {statusPillText(
             overview.status.state,
             overview.status.peer_count,
-            overview.status.paused_reason
+            overview.status.paused_reason,
+            overview.status.authorized_peer_count
           )}
         {:else}
           Offline
@@ -464,8 +478,10 @@
             >
               <div class="row-top">
                 <span class="row-name">{model.name}</span>
-                {#if model.providing}
+                {#if model.providing && model.available_locally}
                   <span class="chip sharing">Providing</span>
+                {:else if model.needs_restart}
+                  <span class="chip">Restart to load</span>
                 {:else if model.peer_count > 0}
                   <span class="chip">{model.peer_count} {model.peer_count === 1 ? "peer" : "peers"}</span>
                 {/if}
@@ -519,7 +535,13 @@
                 </div>
               </div>
               <span class="badge" class:on={selectedModel.available_locally || selectedModel.can_request}>
-                {selectedModel.available_locally || selectedModel.can_request ? "Ready" : "Join or enable"}
+                {#if selectedModel.available_locally || selectedModel.can_request}
+                  Ready
+                {:else if selectedModel.needs_restart}
+                  Restart to load
+                {:else}
+                  Join or enable
+                {/if}
               </span>
             </div>
 
@@ -529,7 +551,9 @@
               <div>
                 <div class="row-label">Help provide to my network</div>
                 <div class="row-help">
-                  {#if selectedModel.providing}
+                  {#if selectedModel.needs_restart}
+                    Approved to provide — restart the LUCID service to start the local inference worker
+                  {:else if selectedModel.providing}
                     Sharing with your authorized network · auto-pauses on battery & high heat
                   {:else if !selectedModel.on_device}
                     Only models stored on this device can be provided right now
@@ -551,7 +575,7 @@
           </section>
 
           <div class="cta-row">
-            {#if selectedModel.can_request || selectedModel.providing}
+            {#if selectedModel.can_request || selectedModel.available_locally}
               <button
                 class="primary"
                 onclick={() => {
@@ -563,6 +587,10 @@
               </button>
               <button onclick={() => selectedModel && handleOpenChat(selectedModel)}>
                 Open WebUI ↗
+              </button>
+            {:else if selectedModel.needs_restart}
+              <button class="primary" disabled={busy} onclick={handleRestartService}>
+                Restart Service to Load
               </button>
             {:else if !selectedModel.on_device}
               <button class="primary" onclick={() => (showJoinModal = true)}>

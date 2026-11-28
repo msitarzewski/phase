@@ -60,12 +60,23 @@ export function sourceLabel(source: string): string {
 export function statusPillText(
   state: string,
   peerCount: number,
-  pausedReason: string | null
+  pausedReason: string | null,
+  authorizedPeerCount?: number
 ): string {
   if (pausedReason === "battery") return "Paused · On battery";
   if (pausedReason === "thermal") return "Paused · Cooling down";
   if (pausedReason === "manual_pause") return "Providing paused";
   if (state === "connected") {
+    if (typeof authorizedPeerCount === "number") {
+      if (authorizedPeerCount > 0) {
+        return authorizedPeerCount === 1
+          ? "Connected · 1 authorized"
+          : `Connected · ${authorizedPeerCount} authorized`;
+      }
+      return peerCount === 1
+        ? "Connected · 1 network (0 authorized)"
+        : `Connected · ${peerCount} network (0 authorized)`;
+    }
     return peerCount === 1 ? "Connected · 1 peer" : `Connected · ${peerCount} peers`;
   }
   if (state === "connecting") return "Connecting…";

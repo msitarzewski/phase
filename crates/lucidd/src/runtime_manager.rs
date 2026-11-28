@@ -315,6 +315,11 @@ pub async fn download_and_install_pinned_runtime(
         Some(dir) => dir,
         None => default_runtime_dir()?,
     };
+    if let Some(parent) = root.parent() {
+        if parent.file_name().and_then(|n| n.to_str()) == Some("lucidd") {
+            ensure_private_dir(parent)?;
+        }
+    }
     ensure_private_dir(&root)?;
 
     let client = reqwest::Client::builder()

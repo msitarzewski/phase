@@ -24,9 +24,9 @@ const MAX_ERROR_BYTES: usize = 4096;
 const INTERRUPTED: &str = "The reply was interrupted before it finished. Try again.";
 const INVALID_STREAM: &str = "The LUCID service returned an invalid chat stream.";
 const OFFLINE_PEER: &str =
-    "The model’s device may be offline. Ask its owner to check LUCID, or choose another model.";
+    "No active device is serving this model right now. If it’s on this device, make sure Provide is enabled (or restart LUCID); otherwise ask its owner to check LUCID.";
 const NO_LOCAL_MODEL: &str =
-    "This model can’t run on this device with Local Only on. Choose a local model or add one in Models.";
+    "This model isn’t loaded on this device right now. Enable Provide in Models (or restart LUCID), or turn off Local Only.";
 
 type ChatResult<T> = std::result::Result<T, &'static str>;
 
@@ -276,7 +276,9 @@ async fn chat_refusal(mut response: Response, local_only: bool) -> &'static str 
     let body = String::from_utf8_lossy(&body);
     if local_only
         && status == StatusCode::SERVICE_UNAVAILABLE
-        && body.starts_with("router refused: local-only requested")
+        && (body.starts_with("router refused: local-only requested")
+            || body.starts_with("router refused: no peers serving model")
+            || body.starts_with("router refused: no authorized peers serving model"))
     {
         NO_LOCAL_MODEL
     } else if status == StatusCode::SERVICE_UNAVAILABLE
@@ -614,5 +616,36 @@ mod tests {
 
         let error_frame = br#"{"done":true,"done_reason":"error","error":"failed","x_lucid_trust_label":"remote-spot-checked","x_lucid_receipt_verified":"true"}"#;
         assert!(apply_frame(error_frame, Some("peer"), &mut ignore).is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_refusal_distinguishes_local_only_and_unloaded_503() {
+        for (local_only, expected) in [(true, NO_LOCAL_MODEL), (false, OFFLINE_PEER)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let body = b"router refused: no peers serving model qwen3-vl:8b";
+            let head = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let server = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut socket = reply_to(listener, head.as_bytes(), local_only).await;
+                socket.write_all(body).await.unwrap();
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let err = stream_chat(
+                &client,
+                port,
+                "qwen3-vl:8b".into(),
+                Vec::new(),
+                local_only,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, expected);
+            server.await.unwrap();
+        }
     }
 }

@@ -38,7 +38,7 @@ use futures::{Stream, StreamExt};
 use hyper::body::Frame;
 use phase_identity::NodeIdentity;
 use phase_manifest::ManifestBuilder;
-use phase_net::{PeerId, ReachabilityConnection};
+use phase_net::{PeerId, ReachabilityConnection, ReachabilityPath};
 use phase_protocol::{
     ChatMessage as PhaseChatMessage, ChatRole as PhaseChatRole, Completion, InferenceJobSpec,
     JobEvent, JobHandle, JobSpec, OutputChunk, SamplingParams,
@@ -720,7 +720,12 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
     .await
     .ok()
     .and_then(|res| res.ok());
-    let peer_count = snapshot.as_ref().map(|s| s.connections.len()).unwrap_or(0);
+    let peers = snapshot
+        .as_ref()
+        .map(|s| control_peer_entries(&state, s.connections.clone()))
+        .unwrap_or_default();
+    let peer_count = peers.len();
+    let authorized_peer_count = peers.iter().filter(|p| p.authorized).count();
     let active_path = snapshot
         .as_ref()
         .map(|s| format!("{:?}", s.active_path).to_ascii_lowercase())
@@ -763,6 +768,7 @@ async fn handle_consumer_status(State(state): State<AppState>, headers: HeaderMa
         serde_json::json!({
             "state": connection,
             "peer_count": peer_count,
+            "authorized_peer_count": authorized_peer_count,
             "active_path": active_path,
             "model_count": cids.len(),
             "enrollment": state.consumer.enrollment_status(),
@@ -788,12 +794,43 @@ struct ControlPeer {
     authorized: bool,
 }
 
+fn reachability_path_priority(path: ReachabilityPath) -> u8 {
+    match path {
+        ReachabilityPath::Direct => 3,
+        ReachabilityPath::Dcutr => 2,
+        ReachabilityPath::Relayed => 1,
+        ReachabilityPath::Unknown => 0,
+    }
+}
+
+/// Collapse multiple active libp2p connections (`ConnectionId`s) to the same
+/// remote `PeerId` into a single peer entry, preserving the best path
+/// (`direct > dcutr > relayed > unknown`).
+fn dedupe_peer_connections(
+    connections: Vec<ReachabilityConnection>,
+) -> Vec<ReachabilityConnection> {
+    let mut best_by_peer: std::collections::BTreeMap<String, ReachabilityConnection> =
+        std::collections::BTreeMap::new();
+    for conn in connections {
+        let key = conn.peer_id.to_string();
+        match best_by_peer.get(&key) {
+            Some(existing)
+                if reachability_path_priority(existing.path)
+                    >= reachability_path_priority(conn.path) => {}
+            _ => {
+                best_by_peer.insert(key, conn);
+            }
+        }
+    }
+    best_by_peer.into_values().collect()
+}
+
 fn control_peer_entries(
     state: &AppState,
     connections: Vec<ReachabilityConnection>,
 ) -> Vec<ControlPeer> {
     let authorized = state.consumer.authorized_circle_peers(&state.policy);
-    connections
+    dedupe_peer_connections(connections)
         .into_iter()
         .map(|connection| ControlPeer {
             peer_id: connection.peer_id.to_string(),
@@ -960,11 +997,10 @@ async fn handle_control_models(State(state): State<AppState>, headers: HeaderMap
                 .approved_provide_models
                 .iter()
                 .any(|a| a == &disc.name);
-        let available_locally = node_cfg
-            .approved_local_models
-            .iter()
-            .any(|a| a == &disc.name)
-            || providing;
+        // Models reached here were discovered on disk only — they are NOT yet
+        // verified/loaded in an active local worker, so never advertise them as
+        // immediately ready on `:11435`.
+        let needs_restart = providing && state.model_dir.is_none();
         entries.push(serde_json::json!({
             "id": disc.name,
             "name": disc.name,
@@ -974,9 +1010,10 @@ async fn handle_control_models(State(state): State<AppState>, headers: HeaderMap
             "quantization": disc.quantization,
             "peer_count": 0,
             "on_device": true,
-            "available_locally": available_locally,
+            "available_locally": false,
             "providing": providing,
             "can_request": false,
+            "needs_restart": needs_restart,
             "fits_hardware": disc.fits_hardware,
             "local_path": disc.path,
         }));
