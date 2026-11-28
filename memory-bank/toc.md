@@ -1,7 +1,7 @@
 # Table of Contents: Phase Memory Bank
 
-**Last Updated**: 2026-11-09
-**Version**: 0.5
+**Last Updated**: 2026-11-27
+**Version**: 0.8
 
 ---
 
@@ -11,7 +11,7 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 
 **Navigation**: This TOC is your starting point. Jump to specific files based on what you need.
 
-**Most current shipped and active state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, `tasks/2026-06/`, and `tasks/2026-08/`. Historical release plans are in `releases/phase-core/` and `releases/lucid/`; the active LUCID v0.2 tracker is [`releases/lucid-v0.2/`](./releases/lucid-v0.2/), and the planned independent LUMEN tracker is [`releases/lumen/`](./releases/lumen/). Tracker status is authoritative; implementation existence does not mean a release shipped.
+**Most current shipped and active state lives in** [activeContext.md](./activeContext.md) and [progress.md](./progress.md). Per-month task records are under `tasks/2025-11/`, `tasks/2026-05/`, `tasks/2026-06/`, `tasks/2026-08/`, and `tasks/2026-11/`. Historical release plans are in `releases/phase-core/` and `releases/lucid/`; the active LUCID v0.2 tracker is [`releases/lucid-v0.2/`](./releases/lucid-v0.2/), and the planned independent LUMEN tracker is [`releases/lumen/`](./releases/lumen/). Tracker status is authoritative; implementation existence does not mean a release shipped.
 
 ---
 
@@ -21,12 +21,12 @@ This Memory Bank contains all project knowledge, decisions, patterns, and progre
 |------|---------|------------------|--------------|
 | [projectbrief.md](./projectbrief.md) | Vision, goals, MVP scope | Rarely (major pivots) | 2025-11-08 |
 | [systemPatterns.md](./systemPatterns.md) | Architecture patterns | Pattern discovery | 2026-08-09 |
-| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-08-10 |
-| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-09 |
-| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-09 |
+| [techContext.md](./techContext.md) | Tech stack decisions | New tech adoption | 2026-11-25 |
+| [activeContext.md](./activeContext.md) | Current sprint focus | Weekly | 2026-11-25 |
+| [progress.md](./progress.md) | Status, blockers | Weekly | 2026-11-25 |
 | [projectRules.md](./projectRules.md) | Coding standards | New patterns | 2025-11-08 |
 | [decisions.md](./decisions.md) | Architectural decisions (ADRs) | Arch decisions | 2026-08-10 |
-| [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2025-11-08 |
+| [quick-start.md](./quick-start.md) | Common patterns, session data | Weekly | 2026-11-22 |
 
 ---
 
@@ -227,13 +227,29 @@ What was accomplished
 
 ---
 
+## Current Task Documentation (2026-11)
+
+**Status**: Physical 5-node fleet qualification (`v0.2.0-rc8` + `b97f93e`), WAN MLX (`71.3 tok/s` cellular+VPN, `98.0 tok/s` 2-Mac burst), and first real sliced 2-Mac LLM inference (`21.3 tok/s`, `120/120` verified Ed25519 receipts) completed on `feat/lucid-consumer-experience`; parallel [multi-agent sprint plan](./releases/lucid-v0.2/multi-agent-sprint-plan.md) ready for Tracks A, B, and C.
+
+| Task | Status | File |
+|---|---|---|
+| Physical 5-node fleet qualification (`v0.2.0-rc8`), WAN MLX, & real sliced 2-Mac LLM inference | ✅ Verified (`Runs #1–#12`, `120/120` receipts) | [261126_physical-fleet-qualification-and-real-sliced-inference.md](./tasks/2026-11/261126_physical-fleet-qualification-and-real-sliced-inference.md) |
+| Tier-1 `ShardWorker` libp2p transport (`/phase/shard-stage/1.0.0`), GGUF reader, & Cluster UI | ✅ Verified | [261125_shardworker-transport-and-cluster-ui.md](./tasks/2026-11/261125_shardworker-transport-and-cluster-ui.md) |
+| Ollama/multi-folder serving, HTTP tests, `lucidd bench`, & `ShardWorker` foundation | ✅ Verified (`b5bcee9`) | [261125_shardworker-foundation-and-bench.md](./tasks/2026-11/261125_shardworker-foundation-and-bench.md) |
+| Apple-simple self-configuring `lucidd` & cross-platform Tauri v2 desktop app | ✅ Verified (`v0.2.0-rc3`) | [261123_apple-simple-lucid-desktop.md](./tasks/2026-11/261123_apple-simple-lucid-desktop.md) |
+| Workspace, build/CI, and runtime efficiency | ✅ Verified | [261122_workspace-and-runtime-efficiency.md](./tasks/2026-11/261122_workspace-and-runtime-efficiency.md) |
+
+**Monthly Summary**: [tasks/2026-11/README.md](./tasks/2026-11/README.md)
+
+---
+
 ## Current Task Documentation (2026-08)
 
 **Status**: LUCID v0.2 implementation checkpoint approved; release acceptance incomplete
 
 | Task | Status | File |
 |---|---|---|
-| LUCID v0.2 implementation + UMBP qualification | ✅ Checkpoint approved | [260809_lucid-v0.2-implementation-umbp-qualification.md](./tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md) |
+| LUCID v0.2 implementation + Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) qualification | ✅ Checkpoint approved | [260809_lucid-v0.2-implementation-linux-qualification.md](./tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md) |
 
 **Monthly Summary**: [tasks/2026-08/README.md](./tasks/2026-08/README.md)
 
@@ -257,9 +273,12 @@ What was accomplished
 - [Intended-Stream Vertical Slice](./releases/lucid-v0.2/intended-stream-vertical-slice.md)
 - [Reputation and Redundant Verification](./releases/lucid-v0.2/reputation-and-redundant-verification.md)
 - [ShardWorker](./releases/lucid-v0.2/shardworker.md)
+- [ShardWorker ADR Draft](./releases/lucid-v0.2/shardworker-adr.md)
 - [MLX Backend](./releases/lucid-v0.2/mlx-backend.md)
 - [Core AI Feasibility Gate](./releases/lucid-v0.2/core-ai-feasibility-gate.md)
 - [Release Qualification](./releases/lucid-v0.2/release-qualification.md)
+- [Physical Fleet Progress Report](./releases/lucid-v0.2/fleet-progress-report.md)
+- [Multi-Agent Divide & Conquer Sprint Plan](./releases/lucid-v0.2/multi-agent-sprint-plan.md)
 
 ### Competitive research and next experiments
 
@@ -343,18 +362,18 @@ What was accomplished
 ## Memory Bank Statistics
 
 **Total Files**: Living Memory Bank; use this TOC and `rg --files memory-bank` rather than a stale manual count
-**Last Updated**: 2026-11-09
+**Last Updated**: 2026-11-25
 **Coverage**:
 - ✅ Project vision and goals (projectbrief.md)
 - ✅ Architecture patterns (systemPatterns.md) - updated with Phase Boot patterns
 - ✅ Tech stack documentation (techContext.md) - LUCID v0.2 checkpoint and experimental MLX adapter reflected
-- ✅ Current focus (activeContext.md) - external foundation/Pip/UMBP acceptance staging
+- ✅ Current focus (activeContext.md) - external foundation/Mac M1 Max (32GB RAM)/Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) acceptance staging
 - ✅ Progress tracking (progress.md) - shipped releases plus unreleased LUCID v0.2 checkpoint
 - ✅ Coding standards (projectRules.md)
 - ✅ Architectural decisions (decisions.md)
 - ✅ Quick reference (quick-start.md)
 - ✅ Navigation (toc.md - this file)
-- ✅ Monthly summaries (2025-11, 2026-05, 2026-06, and 2026-08)
+- ✅ Monthly summaries (2025-11, 2026-05, 2026-06, 2026-08, and 2026-11)
 - ✅ Phase Boot documentation (releases/boot/)
 - ✅ LUCID v0.2 detailed release tracker (releases/lucid-v0.2/)
 - ✅ Independent LUMEN detailed release tracker (releases/lumen/)

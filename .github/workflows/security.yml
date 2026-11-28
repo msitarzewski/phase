@@ -1,12 +1,13 @@
 # SEC-00 — first CI workflow for the Phase repo.
 #
-# Three jobs:
+# Jobs:
 #   advisories  - cargo-audit + cargo-deny dependency-advisory / license /
 #                 source gate. Vulnerabilities FAIL the build; unmaintained
 #                 crates are warnings (tracked in SEC-12). Ignore list lives in
 #                 `.cargo/audit.toml` and `deny.toml`.
 #   test        - cargo test across the workspace.
 #   clippy      - cargo clippy with warnings denied + rustfmt check.
+#   native-macos - native Swift tests and the actual signed LUCID app bundle.
 #
 # This is the repo's first CI; it is intentionally a sensible baseline, not
 # only a security gate.
@@ -36,18 +37,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write # audit-check publishes its result as a check run.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # RustSec advisory scan. Reads Cargo.lock and `.cargo/audit.toml`
-      # (the SEC-02 ignore list). Vulnerabilities fail; the 4 unmaintained
-      # crates are allowed warnings and exit 0.
+      # Install prebuilt cargo-audit binary (seconds instead of compiling from
+      # source) and scan Cargo.lock with `.cargo/audit.toml`. Vulnerabilities
+      # fail; unmaintained/informational advisories stay visible as warnings.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
       - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
       # cargo-deny: advisories (mirrors audit), licenses, bans, sources.
       # `--warn unmaintained` downgrades unmaintained-crate findings from the
@@ -65,6 +66,22 @@ jobs:
           # downgrades unmaintained findings from error to warning so they
           # stay visible without failing CI (matches `cargo audit`).
           command-arguments: --warn unmaintained
+
+  # --- Formatting (fast, no compilation or cargo cache needed) ----------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
 
   # --- Workspace tests --------------------------------------------------
   test:
@@ -85,7 +102,7 @@ jobs:
 
   # --- Lint -------------------------------------------------------------
   clippy:
-    name: clippy + fmt
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -94,13 +111,134 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # --- Native consumer app -----------------------------------------------
+  native-macos:
+    name: native macOS app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the current native daemon
+        run: cargo build -p lucidd --locked
+
+      - name: Swift tests with warnings denied
+        run: |
+          test "$(id -u)" -ne 0
+          export CLANG_MODULE_CACHE_PATH="$RUNNER_TEMP/native-macos-ci/module-cache"
+          export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
+          mkdir -p "$CLANG_MODULE_CACHE_PATH"
+          swift test --package-path apps/lucid-macos \
+            --scratch-path "$RUNNER_TEMP/native-macos-ci/tests" \
+            --cache-path "$RUNNER_TEMP/native-macos-ci/cache" \
+            --config-path "$RUNNER_TEMP/native-macos-ci/config" \
+            --security-path "$RUNNER_TEMP/native-macos-ci/security" \
+            --disable-sandbox -Xswiftc -module-cache-path \
+            -Xswiftc "$CLANG_MODULE_CACHE_PATH" -Xswiftc -warnings-as-errors
+
+      - name: Build and verify the actual app bundle
+        run: |
+          bash apps/lucid-macos/build-app.sh \
+            --daemon "$GITHUB_WORKSPACE/target/debug/lucidd" \
+            --output "$RUNNER_TEMP/native-macos-ci/app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/native-macos-ci/app/LUCID.app"
+          plutil -lint "$RUNNER_TEMP/native-macos-ci/app/LUCID.app/Contents/Info.plist"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, platform, plistlib, re, subprocess
+
+          root = Path.cwd()
+          app = Path(os.environ['RUNNER_TEMP']) / 'native-macos-ci/app/LUCID.app'
+          with (app / 'Contents/Info.plist').open('rb') as f:
+              info = plistlib.load(f)
+          build = json.loads((app / 'Contents/Resources/build-info.json').read_text())
+          daemon = app / 'Contents/Helpers/lucidd'
+          digest = hashlib.sha256(daemon.read_bytes()).hexdigest()
+          version = re.search(r'^version = "([^"]+)"',
+                              (root / 'crates/lucidd/Cargo.toml').read_text(), re.M).group(1)
+          assert info['CFBundleIdentifier'] == 'net.phasebased.lucid'
+          assert info['CFBundleShortVersionString'] == version == build['version']
+          assert info['LucidDaemonSHA256'] == digest == build['daemon_sha256']
+          assert build['source_commit'] == subprocess.check_output(
+              ['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert build['architecture'] == platform.machine()
+          assert build['distribution'] == 'local-development'
+          for executable in [daemon, app / 'Contents/MacOS/Lucid']:
+              architectures = subprocess.check_output(
+                  ['xcrun', 'lipo', '-archs', str(executable)], text=True).split()
+              assert platform.machine() in architectures
+          help_text = subprocess.check_output([str(daemon), '--help'], text=True)
+          assert '--outbound-only' in help_text and '--control-token-file' in help_text
+          expected_files = {
+              'Contents/Info.plist', 'Contents/MacOS/Lucid',
+              'Contents/Helpers/lucidd', 'Contents/Resources/build-info.json',
+              'Contents/Resources/Phase-LICENSE', 'Contents/Resources/AppIcon.icns',
+              'Contents/Resources/Assets.car',
+              'Contents/_CodeSignature/CodeResources',
+          }
+          assert {str(p.relative_to(app)) for p in app.rglob('*') if p.is_file()} == expected_files
+          assert not any(p.is_symlink() for p in app.rglob('*'))
+          print(json.dumps({'app_bundle': 'verified', 'architecture': build['architecture'],
+                            'daemon_sha256': digest, 'source_commit': build['source_commit']}))
+          PY
+
+  # --- Cross-platform Tauri v2 desktop app -------------------------------
+  desktop-tauri:
+    name: desktop app (Tauri v2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Linux WebKit/GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/lucid-desktop/src-tauri -> apps/lucid-desktop/src-tauri/target
+
+      - name: Frontend type-check and production build
+        working-directory: apps/lucid-desktop
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: Build lucidd sidecar and verify Tauri Rust tests & clippy
+        run: |
+          cargo build -p lucidd --locked
+          bash apps/lucid-desktop/stage-sidecar.sh target/debug/lucidd
+          cargo test --manifest-path apps/lucid-desktop/src-tauri/Cargo.toml
+          cargo clippy --manifest-path apps/lucid-desktop/src-tauri/Cargo.toml --all-targets -- -D warnings

@@ -29,6 +29,8 @@ const FILE_MAGIC: &[u8; 8] = b"LUCEV001";
 const CHECKSUM_DOMAIN: &[u8] = b"lucid-evidence-record:v1\0";
 const EVENT_ID_DOMAIN: &[u8] = b"lucid-evidence-event-id:v1\0";
 pub const EVIDENCE_SCHEMA_VERSION: u16 = 1;
+const SPOT_CHECK_SCHEMA_VERSION: u16 = 2;
+pub(crate) const SPOT_CHECK_METHOD: &str = "lucid/deterministic-text-replay/1";
 const LENGTH_PREFIX_BYTES: usize = 4;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_PROTOCOL_VERSION_BYTES: usize = 128;
@@ -81,6 +83,48 @@ pub enum EvidenceOutcome {
     RedundantExecutionDisagreement,
     RedundantExecutionIncomparableResult,
     OperatorReviewedAbuseEvidence,
+    // Append new variants to preserve the postcard tags of existing records.
+    VerifiedSpotCheckAgreement(SpotCheckEvidence),
+    VerifiedSpotCheckDisagreement(SpotCheckEvidence),
+}
+
+/// Paired evidence from distinct, receipt-verified executions. The surrounding
+/// record supplies the primary peer, manifest, model and transcript commitment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpotCheckEvidence {
+    #[serde(
+        serialize_with = "serialize_peer_id",
+        deserialize_with = "deserialize_peer_id"
+    )]
+    pub(crate) validator_peer: PeerId,
+    pub(crate) validator_commitment: [u8; 32],
+    pub(crate) primary_text_digest: [u8; 32],
+    pub(crate) validator_text_digest: [u8; 32],
+    pub(crate) capability_digest: [u8; 32],
+}
+
+fn serialize_peer_id<S: serde::Serializer>(
+    peer: &PeerId,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(peer)
+}
+
+fn deserialize_peer_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<PeerId, D::Error> {
+    let encoded = String::deserialize(deserializer)?;
+    parse_peer_id("validator_peer", &encoded).map_err(serde::de::Error::custom)
+}
+
+impl EvidenceOutcome {
+    fn spot_check(self) -> Option<SpotCheckEvidence> {
+        match self {
+            Self::VerifiedSpotCheckAgreement(evidence)
+            | Self::VerifiedSpotCheckDisagreement(evidence) => Some(evidence),
+            _ => None,
+        }
+    }
 }
 
 /// Privacy-minimal construction input. No raw request or result content is
@@ -138,7 +182,11 @@ impl ExecutionEvidence {
         output_commitment: Option<[u8; 32]>,
     ) -> Result<Self, EvidenceError> {
         let mut record = Self {
-            schema_version: EVIDENCE_SCHEMA_VERSION,
+            schema_version: if outcome.spot_check().is_some() {
+                SPOT_CHECK_SCHEMA_VERSION
+            } else {
+                EVIDENCE_SCHEMA_VERSION
+            },
             event_id: [0; 32],
             observer_peer_id: context.observer_peer_id.to_string(),
             remote_peer_id: context.remote_peer_id.to_string(),
@@ -226,7 +274,11 @@ impl ExecutionEvidence {
     }
 
     fn validate_static(&self) -> Result<(), EvidenceError> {
-        if self.schema_version != EVIDENCE_SCHEMA_VERSION {
+        let spot_check = self.outcome.spot_check();
+        if !matches!(
+            (self.schema_version, spot_check.is_some()),
+            (EVIDENCE_SCHEMA_VERSION, false) | (SPOT_CHECK_SCHEMA_VERSION, true)
+        ) {
             return Err(EvidenceError::UnsupportedSchema(self.schema_version));
         }
         let observer = parse_peer_id("observer_peer_id", &self.observer_peer_id)?;
@@ -248,6 +300,27 @@ impl ExecutionEvidence {
             return Err(EvidenceError::InvalidField(
                 "output_commitment must be non-zero when present",
             ));
+        }
+        if let Some(evidence) = spot_check {
+            let agrees = evidence.primary_text_digest == evidence.validator_text_digest;
+            if evidence.validator_peer == observer
+                || evidence.validator_peer == remote
+                || self.job_class != JobSpecKind::Inference
+                || self.protocol_version != SPOT_CHECK_METHOD
+                || self.output_commitment.is_none()
+                || [
+                    evidence.validator_commitment,
+                    evidence.primary_text_digest,
+                    evidence.validator_text_digest,
+                    evidence.capability_digest,
+                ]
+                .contains(&[0; 32])
+                || agrees != matches!(self.outcome, EvidenceOutcome::VerifiedSpotCheckAgreement(_))
+            {
+                return Err(EvidenceError::InvalidField(
+                    "invalid verified spot-check binding",
+                ));
+            }
         }
         if matches!(
             self.outcome,
@@ -656,10 +729,14 @@ pub fn assess_peer(
     let mut total_weight = 0_u64;
     let mut evidence_count = 0_usize;
 
-    for record in records
-        .iter()
-        .filter(|record| record.observer_peer_id == observer && record.remote_peer_id == peer)
-    {
+    for record in records.iter().filter(|record| {
+        record.observer_peer_id == observer
+            && (record.remote_peer_id == peer
+                || record
+                    .outcome
+                    .spot_check()
+                    .is_some_and(|check| check.validator_peer == *peer_id))
+    }) {
         evidence_count = evidence_count.saturating_add(1);
         let age = now_unix_ms.saturating_sub(record.observed_at_unix_ms);
         let weight =
@@ -737,7 +814,8 @@ fn assessment_rank(class: AssessmentClass) -> u8 {
 
 fn outcome_score(outcome: EvidenceOutcome) -> i16 {
     match outcome {
-        EvidenceOutcome::VerifiedSuccessfulCompletion => 100,
+        EvidenceOutcome::VerifiedSuccessfulCompletion
+        | EvidenceOutcome::VerifiedSpotCheckAgreement(_) => 100,
         EvidenceOutcome::VerifiedCancellation
         | EvidenceOutcome::PolicyRefusal
         | EvidenceOutcome::CapacityRefusal
@@ -751,6 +829,8 @@ fn outcome_score(outcome: EvidenceOutcome) -> i16 {
         EvidenceOutcome::VerifiedWorkerError => -20,
         EvidenceOutcome::MissingTerminalEvent | EvidenceOutcome::MissingReceipt => -40,
         EvidenceOutcome::RedundantExecutionAgreement => 20,
+        // A two-peer mismatch establishes inconsistency for both executions.
+        EvidenceOutcome::VerifiedSpotCheckDisagreement(_) => -40,
         EvidenceOutcome::InvalidReceiptSignature
         | EvidenceOutcome::ManifestMismatch
         | EvidenceOutcome::JobMismatch
@@ -774,7 +854,9 @@ fn outcome_confidence_weight(outcome: EvidenceOutcome) -> u64 {
         | EvidenceOutcome::RedundantExecutionDisagreement
         | EvidenceOutcome::RedundantExecutionIncomparableResult => 0,
         EvidenceOutcome::MissingTerminalEvent | EvidenceOutcome::MissingReceipt => 500,
-        EvidenceOutcome::RedundantExecutionAgreement => 250,
+        EvidenceOutcome::RedundantExecutionAgreement
+        | EvidenceOutcome::VerifiedSpotCheckAgreement(_) => 250,
+        EvidenceOutcome::VerifiedSpotCheckDisagreement(_) => 500,
         EvidenceOutcome::VerifiedSuccessfulCompletion
         | EvidenceOutcome::VerifiedCancellation
         | EvidenceOutcome::VerifiedWorkerError
@@ -888,8 +970,11 @@ fn load_records(
         if actual_checksum != expected_checksum {
             return Err(EvidenceError::ChecksumMismatch(frame_start as u64));
         }
-        let record: ExecutionEvidence = postcard::from_bytes(payload)
+        let (record, remaining): (ExecutionEvidence, _) = postcard::take_from_bytes(payload)
             .map_err(|error| EvidenceError::Decode(frame_start as u64, error.to_string()))?;
+        if !remaining.is_empty() {
+            return Err(EvidenceError::CorruptRecord(frame_start as u64));
+        }
         record.validate_static()?;
         if record.observer_peer_id != observer_peer_id {
             return Err(EvidenceError::ObserverMismatch);
@@ -1612,6 +1697,100 @@ mod tests {
         for prohibited in ["prompt", "token", "embedding", "model_bytes", "output"] {
             assert!(!value.as_object().unwrap().contains_key(prohibited));
         }
+    }
+
+    #[test]
+    fn verified_disagreement_round_trips_with_v1_records_and_penalizes_both_peers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed-evidence.log");
+        let observer = PeerId::random();
+        let primary = PeerId::random();
+        let validator = PeerId::random();
+        let unconnected_peer = PeerId::random();
+        let now = 4_000;
+        let legacy_records = [
+            evidence(
+                observer,
+                primary,
+                now,
+                1,
+                EvidenceOutcome::VerifiedSuccessfulCompletion,
+            ),
+            evidence(
+                observer,
+                validator,
+                now,
+                1,
+                EvidenceOutcome::VerifiedSuccessfulCompletion,
+            ),
+            evidence(
+                observer,
+                primary,
+                now,
+                2,
+                EvidenceOutcome::RedundantExecutionDisagreement,
+            ),
+        ];
+        let check = SpotCheckEvidence {
+            validator_peer: validator,
+            validator_commitment: [3; 32],
+            primary_text_digest: [4; 32],
+            validator_text_digest: [5; 32],
+            capability_digest: [6; 32],
+        };
+        let mut binding = context(observer, primary, now, 3);
+        binding.protocol_version = SPOT_CHECK_METHOD.to_string();
+        assert!(ExecutionEvidence::new(
+            binding.clone(),
+            EvidenceOutcome::VerifiedSpotCheckAgreement(check),
+            Some([7; 32]),
+        )
+        .is_err());
+        assert!(ExecutionEvidence::new(
+            binding.clone(),
+            EvidenceOutcome::VerifiedSpotCheckDisagreement(SpotCheckEvidence {
+                validator_peer: primary,
+                ..check
+            }),
+            Some([7; 32]),
+        )
+        .is_err());
+        let disagreement = ExecutionEvidence::new(
+            binding,
+            EvidenceOutcome::VerifiedSpotCheckDisagreement(check),
+            Some([7; 32]),
+        )
+        .unwrap();
+        let mut store = EvidenceStore::open(&path, observer).unwrap();
+        for record in legacy_records.iter().cloned() {
+            store.append_at(record, now).unwrap();
+        }
+        store.append_at(disagreement.clone(), now).unwrap();
+        drop(store);
+        let store = EvidenceStore::open(&path, observer).unwrap();
+        let records = store.records();
+        assert_eq!(&records[..3], &legacy_records);
+        assert_eq!(&records[3], &disagreement);
+        for peer in [primary, validator] {
+            let initial = assess_peer(
+                &observer,
+                &peer,
+                &legacy_records,
+                now,
+                OperatorOverride::default(),
+            );
+            let updated = assess_peer(&observer, &peer, records, now, OperatorOverride::default());
+            assert_eq!(initial.score, 100);
+            assert_eq!(updated.score, 53);
+        }
+        let unrelated = assess_peer(
+            &observer,
+            &unconnected_peer,
+            records,
+            now,
+            OperatorOverride::default(),
+        );
+        assert_eq!(unrelated.evidence_count, 0);
     }
 
     #[test]

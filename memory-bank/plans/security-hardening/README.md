@@ -11,7 +11,7 @@ This plan turns the 2026-05-28 security audit findings into discrete, independen
 
 ## Why this exists
 
-The audit found the cryptographic primitives are sound but the **trust model around them is not enforced**, the dependency tree carries 20 advisories (incl. wasmtime sandbox escapes), and DoS guards are missing. The currently-internet-exposed node (umbp) runs `--mode relay` with no worker, so it refuses all jobs — exposure is **latent**. These tasks must land before any worker node is reachable from the internet.
+The audit found the cryptographic primitives are sound but the **trust model around them is not enforced**, the dependency tree carries 20 advisories (incl. wasmtime sandbox escapes), and DoS guards are missing. The currently-internet-exposed node (Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)) runs `--mode relay` with no worker, so it refuses all jobs — exposure is **latent**. These tasks must land before any worker node is reachable from the internet.
 
 ---
 

@@ -48,7 +48,7 @@ use crate::metrics::{perform_health_check, ProviderMetrics};
 /// same way.
 ///
 /// Implementors return any `serde_json::Value` — typically a serialized
-/// [`phase_manifest::SignedManifest<T>`] or, for the legacy phase-boot wire
+/// `phase_manifest::SignedManifest<T>` or, for the legacy phase-boot wire
 /// format, a `BootManifest` value.
 pub trait ManifestProvider: Send + Sync + std::fmt::Debug {
     /// Manifest for a given `(channel, arch)` pair. Returning `Err` causes

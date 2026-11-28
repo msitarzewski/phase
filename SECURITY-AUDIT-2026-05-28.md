@@ -23,7 +23,7 @@
 
 **Scope:** Full-codebase sweep. 5 parallel specialist passes (network trust boundary, subprocess/path, cryptography, HTTP+PHP SDK, supply-chain/DoS/secrets) + empirical `cargo audit`.
 
-**Bottom line:** The cryptographic *primitives* are well-built (proper CSPRNG, domain separation, sound canonicalization, tamper-evident commitment chain). The **trust model around them is not enforced** — `verify()` proves "someone signed this," nobody checks "someone *authorized* signed this," and the verifiable-compute receipt loop is currently a no-op on the consumer side. Combined with a vulnerable wasmtime and missing DoS guards, a worker node exposed to the internet today is wide open. The good news: the one node currently on the public internet (umbp) runs `--mode relay` with **no worker**, so it refuses all jobs — the live exposure is latent, not active.
+**Bottom line:** The cryptographic *primitives* are well-built (proper CSPRNG, domain separation, sound canonicalization, tamper-evident commitment chain). The **trust model around them is not enforced** — `verify()` proves "someone signed this," nobody checks "someone *authorized* signed this," and the verifiable-compute receipt loop is currently a no-op on the consumer side. Combined with a vulnerable wasmtime and missing DoS guards, a worker node exposed to the internet today is wide open. The good news: the one node currently on the public internet (Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)) runs `--mode relay` with **no worker**, so it refuses all jobs — the live exposure is latent, not active.
 
 ---
 

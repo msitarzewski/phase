@@ -1,6 +1,8 @@
 # dist
 
-Pre-built binaries for distribution. One subdirectory per `<crate>-<version>-<target-triple>`.
+Packaging metadata and demo recordings. Pre-built `lucidd` binaries are no longer
+committed to git (they are built locally or published via GitHub Releases; see
+`.gitignore`). One subdirectory per `<crate>-<version>-<target-triple>`.
 
 Targets currently shipped:
 - `aarch64-apple-darwin` — Mac (M-series). Built natively via `cargo build --release`.

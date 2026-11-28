@@ -55,4 +55,12 @@ impl DhtTransport for PhaseNetDhtTransport {
     async fn get_record(&self, key: Vec<u8>) -> Result<Vec<Vec<u8>>> {
         self.discovery.get_kad_record(key).await
     }
+
+    async fn start_providing_key(&self, key: Vec<u8>) -> Result<()> {
+        self.discovery.start_providing_key(key).await
+    }
+
+    async fn get_provider_peers(&self, key: Vec<u8>) -> Result<Vec<phase_net::PeerId>> {
+        self.discovery.get_provider_peers(key).await
+    }
 }

@@ -75,7 +75,7 @@ The user's existing client (Open WebUI / Cursor / Zed / Continue / opencode / et
 - **Open weights are competitive in 2026.** DeepSeek-V4, Qwen3-Next, Llama 4 — frontier-quality at the median use case. Donating a GPU no longer means running a worse model.
 - **Hundreds of millions of consumer GPUs sit idle.** Aggregate capacity is enormous; coordination is the missing piece.
 - **AI sovereignty is a political reality.** Export restrictions, API gating, board-level control disputes at major labs — there is a real and growing constituency for inference that can't be switched off.
-- **The protocol is already built.** Phase (after the phase-core release) ships discovery, identity, manifest signing, signed receipts. LUCID is the workload-specific layer on top — not a from-scratch network.
+- **The protocol is already built.** Phase (after the phase-core release) ships discovery, identity, manifest signing, signed receipts. LUCID is the workload-specific layer on top — not a from-Ubuntu ARM64 VM network.
 - **Compatibility is the wedge.** Speak Ollama's API. Every existing tool works unchanged. The user doesn't even need to know they're on a distributed network.
 
 ---

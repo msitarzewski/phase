@@ -1,56 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "phase-artifact-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "Content-addressed HTTP server for distributing any signed blob across the Phase network."
-authors = ["Michael Sitarzewski"]
-repository = "https://github.com/msitarzewski/phase"
+authors.workspace = true
+repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-# Sibling Phase library crates. phase-manifest supplies the generic
-# SignedManifest<T> wrapper that consumers wrap their own payload types in
-# before publishing them through this server. phase-net supplies the
-# libp2p::kad::RecordKey used by the DHT advertisement helper.
-phase-manifest = { path = "../phase-manifest", version = "0.1.0" }
-phase-net = { path = "../phase-net", version = "0.1.0" }
+libp2p = { workspace = true, features = ["kad"] }
 
-# Networking — libp2p only used by the dht module for RecordKey construction;
-# request/response and swarm machinery lives in phase-net so we don't drag
-# the full libp2p feature set into here.
-libp2p = { version = "0.56", features = ["kad"] }
+axum = { workspace = true, features = ["tokio", "http1", "http2"] }
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
 
-# HTTP server stack. axum 0.7 matches the daemon's pre-extraction version so
-# the wire format and Range / 206 / Content-Range header layout stay
-# byte-identical to the pre-M6 server.
-axum = { version = "0.7", features = ["tokio", "http1", "http2"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "fs", "io-util", "sync", "macros", "time"] }
+tokio-util = { workspace = true, features = ["io"] }
 
-# Async runtime + streaming reader for Range responses.
-tokio = { version = "1.0", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
-
-# Serialization. JSON responses + DHT record bytes.
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Hashing — SHA-256 of blob contents drives the blob_id content-address layout.
-sha2 = "0.10"
-hex = "0.4"
-
-# Timestamps — DHT records carry ISO 8601 created_at + ttl_secs.
-chrono = { version = "0.4", features = ["serde"] }
-
-# Error handling.
-anyhow = "1.0"
-thiserror = "2.0"
-
-# Logging.
-tracing = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ring = "0.17"
+hex.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tempfile = "3.0"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+tempfile.workspace = true
+reqwest.workspace = true

@@ -159,4 +159,4 @@ No alias or key prefix proposed during implementation becomes normative until re
 - Extended the existing Phase artifact store with streaming verification, staged commit, same-CID convergence, symlink/path rejection, and content-addressed lookup in `crates/phase-artifact-server/src/artifacts.rs`.
 - Automated unit/integration/adversarial coverage passed on macOS ARM64 and native Ubuntu x86_64, including two discovery nodes resolving signed content, resumable transfer, tamper rejection, catalog rollback, and bounded quota/concurrency behavior.
 - Remaining before completion: real multi-gigabyte cross-machine pull, daemon-restart resume, third-node cold alias resolution, physical provider failover, and the full SEC-13 acceptance record.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).

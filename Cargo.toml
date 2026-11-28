@@ -14,11 +14,43 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 authors = ["Michael Sitarzewski"]
 repository = "https://github.com/msitarzewski/phase"
 
 [workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5.0"
+ed25519-dalek = "2.2"
+futures = "0.3"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+hyper = "1"
+libp2p = "0.57"
+num_cpus = "1.0"
+postcard = { version = "1", features = ["use-std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.0"
+thiserror = "2.0"
+tokio = "1.40"
+tokio-util = "0.7"
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

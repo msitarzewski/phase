@@ -145,11 +145,11 @@ Sensitive raw prompts, tokens, private keys, credentials, and model weights are 
 
 - Approved source fingerprint: `1356ef6520ce7ad7dab6369ed40e50cd7507bfff570df87f1881db41fbb7d847`; Cargo.lock SHA-256: `107edfbf1e0dc7ab0c780fe9a156eb3df5c69020ca5f386bbe59acbeac3e8329`.
 - macOS ARM64: 460 tests passed, 2 hardware-only tests ignored; strict Clippy, formatting, diff hygiene, and native release bundle checks passed.
-- UMBP Ubuntu x86_64: offline locked optimized all-target build passed in 1,339s; 450 tests passed with 2 hardware-only ignores in 241s; strict Clippy passed in 40s. Evidence metadata binds Linux/x86_64, Rust/Cargo 1.91.1, source fingerprint, and lock hash.
+- Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) Ubuntu x86_64: offline locked optimized all-target build passed in 1,339s; 450 tests passed with 2 hardware-only ignores in 241s; strict Clippy passed in 40s. Evidence metadata binds Linux/x86_64, Rust/Cargo 1.91.1, source fingerprint, and lock hash.
 - Isolated release-binary HTTP smoke passed version, tags, non-stream generation, streaming generation, embeddings, headers, commitment, teardown, and production-service isolation. The temporary port closed; the production relay stayed active on PID `106521` with zero restarts.
 - Security checkpoint: zero known vulnerabilities, four allowed unmaintained transitive warnings, bans/licenses/sources policy passed, no high/critical review finding, and secret/incomplete-marker scans passed.
 - Remaining before completion: Linux ARM64 resource/toolchain rerun, physical interoperability/NAT matrix, real MLX, full intended stream, clean-machine/rollback/operator drills, release commit/tag, and public claims audit. The unavailable interactive browser controller is recorded; the native compiled real-process browser-contract test passed.
-- Evidence location and review details: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence location and review details: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).
 
 ## 2026-08-10 pre-publication revalidation
 
@@ -159,3 +159,17 @@ Sensitive raw prompts, tokens, private keys, credentials, and model weights are 
 - Evidence: `target/phase-validation/20260810T201819Z-38743/`. This evidence is local generated output and is not committed.
 - The offline security profile passed: zero vulnerabilities; five allowed dependency warnings (four unmaintained crates plus yanked transitive `spin 0.9.8` through `postcard`/`heapless`); Cargo-deny advisories, bans, licenses, and sources passed with its documented duplicate/unmatched-license warnings. Evidence: `target/phase-validation/20260810T202203Z-41037/`.
 - This revalidation authorizes checkpoint publication only. It does not satisfy Linux ARM64, real MLX, physical NAT/intended-stream, rollback, fleet, or release/tag gates.
+
+## 2026-11-22 macOS ARM64 baseline & physical fleet qualification plan
+
+- Local macOS ARM64 QA (Mac M5 Max (128GB RAM), macOS 27.3 b2, Rust/Cargo 1.100, Swift 6.4.2) passed on `feat/lucid-consumer-experience` after the workspace/runtime efficiency pass ([261122 task record](../../tasks/2026-11/261122_workspace-and-runtime-efficiency.md)):
+  - Rust workspace: **492 passed, 0 failed, 2 hardware-only ignored**.
+  - Native macOS Swift app (`apps/lucid-macos`): **11 passed, 0 failed** (`LocalAPITests` 8/8, `LocalHTTPContractTests` 3/3) and `Lucid-product` built cleanly with `-warnings-as-errors`.
+  - Static & supply-chain gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo audit --no-fetch --stale` (0 vulnerabilities; 4 allowed transitive unmaintained warnings), and `cargo deny --offline check --disable-fetch` (`advisories/bans/licenses/sources ok`) all passed.
+- Target hardware matrix assignment for the remaining release gates (installed via `.github/workflows/release.yml` + `scripts/install-lucid.sh` / `scripts/fleet-install.sh`; private targets stay in gitignored `.phase-fleet.local.env`; detailed commands in [intended-stream-vertical-slice.md](./intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22)):
+  - **Public static-IP infrastructure relay**: **Cloud Relay** (DigitalOcean Ubuntu x86_64 — sole direct public static-IPv4 host, TCP `4001`, preserving Caddy `80/443 → Tailscale → Ubuntu Desktop Caddy`).
+  - **Linux x86_64 (`PHASE_LINUX_X86_64_EVIDENCE`)**: **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** (Ubuntu 26.04 LTS x86_64, behind NAT) running `scripts/phase-validate.sh linux`; also serves as Content Provider #2.
+  - **Linux ARM64 (`PHASE_LINUX_AARCH64_EVIDENCE`)**: Ubuntu ARM64 VM on Mac M5 Max running `scripts/phase-validate.sh linux`.
+  - **Physical two-network / consumer-NAT intended stream & clean consumer**: **Mac M5 Max (128GB RAM)** (cellular hotspot, `LUCID.app` + CLI) → **Cloud Relay** (static public IPv4 on TCP `4001`) → **Ubuntu Desktop (5060ti 16GB, 32GB RAM)** (CUDA contributor #1 + Content Provider #1, behind NAT) + **Mac M1 Max (32GB RAM)** (Metal/MLX contributor #2, behind NAT) + **Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** (Content Provider #2, behind NAT).
+  - **Real Apple Silicon MLX acceptance**: **Mac M1 Max (32GB RAM)** (primary behind-NAT contributor) and **Mac M5 Max (128GB RAM)** (secondary local comparison).
+- Remaining blockers outside this fleet pass: a second independent static-IP cloud relay site for multi-site loss/DNS drills, independent correctness-evidence validator design/implementation, and ShardWorker research gate.

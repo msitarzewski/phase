@@ -8,7 +8,7 @@
 - `JobSpec::Embedding` rides the existing `OutputChunk` commitment/receipt machinery — no new
   result shape; SEC-05 receipt verify+bind covers embedding relays unchanged.
 - 263 tests pass, clippy `-D warnings` clean, `cargo audit` 0 vulns. Merged via PR #10 (`14ae8d6`).
-- Validated live on `scratch` (ARM64, cargo 1.96.0): build + 87 tests + the three new endpoints
+- Validated live on Ubuntu ARM64 VM (ARM64, cargo 1.96.0): build + 87 tests + the three new endpoints
   over HTTP against the echo worker.
 - Files: `phase-protocol/job_spec.rs`, `lucidd/{router,policy,echo,worker_llama,ollama,main,registry}.rs`.
 - See: [260609_lucid-v0.1.1-gaps.md](./260609_lucid-v0.1.1-gaps.md).

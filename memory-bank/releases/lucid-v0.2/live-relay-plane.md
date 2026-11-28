@@ -148,4 +148,4 @@ Before the wire contract stabilizes, approve an ADR covering:
 - Linux qualification exposed and fixed a production timing flaw: transport mutex/multistream negotiation now has a separate bounded deadline, while caller idle timeout starts after establishment (`crates/phase-net/src/discovery.rs:1370-1482`, `1556-1567`).
 - Native Ubuntu x86_64 passed all 35 `phase-net` tests, including real ordered substreams, cancellation, blob streaming, relay-only connection, rendezvous, malformed frames, total deadline, and post-acceptance idle timeout.
 - Remaining before completion: physical two-peer first-token trace, cross-peer cancellation/capacity proof, 100+ stream resource test, slow-client measurement, and documented v0.1 encounter on real nodes.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).

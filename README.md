@@ -1,175 +1,134 @@
-# Phase
+# Phase & LUCID
 
-Phase is the open verifiable compute protocol — a credibly-neutral, vendor-agnostic substrate for advertising and discovering compute, and checking signed execution evidence across independent machines, without payments, without KYC, without lock-in. The protocol is workload-neutral: WASM through Plasm, GPU inference through LUCID, and further workloads through the same substrate. The goal is public compute infrastructure that no single provider controls. Current receipts establish attributable output integrity; independent computation-correctness validation remains in development.
+**Private, peer-to-peer AI on hardware you trust — built on an open verifiable compute protocol.**
 
-See [memory-bank/MISSION.md](memory-bank/MISSION.md) for the long-form rationale.
+- **Phase** is a workload-neutral, Apache-2.0 peer-to-peer substrate (`libp2p 0.57`, Ed25519 identities, signed job manifests, streaming execution receipts, and content-addressed blob transfer) with no accounts, no billing, and no vendor lock-in.
+- **LUCID** (`lucidd` + Desktop app, AGPL-3.0-or-later) is the GPU inference flagship built on Phase. It runs open-weight models locally or across friends you explicitly invite, speaks the standard Ollama HTTP API on `127.0.0.1`, and verifies signed Ed25519 receipts on every remote reply.
 
----
-
-## Status
-
-**Reviewed: 2026-11-07.** The release tracker distinguishes shipped software, implemented checkpoints, and pending acceptance. It is authoritative over historical roadmap notes below.
-
-- **Phase Core** — **complete** (Nov 2025 → May 2026). The libp2p + Ed25519 substrate, extracted from the legacy `daemon/` tree into six publishable Apache-2.0 library crates plus the repositioned Plasm reference node.
-- **LUCID v0.1 / v0.1.1** — **shipped and security-hardened.** The inference flagship (`crates/lucidd`) speaks the Ollama API on `:11434`, runs real GPU inference and embeddings through llama.cpp, routes locally or across the Phase DHT with multi-peer failover, and returns cryptographically verifiable signed receipts. A public foundation relay was deployed in May; current fleet availability requires fresh operational evidence.
-- **LUCID v0.2** — **implemented checkpoint, unreleased.** Verified content pull/alias/provider records, live peer streams, relay/AutoNAT/DCUtR machinery, local reputation and bounded redundancy, and an experimental MLX adapter are implemented. Physical cross-network/NAT acceptance, real large-artifact resume, real MLX acceptance, independent correctness validation, and the remaining qualification matrix are open. [Authoritative tracker](memory-bank/releases/lucid-v0.2/README.md).
-- **Security hardening** — **shipped in May 2026** (PR #9). Signer authorization, DoS caps, receipt verify+bind, patched dependencies, and a `cargo audit` / `cargo deny` CI gate. Current dependency security requires a fresh audit.
-
-**Validated on real hardware:**
-- Two-node, DHT-routed inference demo — one machine loads a model, another `curl`s `localhost:11434/api/chat` and gets a signed result routed over libp2p.
-- Real embeddings on Apple Metal — `nomic-embed-text` via `/api/embed`, 768-dim vectors with correct semantics (`cos(cat,kitten)=0.74`, `cos(cat,finance)=0.30`).
-- An authz-gate demo — default-deny rejects an unauthorized routed job; the operator escape hatch accepts it with `X-Lucid-Receipt-Verified: true`.
-
-**Recorded checkpoint QA (August 2026):** macOS ARM64 460 tests passed / 2 ignored; Ubuntu x86_64 450 passed / 2 ignored, release build and strict Clippy passed. These are historical results for the source identified in the [checkpoint record](memory-bank/tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md), not a claim of fresh qualification or a released v0.2.
-
-**November follow-up:** the November 7 macOS run and separate real llama-server/Gemma smoke passed, while repeated backend suites exposed an intermittent fixture startup failure. The November 9 CI repair updates the affected dependencies, isolates macOS fixture subprocesses and corrects the relay idle-timeout assertion. The macOS workspace passes 460 tests (2 ignored), formatting and strict Clippy; the dependency audit reports zero vulnerabilities and zero yanked packages under the existing policy. Four transitive unmaintained warnings remain visible. See [current qualification evidence](memory-bank/progress.md#ci-security-and-test-reliability-refresh-2026-11-09); physical-network and release acceptance gates remain open.
+**Website & Full Documentation:** [msitarzewski.github.io/phase](https://msitarzewski.github.io/phase/) · **[Download & Releases](https://github.com/msitarzewski/phase/releases)** · **[60-Second Quickstart](docs/friends-and-family-quickstart.md)** · **[HTTP API](site/help/http-api.md)** · **[Network Protocols](site/help/protocols.md)**
 
 ---
 
-## What works today (v0.1)
+## Install in 60 seconds
 
-- **Ollama-compatible API** on `:11434` — compatible clients can use the supported endpoints without a Phase SDK; qualify the actual client and options rather than assuming complete upstream API parity:
-  `/api/chat`, `/api/generate` (NDJSON streaming) · `/api/embed`, `/api/embeddings` (vectors) · `/api/pull` (registers a local model) · `/api/tags`, `/api/show`, `/api/version`.
-- **Workers:** `llama.cpp` (real inference + embeddings via `llama-server`, any of its Metal/CUDA/ROCm/Vulkan backends) and an in-tree `echo` worker (no GPU, for dev/CI/demos).
-- **Local-or-DHT routing** — per-request: serve locally if the model is loaded, else discover a peer on the Kademlia DHT and relay the job, with **multi-peer failover**. Response headers report where it ran (`X-Lucid-Routed-Via`) and whether the peer's signed receipt verified (`X-Lucid-Receipt-Verified`).
-- **Attributable output integrity** — every result carries a streaming SHA-256 commitment in an Ed25519 `SignedReceipt`; verification binds signature, job, serving PeerId and delivered output. This does not prove correct model execution.
-- **Operator policy** — a hot-reloadable `policy.toml`: serve-model allowlist, auto-pause on battery / thermal / time-of-day / concurrency, a signer allowlist, and a `manual_pause`. Self-initiated requests bypass the donation-protection gates so the operator can always use their own GPU.
-- **WAN bootstrap** — stable libp2p ports, IPv6 listen, persistent identity, explicit `--bootstrap-peer`, and DNS TXT-record bootstrap (`--bootstrap-dns`, PeerID-pinned).
-- **Plasm** — the reference WASM node (`plasmd`): signed-manifest WASM execution in a sandboxed wasmtime runtime, content-addressed artifact serving, and the Phase Boot netboot/kexec pipeline.
+Every GitHub Release ships a unified `SHA256SUMS.txt` verified fail-closed before unpacking.
+
+- **macOS Apple Silicon (Desktop `.dmg` + CLI):** Download `LUCID_0.2.0_aarch64.dmg` from [Releases](https://github.com/msitarzewski/phase/releases), or run:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.sh | bash -s -- --app
+  ```
+- **Linux (`x86_64` & `aarch64`, Desktop `.deb` + CLI):** Install the `.deb` from [Releases](https://github.com/msitarzewski/phase/releases), or install the CLI (baseline `x86-64`, zero AVX2/BMI2 requirements):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.sh | bash
+  ```
+- **Windows (`x86_64` CLI):**
+  ```powershell
+  irm https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.ps1 | iex
+  ```
+
+See [site/help/install.md](site/help/install.md) for manual checksum verification, offline installs, and building from source.
 
 ---
 
-## Current checkpoint and remaining roadmap
+## What LUCID does (simple on the surface, deep underneath)
 
-The protocol remains workload-neutral. Implementation does not imply release acceptance; the [v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md#progress-tracker) records each gate.
+| Capability | Plain-English Summary | Deep Dive |
+|---|---|---|
+| **Built-in Chat & Ollama API** | Token-by-token streaming Desktop Chat (Stop, Copy, memory-only history, **Local Only** toggle) plus Ollama-compatible `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`, `/api/show`, `/api/ps`, and `/api/pull` on `127.0.0.1`. | [First chat](site/help/first-chat.md) · [HTTP API](site/help/http-api.md) |
+| **Default-Deny Private Circles** | Serving is off by default (`providing_enabled = false`). Share access via single-use `lucid://join/...` links or `.lucidinvite` files; uninvited peers are refused automatically. | [Joining a circle](site/help/first-chat.md#joining-a-trusted-circle) |
+| **Safe GPU Sharing** | Hot-reloadable `policy.toml` (+ `SIGHUP`) auto-pauses remote jobs on battery, over thermal ceiling, outside your hours, or above concurrency caps—while your own prompts always run. | [Operator policy](site/help/operator-policy.md) |
+| **Zero-Copy Discovery & P2P Pull** | Read-only discovery of Ollama and LM Studio GGUFs, SHA-256-pinned `llama.cpp b12651` runtime, and resumable `/phase/blob/1.0.0` P2P model downloads with whole-file SHA-256 verification. | [Models & sharing](site/help/models-and-sharing.md) |
+| **Hardened GPU Backends** | `llama.cpp` (Metal, CUDA, ROCm, Vulkan, CPU) with per-spawn 256-bit `LLAMA_API_KEY`, cross-tenant KV-cache stripping (`--no-cache-prompt --cache-ram 0 --cache-reuse 0`), hang kill, deferred LRU eviction, and honest `/api/ps` residency; plus Apple Silicon `MLX` and dev `echo` workers. | [Workers & backends](site/help/workers-and-backends.md) |
+| **Tier-1 GPU Pooling** | Pool memory across your own trusted machines over Noise-encrypted `/phase/shard-rpc/1.0.0` with auto-managed SHA-256-pinned loopback `ggml-rpc-server`, RPC-first `--llama-tensor-split`, and refusal of silent local fallback. | [Trusted-Circle sharding](site/help/trusted-circle-sharding.md) |
+| **Self-Hostable Relay & Tor/Tails** | One-command unprivileged Linux Cloud Relay (`scripts/setup-cloud-relay.sh --port 443\|4001`), PeerID-pinned DNS TXT bootstrap, `--outbound-only` mode, and TailsOS/Tor guidance. | [Cloud Relay & Tor](site/help/cloud-relay-and-privacy.md) |
+| **Verifiable Substrate & Protocols** | Seven `/phase/*` libp2p protocols, ten Kademlia DHT namespaces, Ed25519 `SignedManifest`/`SignedReceipt` + streaming `CommitmentAccumulator`, and `plasmd` WASM reference node. | [Protocols](site/help/protocols.md) · [Cryptography](site/help/cryptography-and-receipts.md) |
 
-**v0.2 — implemented, awaiting acceptance**
-- Content-derived CIDs, signed alias/provider records, verified network pull and resumable transfer.
-- Live peer streaming with cancellation, backpressure, ordered frames and terminal receipt binding.
-- Circuit relay, AutoNAT and DCUtR machinery; public rendezvous serving stays disabled pending registration quotas.
-- Local evidence/reputation and bounded deterministic redundant checks. Agreement is empirical evidence, not proof of model execution.
-- Experimental pinned MLX subprocess adapter, pending real Apple Silicon acceptance.
+---
 
-**Next evidence gates**
-- Demonstrate the [intended stream](memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md) across physical networks and consumer NAT using a real model, verified pull/resume, live remote output, cancellation and invalid-content/receipt rejection.
-- Evaluate independent correctness-validation methods against existing work such as TOPLOC and OpenHydra's challenge/replay mechanisms, with exact model/backend binding and explicit limitations.
-- Measure independent whole-model jobs across heterogeneous peers before proposing tensor sharding. **ShardWorker remains research-blocked**; no production worker exists.
-- Finish Linux ARM64, real MLX, rollback, clean-host and public-load qualification.
+## Current status (reviewed 2026-11-27)
 
-**v0.3 — privacy**
-- Research prompt confidentiality from the serving operator. Encrypted transport and onion routing alone do not hide a prompt from the machine executing it; a stronger claim requires a separately evaluated construction. The current local-only toggle keeps requests on the operator's machine.
+- **Phase Core** — **shipped.** Six publishable Apache-2.0 crates (`phase-identity`, `phase-net`, `phase-manifest`, `phase-receipt`, `phase-protocol`, `phase-artifact-server`) plus the `plasm` WASM reference node, all with `#![deny(unsafe_code)]`.
+- **LUCID v0.1 / v0.1.1** — **shipped & security-hardened.** Default-deny authorization, Ed25519 `PeerId` binding, four-way receipt verification, `libp2p 0.57` / `wasmtime 36 LTS` / `hickory 0.26`, and `cargo audit` / `cargo deny` CI gates.
+- **LUCID v0.2 beta (`Friends & Family`)** — **active physical 5-node qualification (`v0.2.0-rc11` live fleet-wide; `v0.2.0-rc12` release signing active).**
+  - **Verified on physical hardware:** `122/122` (`100%`) remote peer-verified Ed25519 receipts across live WAN/relay/LAN runs (plus `6` local commitments, `12` sharded runs, and `2` chained stage receipts); `10.18 GB` P2P pull with interrupt & exact-offset resume; Apple Silicon MLX at `71.3 tok/s` (`124 ms` TTFT) over Cellular + VPN + Cloud Relay and `98.0 tok/s` combined 2-Mac burst; zero-SSH 2-Mac sliced `gemma-4-12B` over `/phase/shard-rpc/1.0.0` at `22.0 tok/s` (`c=1`) and `57.5 tok/s` (`c=4`); empirical KV-cache isolation verification; baseline `x86-64` zero-`SIGILL` run on 2012 Ivy Bridge; macOS Developer ID + Apple Notarization + stapling; and Windows Azure Artifact Signing via GitHub OIDC.
+  - **Honest open gates before v0.2.0 final:** NVIDIA CUDA live host run (awaiting host reboot), fail-closed native `--tor-socks5` transport, public rendezvous registration quotas, Linux ARM64 VM qualification, and multi-site relay redundancy.
+  - **Honest security boundaries:** Receipts prove attributable output integrity (`PeerId` + exact streamed bytes), not hidden weight quantization; serving peers see plaintext prompts (use `X-Lucid-Local-Only: true` for local-only prompts); Tier-1 GPU pooling carries SSH-equivalent peer trust and Tier-2 `UntrustedSpotChecked` sharding remains fail-closed.
 
-**Backends (LUCID)**
-- **MLX worker** — experimental implementation exists; real model, lifecycle, peer-routing and power/performance acceptance remain.
-- **CoreAIWorker** — Apple Neural Engine backend for our own converted open-weights models (the "donate your idle Mac overnight" efficiency profile). After MLX; gated on confirming the public Core AI API exposes KV-cache / stateful decode. (Apple **Foundation Models** is explicitly a non-goal — see [decisions.md](memory-bank/decisions.md).)
-
-**Second flagship & future workloads**
-- **LUMEN** — the diffusion / image-synthesis flagship, a *separate* Phase node (not a LUCID mode), to prove the workload-agnostic bet.
-- **phase-render**, **phase-science** — further reference nodes for any compute that benefits from verifiable distribution.
-
-**Reach & governance**
-- More geographically-distributed foundation relays; a consumer install site.
-- A real mDNS implementation in `phase-artifact-server` (currently a stub).
-- A Mozilla/Tor-shaped **501(c)(3)** that holds the trademark and accepts grants without capture.
+See the [authoritative v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md) and [physical fleet progress report](memory-bank/releases/lucid-v0.2/fleet-progress-report.md).
 
 ---
 
 ## Repository structure
 
-```
+```text
 phase/
-├── Cargo.toml                 # Workspace root, resolver = 2
+├── Cargo.toml                     # Workspace root (edition 2021, rust-version 1.88)
+├── apps/
+│   └── lucid-desktop/             # Cross-platform Tauri v2 + Svelte 5 app (macOS .dmg, Linux .deb)
 ├── crates/
-│   ├── phase-identity/        # Persistent Ed25519 node identity        Apache-2.0
-│   ├── phase-net/             # libp2p 0.56 / Kademlia / mDNS / Noise+QUIC + job-relay   Apache-2.0
-│   ├── phase-manifest/        # SignedManifest<T>, generic over payload  Apache-2.0
-│   ├── phase-receipt/         # SignedReceipt<T> + commitment accumulator Apache-2.0
-│   ├── phase-protocol/        # JobSpec {Wasm,Inference,Embedding} + Worker trait + JobStream  Apache-2.0
-│   ├── phase-artifact-server/ # Content-addressed HTTP server            Apache-2.0
-│   ├── plasm/                 # Reference WASM Phase node (plasmd)        Apache-2.0
-│   └── lucidd/                # LUCID inference Phase node (lucidd)       AGPL-3.0-or-later
-├── php-sdk/                   # PHP client SDK (legacy + phase-receipt:v1: signing)
-├── wasm-examples/             # Source for hello.wasm
-├── examples/                  # hello.wasm artifact + PHP demos
-├── boot/                      # Phase Boot (USB/netboot initramfs)
-├── dist/                      # Pre-built binaries per target triple + demo asciinema
-├── docs/                      # Additional documentation
-├── memory-bank/               # Project documentation (MISSION, decisions, progress, releases, tasks)
-└── CLAUDE.md / AGENTS.md      # AI-assist development workflow
+│   ├── phase-identity/            # Persistent Ed25519 identity (0600)          Apache-2.0
+│   ├── phase-net/                 # libp2p 0.57, Kademlia, Relay v2, /phase/*   Apache-2.0
+│   ├── phase-manifest/            # Generic SignedManifest<T>                   Apache-2.0
+│   ├── phase-receipt/             # Generic SignedReceipt<T>                    Apache-2.0
+│   ├── phase-protocol/            # Worker trait, JobSpec, CommitmentAccumulator Apache-2.0
+│   ├── phase-artifact-server/     # Content-addressed HTTP Range server         Apache-2.0
+│   ├── plasm/                     # Reference WASM node (plasmd) + Phase Boot   Apache-2.0
+│   └── lucidd/                    # LUCID GPU inference daemon (lucidd)         AGPL-3.0-or-later
+├── site/                          # GitHub Pages landing page, releases & searchable help/API docs
+├── scripts/
+│   ├── build_site.py              # Builds & verifies _site/ via pandoc (links, anchors, opsec)
+│   ├── install-lucid.sh           # Verified macOS & Linux installer
+│   ├── install-lucid.ps1          # Verified Windows x86_64 installer
+│   ├── setup-cloud-relay.sh       # One-command unprivileged Linux Cloud Relay setup
+│   ├── sign-macos-release.sh      # Local Mac Keychain Developer ID + notarization + staple
+│   ├── sign-windows-binary.ps1    # Shared CI + local Azure Artifact Signing script
+│   └── phase-validate.sh          # Fingerprinted build/test/security/release validation harness
+├── docs/                          # Quickstart, Tor/Tails, and platform guides
+└── memory-bank/                   # Architecture decisions, mission, release trackers & fleet logs
 ```
-
-### Crate dependency graph
-
-```
-phase-identity   ← leaf
-  ├── phase-net
-  ├── phase-manifest
-  └── phase-receipt
-          └── phase-protocol
-                  ├── phase-artifact-server  (also depends on phase-net)
-                  ├── plasm                  (WASM reference node)
-                  └── lucidd                 (inference flagship)
-```
-
-No upward references. Build order is top to bottom.
 
 ---
 
-## Quick start
-
-Build and test everything:
+## Build and run from source
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-```
+# Build and test all 8 workspace crates
+cargo build --workspace --locked
+cargo test --workspace --locked
 
-**Plasm** — run the reference WASM node and execute the hello.wasm sample (reverses `Hello, World` → `dlroW ,olleH`, emitting a signed receipt):
+# Run LUCID with the GPU-less echo worker (no model required)
+cargo run -p lucidd -- --mode worker --worker echo
+curl -s http://127.0.0.1:11434/api/embed -d '{"model":"echo","input":["hello","world"]}'
 
-```bash
+# Run LUCID with real GGUF inference via llama.cpp
+cargo run -p lucidd -- --mode worker --worker llama-cpp \
+  --model-dir ~/Models --llama-server-binary /absolute/path/to/llama-server
+curl -s http://127.0.0.1:11434/api/chat \
+  -d '{"model":"my-model","messages":[{"role":"user","content":"hi"}]}'
+
+# Run the Plasm WASM reference node
 cargo run -p plasm --bin plasmd -- start
 cargo run -p plasm --bin plasmd -- run examples/hello.wasm
+
+# Build and preview the GitHub Pages documentation site locally (requires pandoc)
+python3 scripts/build_site.py
+python3 -m http.server -d _site 8090
 ```
-
-**LUCID** — run the inference daemon. With the GPU-less echo worker (no model needed):
-
-```bash
-cargo run -p lucidd -- --worker echo
-curl -s localhost:11434/api/embed -d '{"model":"echo","input":["hello","world"]}'
-```
-
-With real inference/embeddings via llama.cpp (point `--model-dir` at a folder of `.gguf` files; needs the `llama-server` binary):
-
-```bash
-cargo run -p lucidd -- --worker llama-cpp \
-  --model-dir ~/models --llama-server-binary "$(command -v llama-server)"
-curl -s localhost:11434/api/chat \
-  -d '{"model":"my-model","messages":[{"role":"user","content":"hi"}]}'
-```
-
-Any Ollama-compatible client works unchanged — point it at `http://localhost:11434`. See [crates/lucidd/README.md](crates/lucidd/README.md) for the full daemon reference.
 
 ---
 
-## Documentation
+## Documentation index
 
-- [memory-bank/MISSION.md](memory-bank/MISSION.md) — what we are building and why
-- [Competitive ecosystem review](memory-bank/research/2026-06-21-ai-sovereignty-and-local-inference-ecosystem.md#competitive-reassessment--2026-11-07) — direct peers, evidence limits and Phase's remaining differentiation
-- [LUCID v0.2 tracker](memory-bank/releases/lucid-v0.2/README.md) — authoritative implementation and release-acceptance status
-- [crates/lucidd/README.md](crates/lucidd/README.md) — the LUCID daemon (API, workers, CLI, security)
-- [crates/plasm/README.md](crates/plasm/README.md) — the Plasm WASM node
-- [memory-bank/releases/phase-core/](memory-bank/releases/phase-core/) — substrate extraction release plan
-- [memory-bank/releases/lucid/](memory-bank/releases/lucid/) — inference flagship release plan
-- [memory-bank/decisions.md](memory-bank/decisions.md) — architectural decision record
-- [memory-bank/progress.md](memory-bank/progress.md) — milestone log
-- [memory-bank/projectRules.md](memory-bank/projectRules.md) — coding and contribution conventions
-- [CLAUDE.md](CLAUDE.md) — AI-assist development workflow (AGENTS.md-compatible)
+- **GitHub Pages Site:** [msitarzewski.github.io/phase](https://msitarzewski.github.io/phase/) (`site/pages/*.html`, `site/help/*.md`)
+- **Guides:** [Install](site/help/install.md) · [First Chat & Circles](site/help/first-chat.md) · [Models & Sharing](site/help/models-and-sharing.md) · [Operator Policy](site/help/operator-policy.md) · [Workers & Backends](site/help/workers-and-backends.md) · [Tier-1 GPU Pooling](site/help/trusted-circle-sharding.md) · [Cloud Relay & Tor/Tails](site/help/cloud-relay-and-privacy.md)
+- **Technical Reference:** [HTTP API](site/help/http-api.md) · [CLI & Env Vars](site/help/cli-and-env.md) · [Phase Protocols & DHT](site/help/protocols.md) · [Cryptography & Receipts](site/help/cryptography-and-receipts.md) · [Architecture & Crates](site/help/architecture-and-crates.md)
+- **Project Records:** [MISSION.md](memory-bank/MISSION.md) · [LUCID v0.2 Tracker](memory-bank/releases/lucid-v0.2/README.md) · [crates/lucidd/README.md](crates/lucidd/README.md) · [crates/plasm/README.md](crates/plasm/README.md) · [decisions.md](memory-bank/decisions.md)
 
 ---
 
 ## License
 
-- `phase-identity`, `phase-net`, `phase-manifest`, `phase-receipt`, `phase-protocol`, `phase-artifact-server`, `plasm` — **Apache-2.0**. The substrate must be adoptable without legal friction by anyone, including parties hostile to one another.
-- `lucidd` — **AGPL-3.0-or-later**. The flagship application is copyleft so no party can fork it closed.
+- **Phase substrate & Plasm** (`phase-identity`, `phase-net`, `phase-manifest`, `phase-receipt`, `phase-protocol`, `phase-artifact-server`, `plasm`): **Apache-2.0**
+- **LUCID daemon & Desktop app** (`lucidd`, `apps/lucid-desktop`): **AGPL-3.0-or-later**
 
-See per-crate `Cargo.toml` for canonical license declarations and the top-level [LICENSE](LICENSE) file for the Apache-2.0 text.
+See per-crate `Cargo.toml` manifests and the top-level [LICENSE](LICENSE) file.

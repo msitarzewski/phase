@@ -24,11 +24,10 @@ pub(crate) fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, Rec
 fn sort_value(v: Value) -> Value {
     match v {
         Value::Object(map) => {
-            let mut sorted = Map::new();
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            for k in keys {
-                let val = map.get(&k).cloned().unwrap_or(Value::Null);
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            let mut sorted = Map::with_capacity(entries.len());
+            for (k, val) in entries {
                 sorted.insert(k, sort_value(val));
             }
             Value::Object(sorted)

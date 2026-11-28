@@ -1,0 +1,2255 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! MLX-backed inference worker for Apple Silicon.
+//!
+//! This adapter deliberately uses a separate process boundary from
+//! `LlamaCppWorker`: `mlx_lm.server` is a Python HTTP/SSE service with a
+//! different command line, readiness contract, response schema, and failure
+//! profile than `llama-server`.  The shared Phase surface remains unchanged:
+//! [`Worker`], [`JobEvent`], commitments, and signed receipts are reused.
+//!
+//! The first supported boundary is intentionally narrow:
+//!
+//! - macOS on arm64 only;
+//! - one immutable, canonically hashed local model bundle per worker;
+//! - one in-flight inference at a time;
+//! - compatibility targets `mlx-lm==0.31.3` and `mlx==0.31.2`, explicitly
+//!   unverified until the runtime supplies a stable offline attestation;
+//! - `/v1/chat/completions` and `/v1/completions` SSE, always with
+//!   `model: "default_model"`;
+//! - no embeddings, adapters, draft models, remote model identifiers, or
+//!   `trust-remote-code`.
+//!
+//! Real Apple Silicon Metal runs of this adapter (local loopback and over the
+//! WAN relay) are recorded in the LUCID v0.2 fleet qualification log, but
+//! formal release acceptance remains open and constructing or compiling this
+//! worker implies no run at all.  Callers surface [`MLX_HARDWARE_ACCEPTANCE`]
+//! verbatim in status output.  Receipts are this node's self-signed output
+//! commitments; they never prove to a third party which hardware computed
+//! the output.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{File, Metadata};
+use std::io::Read;
+use std::net::{Ipv4Addr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant, SystemTime};
+
+use async_stream::stream;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use phase_identity::NodeIdentity;
+use phase_protocol::{
+    CommitmentAccumulator, Completion, InferenceJobSpec, JobEvent, JobHandle, JobHandleProducer,
+    JobId, JobMetrics, JobResult, JobSpec, JobSpecKind, JobStream, OutputChunk, SamplingParams,
+    SignedManifest, Worker, WorkerError,
+};
+use phase_receipt::ReceiptBuilder;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::timeout;
+
+/// Compatibility target for the experimental adapter. This is not a runtime
+/// attestation: `mlx_lm.server` has no stable offline version-reporting
+/// contract that binds both Python packages to the entry point being launched.
+pub const TARGET_MLX_LM_VERSION: &str = "0.31.3";
+/// Compatibility target for the experimental adapter; see
+/// [`MLX_RUNTIME_ATTESTATION`].
+pub const TARGET_MLX_VERSION: &str = "0.31.2";
+/// Adapter-level hardware status. It describes the recorded qualification
+/// evidence for this adapter, not any individual job.
+pub const MLX_HARDWARE_ACCEPTANCE: &str = "fleet-recorded: real Apple Silicon Metal model runs of this adapter (local loopback and over the WAN relay) are recorded in LUCID v0.2 fleet qualification; formal release acceptance (pinned runtime versions, power/performance report) remains open; receipts are self-signed output commitments, not third-party proof of compute";
+/// Short machine-readable form of [`MLX_HARDWARE_ACCEPTANCE`] carried in
+/// receipt metadata.
+pub const MLX_HARDWARE_ACCEPTANCE_LABEL: &str = "fleet-recorded";
+/// What a receipt from this adapter proves about the computation itself.
+pub const MLX_COMPUTE_PROOF: &str = "none: self-signed output commitment";
+pub const MLX_RUNTIME_ATTESTATION: &str = "unverified: mlx_lm.server has no stable offline probe that binds the installed mlx-lm and mlx package versions to the launched entry point; only the entry-point bytes are pinned";
+pub const MLX_PORT_BINDING_STATUS: &str = "guarded, not race-free: Phase reserves the loopback port immediately before spawn, but mlx_lm.server cannot inherit that listener";
+/// Signed alias/provider format for the canonical bundle-root contract below.
+pub const MLX_BUNDLE_FORMAT: &str = "mlx-bundle-v1";
+/// Human-readable identifier for the exact root calculation. The bytes fed to
+/// SHA-256 start with `phase/mlx-bundle-root/v1\0` and are described by
+/// [`inspect_mlx_bundle`].
+pub const MLX_BUNDLE_ROOT_ALGORITHM: &str = "sha256:phase/mlx-bundle-root/v1";
+
+const SUPPORTED_KINDS: [JobSpecKind; 1] = [JobSpecKind::Inference];
+const DEFAULT_MAX_TOKENS: u32 = 512;
+const ABSOLUTE_MAX_TOKENS: u32 = 8192;
+const MAX_PROMPT_CHARS: usize = 1_000_000;
+const MAX_MESSAGES: usize = 4_096;
+use crate::backend_io::{append_sse_chunk, take_next_sse_frame};
+#[cfg(test)]
+use crate::backend_io::{SseFrameTooLarge, MAX_SSE_FRAME_BYTES};
+const SSE_INGEST_SLICE_BYTES: usize = 4 * 1024;
+const MAX_STREAM_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WARMUP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_STOP_SEQUENCES: usize = 16;
+const MAX_STOP_SEQUENCE_CHARS: usize = 256;
+const MAX_TOP_K: u64 = 1_000;
+const MAX_SEED: u64 = i32::MAX as u64;
+const MAX_BUNDLE_ENTRIES: usize = 4_096;
+const MAX_BUNDLE_DEPTH: usize = 16;
+const MAX_BUNDLE_PATH_BYTES: usize = 1_024;
+const MAX_RUNTIME_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MODEL_CONFIG_BYTES: u64 = 1024 * 1024;
+const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const CHILD_IO_BUFFER_BYTES: usize = 4 * 1024;
+const BUNDLE_ROOT_DOMAIN: &[u8] = b"phase/mlx-bundle-root/v1\0";
+
+use crate::registry::{ModelCid, MAX_MODEL_SIZE_BYTES};
+use crate::worker_llama::{ResidentModelInfo, ResidentModelKind, ResidentModels};
+
+/// Backend label reported for the model held by [`MlxWorker`]; matches the
+/// `backend` of the `ModelCapabilities` this node advertises for it.
+pub const MLX_BACKEND: &str = "mlx";
+
+/// Verified, bounded metadata derived from bundle bytes rather than CLI
+/// strings. Callers can safely use this for signed alias metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlxBundleMetadata {
+    pub model_cid: ModelCid,
+    pub total_bytes: u64,
+    pub file_count: u32,
+    /// Conservative context limit read from the hashed `config.json` when the
+    /// model declares one unambiguously. `None` means it must not be advertised
+    /// from this adapter.
+    pub context_length: Option<u32>,
+}
+
+/// Configuration for one pinned MLX runtime and one verified model bundle.
+///
+/// `model_cid` must equal the independently recomputed canonical bundle root.
+/// The worker verifies it during construction and before every process spawn;
+/// it never converts an untrusted request model into a filesystem path.
+#[derive(Debug, Clone)]
+pub struct MlxConfig {
+    pub server_binary_path: PathBuf,
+    pub verified_model_bundle_path: PathBuf,
+    pub model_cid: ModelCid,
+    /// `0` asks Phase to choose a currently free ephemeral loopback port. A
+    /// fixed nonzero port is rejected if already occupied. There remains a
+    /// small bind race because mlx_lm cannot inherit Phase's listener.
+    pub server_port: u16,
+    pub max_output_tokens: u32,
+    pub model_load_timeout: Duration,
+    pub request_start_timeout: Duration,
+    pub per_request_idle_timeout: Duration,
+    pub request_deadline: Duration,
+    pub shutdown_timeout: Duration,
+    /// Number of retries after the first failed start.  Capped at three.
+    pub max_start_retries: u8,
+    pub restart_backoff: Duration,
+}
+
+impl MlxConfig {
+    pub fn new(
+        server_binary_path: PathBuf,
+        verified_model_bundle_path: PathBuf,
+        model_cid: ModelCid,
+        server_port: u16,
+    ) -> Self {
+        Self {
+            server_binary_path,
+            verified_model_bundle_path,
+            model_cid,
+            server_port,
+            max_output_tokens: ABSOLUTE_MAX_TOKENS,
+            model_load_timeout: Duration::from_secs(120),
+            request_start_timeout: Duration::from_secs(30),
+            per_request_idle_timeout: Duration::from_secs(30),
+            request_deadline: Duration::from_secs(15 * 60),
+            shutdown_timeout: Duration::from_secs(3),
+            max_start_retries: 2,
+            restart_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MlxWorker {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    identity: NodeIdentity,
+    config: MlxConfig,
+    bundle_snapshot: Arc<BundleSnapshot>,
+    runtime_snapshot: RuntimeSnapshot,
+    client: reqwest::Client,
+    server: Mutex<Option<Arc<MlxServer>>>,
+    /// The backend that last passed readiness, mirrored outside the async
+    /// `server` lock (held across a whole cold load) so residency can be read
+    /// synchronously and never waits behind a load.
+    ready: std::sync::Mutex<Option<ReadyServer>>,
+    capacity: Arc<Semaphore>,
+    /// `true` once a backend has ended abnormally (or a restart failed)
+    /// without a later successful full re-hash; the next spawn then streams
+    /// every bundle byte through SHA-256 again instead of trusting the
+    /// identity-only check. Construction has just hashed, so it starts clear.
+    content_reverify_required: AtomicBool,
+    /// Test-only observation of how many spawn-time verifications streamed
+    /// the full bundle contents.
+    #[cfg(test)]
+    content_rehash_count: std::sync::atomic::AtomicUsize,
+}
+
+impl MlxWorker {
+    /// Validate the platform, pinned runtime, and verified bundle before any
+    /// subprocess can be spawned.
+    pub fn new(identity: NodeIdentity, config: MlxConfig) -> Result<Self, WorkerError> {
+        let validated = validate_config(config)?;
+        let config = validated.config;
+        let client = reqwest::Client::builder()
+            // Never let a configured system proxy receive local prompts.
+            .no_proxy()
+            // A loopback backend must not redirect a prompt elsewhere.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(config.request_start_timeout)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .build()
+            .map_err(|_| WorkerError::Other("failed to construct MLX HTTP client".into()))?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                identity,
+                config,
+                bundle_snapshot: Arc::new(validated.bundle_snapshot),
+                runtime_snapshot: validated.runtime_snapshot,
+                client,
+                server: Mutex::new(None),
+                ready: std::sync::Mutex::new(None),
+                capacity: Arc::new(Semaphore::new(1)),
+                content_reverify_required: AtomicBool::new(false),
+                #[cfg(test)]
+                content_rehash_count: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    pub fn hardware_acceptance(&self) -> &'static str {
+        MLX_HARDWARE_ACCEPTANCE
+    }
+
+    pub fn model_cid(&self) -> ModelCid {
+        self.inner.config.model_cid
+    }
+
+    pub fn bundle_metadata(&self) -> MlxBundleMetadata {
+        self.inner.bundle_snapshot.metadata()
+    }
+
+    pub fn bundle_format(&self) -> &'static str {
+        MLX_BUNDLE_FORMAT
+    }
+
+    pub fn max_output_tokens(&self) -> u32 {
+        self.inner.config.max_output_tokens
+    }
+
+    pub fn advertised_capacity(&self) -> u32 {
+        1
+    }
+
+    pub fn runtime_executable_sha256(&self) -> [u8; 32] {
+        self.inner.runtime_snapshot.sha256
+    }
+
+    pub fn runtime_attestation(&self) -> &'static str {
+        MLX_RUNTIME_ATTESTATION
+    }
+
+    pub fn port_binding_status(&self) -> &'static str {
+        MLX_PORT_BINDING_STATUS
+    }
+
+    /// The model resident right now: present only while the backend that
+    /// passed readiness and warm-up is still running and has not been
+    /// invalidated (crash, cancellation, protocol failure, or shutdown).
+    pub fn resident_models(&self) -> Vec<ResidentModelInfo> {
+        resident_models_of(&self.inner)
+    }
+
+    /// [`ResidentModels`] source for this worker that does not keep it alive.
+    pub fn resident_models_handle(&self) -> ResidentModels {
+        let inner = Arc::downgrade(&self.inner);
+        ResidentModels::new(move || {
+            inner
+                .upgrade()
+                .map(|inner| resident_models_of(&inner))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Record `server` as the backend that just passed readiness.
+    fn publish_ready(&self, server: &Arc<MlxServer>) {
+        *self
+            .inner
+            .ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReadyServer {
+            server: Arc::downgrade(server),
+            since: SystemTime::now(),
+        });
+    }
+
+    /// Spawn the pinned backend if necessary and complete its bounded health
+    /// check plus one-token model warm-up. Callers must await this before
+    /// publishing a "loaded" model capability.
+    pub async fn preload(&self) -> Result<(), WorkerError> {
+        self.ensure_loaded().await.map(|_| ())
+    }
+
+    async fn ensure_loaded(&self) -> Result<Arc<MlxServer>, WorkerError> {
+        let mut slot = self.inner.server.lock().await;
+        if let Some(server) = slot.as_ref() {
+            if !server.is_failed() {
+                return Ok(server.clone());
+            }
+        }
+        if let Some(stale) = slot.take() {
+            if stale.ended_abnormally() {
+                self.inner
+                    .content_reverify_required
+                    .store(true, Ordering::Release);
+            }
+            stale.shutdown(self.inner.config.shutdown_timeout).await;
+        }
+
+        let attempts = u32::from(self.inner.config.max_start_retries) + 1;
+        let mut last_failure = "MLX backend did not become ready";
+        for attempt in 0..attempts {
+            // A clean, Phase-initiated restart (e.g. after cancelling a
+            // request) only re-proves the immutable bundle's identity; a
+            // multi-GB content re-hash is reserved for restarts after the
+            // backend ended abnormally, where on-disk corruption is a real
+            // suspect.
+            let mode = if self.inner.content_reverify_required.load(Ordering::Acquire) {
+                BundleScanMode::ContentHash
+            } else {
+                BundleScanMode::IdentityOnly
+            };
+            let config = self.inner.config.clone();
+            let expected_bundle = self.inner.bundle_snapshot.clone();
+            let expected_runtime = self.inner.runtime_snapshot.clone();
+            let reverified = tokio::task::spawn_blocking(move || {
+                reverify_spawn_inputs(&config, &expected_bundle, &expected_runtime, mode)
+            })
+            .await
+            .map_err(|_| WorkerError::Other("MLX verification task failed".into()))?;
+            reverified?;
+            if mode == BundleScanMode::ContentHash {
+                #[cfg(test)]
+                self.inner
+                    .content_rehash_count
+                    .fetch_add(1, Ordering::AcqRel);
+                self.inner
+                    .content_reverify_required
+                    .store(false, Ordering::Release);
+            }
+
+            let server = match spawn_mlx_server(&self.inner.config) {
+                Ok(server) => Arc::new(server),
+                Err(error) => {
+                    tracing::warn!(attempt, error = %error, "MLX backend spawn failed");
+                    self.inner
+                        .content_reverify_required
+                        .store(true, Ordering::Release);
+                    last_failure = "failed to start MLX backend";
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(
+                            self.inner
+                                .config
+                                .restart_backoff
+                                .saturating_mul(attempt + 1),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+            };
+
+            match wait_for_ready(&self.inner.client, &server, &self.inner.config).await {
+                Ok(()) => {
+                    *slot = Some(server.clone());
+                    self.publish_ready(&server);
+                    return Ok(server);
+                }
+                Err(error) => {
+                    tracing::warn!(attempt, error = %error, "MLX backend readiness failed");
+                    last_failure = "MLX backend readiness failed";
+                    self.inner
+                        .content_reverify_required
+                        .store(true, Ordering::Release);
+                    server.shutdown(self.inner.config.shutdown_timeout).await;
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(
+                            self.inner
+                                .config
+                                .restart_backoff
+                                .saturating_mul(attempt + 1),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(WorkerError::Other(last_failure.into()))
+    }
+}
+
+/// A backend that passed readiness and warm-up at `since`. Weak, so the
+/// mirror never extends the backend's lifetime past the `server` slot; a
+/// replaced, failed, or dropped backend therefore never reads as resident
+/// even before the next successful load overwrites this record.
+struct ReadyServer {
+    server: Weak<MlxServer>,
+    since: SystemTime,
+}
+
+fn resident_models_of(inner: &Inner) -> Vec<ResidentModelInfo> {
+    let ready = inner
+        .ready
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(ready) = ready.as_ref() else {
+        return Vec::new();
+    };
+    match ready.server.upgrade() {
+        Some(server) if !server.is_failed() => vec![ResidentModelInfo {
+            model_id: inner.config.model_cid.to_hex(),
+            backend: MLX_BACKEND,
+            kind: ResidentModelKind::Generation,
+            // This adapter never offloads layers to other machines.
+            trusted_circle_sharded: false,
+            loaded_since: ready.since,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+impl Worker for MlxWorker {
+    fn supported_kinds(&self) -> &[JobSpecKind] {
+        &SUPPORTED_KINDS
+    }
+
+    fn capacity_hint(&self) -> usize {
+        1
+    }
+
+    async fn execute(
+        &self,
+        job: SignedManifest<JobSpec>,
+    ) -> Result<(JobHandle, JobStream), WorkerError> {
+        let manifest_hash = job
+            .manifest_hash()
+            .map_err(|error| WorkerError::BadManifest(error.to_string()))?;
+        let JobSpec::Inference(inference) = &job.payload else {
+            return Err(WorkerError::Unsupported {
+                kind: job.payload.kind(),
+            });
+        };
+
+        if inference.model_cid != self.inner.config.model_cid.to_hex() {
+            return Err(WorkerError::ArtifactUnavailable("model unavailable".into()));
+        }
+        let request = build_completion_request(inference, self.inner.config.max_output_tokens)
+            .map_err(|error| WorkerError::BadManifest(format!("invalid MLX request: {error}")))?;
+
+        let permit = self
+            .inner
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WorkerError::Capacity)?;
+        let server = match self.ensure_loaded().await {
+            Ok(server) => server,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
+        };
+
+        let (handle, producer) = JobHandle::new(JobId(manifest_hash));
+        let stream: JobStream = Box::pin(run_inference(
+            self.inner.client.clone(),
+            server,
+            request,
+            manifest_hash,
+            producer,
+            self.inner.identity.clone(),
+            self.inner.config.clone(),
+            permit,
+        ));
+        Ok((handle, stream))
+    }
+}
+
+struct ValidatedConfig {
+    config: MlxConfig,
+    bundle_snapshot: BundleSnapshot,
+    runtime_snapshot: RuntimeSnapshot,
+}
+
+fn validate_config(mut config: MlxConfig) -> Result<ValidatedConfig, WorkerError> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(WorkerError::Other(
+            "MLX backend requires macOS on Apple Silicon".into(),
+        ));
+    }
+    if config.max_output_tokens == 0 || config.max_output_tokens > ABSOLUTE_MAX_TOKENS {
+        return Err(WorkerError::Other(format!(
+            "MLX max_output_tokens must be in 1..={ABSOLUTE_MAX_TOKENS}"
+        )));
+    }
+    if config.max_start_retries > 3 {
+        return Err(WorkerError::Other(
+            "MLX max_start_retries must be at most 3".into(),
+        ));
+    }
+    for (name, value) in [
+        ("model_load_timeout", config.model_load_timeout),
+        ("request_start_timeout", config.request_start_timeout),
+        ("per_request_idle_timeout", config.per_request_idle_timeout),
+        ("request_deadline", config.request_deadline),
+        ("shutdown_timeout", config.shutdown_timeout),
+    ] {
+        if value.is_zero() {
+            return Err(WorkerError::Other(format!(
+                "MLX {name} must be greater than zero"
+            )));
+        }
+    }
+    let (runtime_path, runtime_snapshot) = inspect_runtime(&config.server_binary_path)?;
+    let (bundle_path, bundle_snapshot) = scan_bundle(&config.verified_model_bundle_path)?;
+    if bundle_snapshot.cid != config.model_cid {
+        return Err(WorkerError::ArtifactUnavailable(
+            "MLX bundle root does not match configured model CID".into(),
+        ));
+    }
+    config.server_binary_path = runtime_path;
+    config.verified_model_bundle_path = bundle_path;
+    Ok(ValidatedConfig {
+        config,
+        bundle_snapshot,
+        runtime_snapshot,
+    })
+}
+
+/// Independently inspect an immutable MLX bundle and compute its canonical
+/// content root. The root is SHA-256 over:
+///
+/// - `phase/mlx-bundle-root/v1\0`;
+/// - the big-endian file count and total file bytes;
+/// - for every file sorted by canonical relative path bytes: the big-endian
+///   path length, path bytes, file size, and SHA-256 of the file bytes.
+///
+/// Relative path components must be portable ASCII (and therefore canonical
+/// UTF-8), which intentionally excludes Unicode-normalization and
+/// case-folding ambiguity across filesystems.
+pub fn inspect_mlx_bundle(path: &Path) -> Result<MlxBundleMetadata, WorkerError> {
+    scan_bundle(path).map(|(_, snapshot)| snapshot.metadata())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSnapshot {
+    identity: FileIdentity,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleSnapshot {
+    cid: ModelCid,
+    total_bytes: u64,
+    file_count: u32,
+    context_length: Option<u32>,
+    root_identity: FileIdentity,
+    entries: Vec<SnapshotEntry>,
+}
+
+impl BundleSnapshot {
+    fn metadata(&self) -> MlxBundleMetadata {
+        MlxBundleMetadata {
+            model_cid: self.cid,
+            total_bytes: self.total_bytes,
+            file_count: self.file_count,
+            context_length: self.context_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEntry {
+    relative_path: String,
+    kind: SnapshotEntryKind,
+    identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    readonly: bool,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    nlink: u64,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+fn file_identity(metadata: &Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        FileIdentity {
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+        }
+    }
+}
+
+fn require_immutable_permissions(metadata: &Metadata, subject: &str) -> Result<(), WorkerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o222 != 0 {
+            return Err(WorkerError::ArtifactUnavailable(format!(
+                "{subject} must have no write permission bits"
+            )));
+        }
+        if metadata.is_file() && metadata.nlink() != 1 {
+            return Err(WorkerError::ArtifactUnavailable(format!(
+                "{subject} must not be hard-linked"
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    if !metadata.permissions().readonly() {
+        return Err(WorkerError::ArtifactUnavailable(format!(
+            "{subject} must be read-only"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_runtime(path: &Path) -> Result<(PathBuf, RuntimeSnapshot), WorkerError> {
+    if !path.is_absolute() {
+        return Err(WorkerError::Other(
+            "MLX runtime path must be absolute".into(),
+        ));
+    }
+    let supplied_metadata = path
+        .symlink_metadata()
+        .map_err(|_| WorkerError::Other("MLX runtime is unavailable".into()))?;
+    if supplied_metadata.file_type().is_symlink() {
+        return Err(WorkerError::Other(
+            "MLX runtime path must not be a symbolic link".into(),
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| WorkerError::Other("MLX runtime is unavailable".into()))?;
+    let before = canonical
+        .symlink_metadata()
+        .map_err(|_| WorkerError::Other("MLX runtime is unavailable".into()))?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(WorkerError::Other(
+            "MLX runtime must be a regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if before.permissions().mode() & 0o111 == 0 {
+            return Err(WorkerError::Other("MLX runtime is not executable".into()));
+        }
+    }
+    require_immutable_permissions(&before, "MLX runtime")
+        .map_err(|error| WorkerError::Other(error.to_string()))?;
+    if before.len() == 0 || before.len() > MAX_RUNTIME_BYTES {
+        return Err(WorkerError::Other(
+            "MLX runtime size is outside the supported range".into(),
+        ));
+    }
+    let (sha256, opened_identity) = hash_regular_file(&canonical, &before, MAX_RUNTIME_BYTES)
+        .map_err(|error| WorkerError::Other(format!("MLX runtime verification failed: {error}")))?;
+    Ok((
+        canonical,
+        RuntimeSnapshot {
+            identity: opened_identity,
+            sha256,
+        },
+    ))
+}
+
+fn canonical_bundle_root(path: &Path) -> Result<PathBuf, WorkerError> {
+    if !path.is_absolute() {
+        return Err(WorkerError::Other(
+            "MLX model bundle path must be absolute".into(),
+        ));
+    }
+    let supplied_metadata = path
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    if supplied_metadata.file_type().is_symlink() {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle root must not be a symbolic link".into(),
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    let metadata = canonical
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(WorkerError::ArtifactUnavailable("model unavailable".into()));
+    }
+    require_immutable_permissions(&metadata, "MLX bundle root")?;
+    Ok(canonical)
+}
+
+#[derive(Debug)]
+struct BundleFileRecord {
+    relative_path: String,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Default)]
+struct BundleScanState {
+    entry_count: usize,
+    total_bytes: u64,
+    files: Vec<BundleFileRecord>,
+    entries: Vec<SnapshotEntry>,
+    portable_paths: BTreeSet<String>,
+    ambiguity_keys: BTreeSet<String>,
+    has_weights: bool,
+    has_tokenizer: bool,
+    context_length: Option<u32>,
+}
+
+fn scan_bundle(path: &Path) -> Result<(PathBuf, BundleSnapshot), WorkerError> {
+    let root = canonical_bundle_root(path)?;
+    let root_before = root
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    let mut state = BundleScanState::default();
+    scan_bundle_directory(&root, &root, "", 0, &mut state, BundleScanMode::ContentHash)?;
+    let root_after = root
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model bundle changed during scan".into()))?;
+    if file_identity(&root_before) != file_identity(&root_after) {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle changed during scan".into(),
+        ));
+    }
+    if !state.portable_paths.contains("config.json")
+        || !state.portable_paths.contains("tokenizer_config.json")
+        || !state.has_weights
+        || !state.has_tokenizer
+    {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle is incomplete".into(),
+        ));
+    }
+    if state.files.is_empty() || state.total_bytes == 0 {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle contains no content".into(),
+        ));
+    }
+
+    state.files.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    state.entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    let file_count = u32::try_from(state.files.len())
+        .map_err(|_| WorkerError::ArtifactUnavailable("model bundle file count overflow".into()))?;
+    let mut root_hasher = Sha256::new();
+    root_hasher.update(BUNDLE_ROOT_DOMAIN);
+    root_hasher.update(u64::from(file_count).to_be_bytes());
+    root_hasher.update(state.total_bytes.to_be_bytes());
+    for file in &state.files {
+        let path = file.relative_path.as_bytes();
+        let path_len = u32::try_from(path.len()).map_err(|_| {
+            WorkerError::ArtifactUnavailable("model bundle path is too long".into())
+        })?;
+        root_hasher.update(path_len.to_be_bytes());
+        root_hasher.update(path);
+        root_hasher.update(file.size.to_be_bytes());
+        root_hasher.update(file.sha256);
+    }
+    let cid = ModelCid(root_hasher.finalize().into());
+    if cid.0.iter().all(|byte| *byte == 0) {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle produced an invalid zero CID".into(),
+        ));
+    }
+    Ok((
+        root,
+        BundleSnapshot {
+            cid,
+            total_bytes: state.total_bytes,
+            file_count,
+            context_length: state.context_length,
+            root_identity: file_identity(&root_after),
+            entries: state.entries,
+        },
+    ))
+}
+
+/// How much of each bundle file a scan reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleScanMode {
+    /// Stream every byte through SHA-256 (construction, and any spawn after
+    /// the backend ended abnormally).
+    ContentHash,
+    /// Re-check structure, permissions, and every entry's filesystem
+    /// identity (device, inode, size, mode, link count, owner, mtime, ctime)
+    /// without reading file contents. Sufficient to prove an immutable,
+    /// already-hashed bundle is unchanged: writing or replacing a file
+    /// changes its ctime or inode, and the scan requires no write bits and no
+    /// hard links.
+    IdentityOnly,
+}
+
+fn scan_bundle_directory(
+    root: &Path,
+    directory: &Path,
+    relative_directory: &str,
+    depth: usize,
+    state: &mut BundleScanState,
+    mode: BundleScanMode,
+) -> Result<(), WorkerError> {
+    if depth > MAX_BUNDLE_DEPTH {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle exceeds directory depth limit".into(),
+        ));
+    }
+    let before = directory
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    if !before.is_dir() || before.file_type().is_symlink() {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle contains a non-directory traversal entry".into(),
+        ));
+    }
+    require_immutable_permissions(&before, "MLX bundle directory")?;
+
+    let mut children = std::fs::read_dir(directory)
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    children.sort_by(|left, right| {
+        left.file_name()
+            .as_encoded_bytes()
+            .cmp(right.file_name().as_encoded_bytes())
+    });
+
+    for child in children {
+        state.entry_count += 1;
+        if state.entry_count > MAX_BUNDLE_ENTRIES {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle exceeds entry limit".into(),
+            ));
+        }
+        let segment = canonical_path_segment(&child.file_name())?;
+        let relative_path = if relative_directory.is_empty() {
+            segment
+        } else {
+            format!("{relative_directory}/{segment}")
+        };
+        if relative_path.len() > MAX_BUNDLE_PATH_BYTES {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle path exceeds length limit".into(),
+            ));
+        }
+        let ambiguity_key = relative_path.to_ascii_lowercase();
+        if !state.portable_paths.insert(relative_path.clone())
+            || !state.ambiguity_keys.insert(ambiguity_key)
+        {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle contains ambiguous paths".into(),
+            ));
+        }
+
+        let child_path = child.path();
+        if !child_path.starts_with(root) {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle path escaped its root".into(),
+            ));
+        }
+        let metadata = child_path
+            .symlink_metadata()
+            .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle contains unsupported symbolic links".into(),
+            ));
+        }
+        require_immutable_permissions(&metadata, "MLX bundle entry")?;
+
+        if metadata.is_dir() {
+            state.entries.push(SnapshotEntry {
+                relative_path: relative_path.clone(),
+                kind: SnapshotEntryKind::Directory,
+                identity: file_identity(&metadata),
+            });
+            scan_bundle_directory(root, &child_path, &relative_path, depth + 1, state, mode)?;
+        } else if metadata.is_file() {
+            reject_executable_bundle_entry(&relative_path, &metadata)?;
+            state.total_bytes = state
+                .total_bytes
+                .checked_add(metadata.len())
+                .filter(|total| *total <= MAX_MODEL_SIZE_BYTES)
+                .ok_or_else(|| {
+                    WorkerError::ArtifactUnavailable("model bundle exceeds byte limit".into())
+                })?;
+            state.has_weights |= relative_path.ends_with(".safetensors");
+            state.has_tokenizer |= matches!(
+                relative_path.as_str(),
+                "tokenizer.json" | "tokenizer.model" | "sentencepiece.bpe.model"
+            );
+            let identity = match mode {
+                BundleScanMode::ContentHash => {
+                    let (sha256, identity) =
+                        hash_regular_file(&child_path, &metadata, MAX_MODEL_SIZE_BYTES).map_err(
+                            |error| {
+                                WorkerError::ArtifactUnavailable(format!(
+                                    "model bundle file verification failed: {error}"
+                                ))
+                            },
+                        )?;
+                    if relative_path == "config.json" {
+                        state.context_length = read_verified_context_length(
+                            &child_path,
+                            &metadata,
+                            sha256,
+                            &identity,
+                        )?;
+                    }
+                    state.files.push(BundleFileRecord {
+                        relative_path: relative_path.clone(),
+                        size: metadata.len(),
+                        sha256,
+                    });
+                    identity
+                }
+                // `hash_regular_file` returns exactly this identity (it
+                // fails unless the opened file still matches it), so the two
+                // modes record comparable snapshots.
+                BundleScanMode::IdentityOnly => file_identity(&metadata),
+            };
+            state.entries.push(SnapshotEntry {
+                relative_path,
+                kind: SnapshotEntryKind::File,
+                identity,
+            });
+        } else {
+            return Err(WorkerError::ArtifactUnavailable(
+                "model bundle contains a special file".into(),
+            ));
+        }
+    }
+
+    let after = directory
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model bundle changed during scan".into()))?;
+    if file_identity(&before) != file_identity(&after) {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle changed during scan".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_path_segment(segment: &std::ffi::OsStr) -> Result<String, WorkerError> {
+    let Some(segment) = segment.to_str() else {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle path is not valid UTF-8".into(),
+        ));
+    };
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.len() > 255
+        || !segment.is_ascii()
+        || segment
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'/' || byte == b'\\' || byte == b':')
+    {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model bundle path is not portable canonical UTF-8".into(),
+        ));
+    }
+    Ok(segment.to_string())
+}
+
+fn reject_executable_bundle_entry(
+    relative_path: &str,
+    metadata: &Metadata,
+) -> Result<(), WorkerError> {
+    let lowercase = relative_path.to_ascii_lowercase();
+    if [".py", ".pyc", ".pyo", ".so", ".dylib", ".dll", ".sh"]
+        .iter()
+        .any(|suffix| lowercase.ends_with(suffix))
+    {
+        return Err(WorkerError::ArtifactUnavailable(
+            "MLX model bundle must not contain executable code".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            return Err(WorkerError::ArtifactUnavailable(
+                "MLX model bundle files must not be executable".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_regular_file(
+    path: &Path,
+    expected: &Metadata,
+    max_bytes: u64,
+) -> Result<([u8; 32], FileIdentity), String> {
+    if !expected.is_file() || expected.file_type().is_symlink() || expected.len() > max_bytes {
+        return Err("file type or size changed".into());
+    }
+    let expected_identity = file_identity(expected);
+    let mut file = File::open(path).map_err(|_| "file became unavailable".to_string())?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "opened file metadata is unavailable".to_string())?;
+    let opened_identity = file_identity(&opened);
+    if expected_identity != opened_identity {
+        return Err("file changed before it was opened".into());
+    }
+
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; FILE_HASH_BUFFER_BYTES];
+    let mut read_bytes = 0u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "file read failed".to_string())?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(count as u64)
+            .filter(|total| *total <= max_bytes)
+            .ok_or_else(|| "file exceeds byte limit".to_string())?;
+        hasher.update(&buffer[..count]);
+    }
+    if read_bytes != expected.len() {
+        return Err("file size changed while hashing".into());
+    }
+    let after_open = file
+        .metadata()
+        .map_err(|_| "post-read metadata is unavailable".to_string())?;
+    let after_path = path
+        .symlink_metadata()
+        .map_err(|_| "file disappeared while hashing".to_string())?;
+    if opened_identity != file_identity(&after_open)
+        || opened_identity != file_identity(&after_path)
+    {
+        return Err("file changed while hashing".into());
+    }
+    let digest = hasher.finish();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    Ok((out, opened_identity))
+}
+
+fn read_verified_context_length(
+    path: &Path,
+    expected_metadata: &Metadata,
+    expected_sha256: [u8; 32],
+    expected_identity: &FileIdentity,
+) -> Result<Option<u32>, WorkerError> {
+    if expected_metadata.len() > MAX_MODEL_CONFIG_BYTES {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model config exceeds size limit".into(),
+        ));
+    }
+    let mut file = File::open(path)
+        .map_err(|_| WorkerError::ArtifactUnavailable("model config became unavailable".into()))?;
+    if &file_identity(&file.metadata().map_err(|_| {
+        WorkerError::ArtifactUnavailable("model config metadata is unavailable".into())
+    })?) != expected_identity
+    {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model config changed during scan".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(expected_metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| WorkerError::ArtifactUnavailable("model config read failed".into()))?;
+    let post_metadata = file.metadata().map_err(|_| {
+        WorkerError::ArtifactUnavailable("model config metadata is unavailable".into())
+    })?;
+    let path_metadata = path
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model config became unavailable".into()))?;
+    let observed_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    if &file_identity(&post_metadata) != expected_identity
+        || &file_identity(&path_metadata) != expected_identity
+        || observed_sha256 != expected_sha256
+    {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model config changed during scan".into(),
+        ));
+    }
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| WorkerError::ArtifactUnavailable("model config is not valid JSON".into()))?;
+    if json_contains_forbidden_code_key(&config) {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model config requests unsupported custom code".into(),
+        ));
+    }
+    let direct = config.get("max_position_embeddings");
+    let nested = config
+        .get("text_config")
+        .and_then(|value| value.get("max_position_embeddings"));
+    let mut values = [direct, nested]
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    WorkerError::ArtifactUnavailable(
+                        "model context length is not a positive u32".into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    values.sort_unstable();
+    values.dedup();
+    if values.len() > 1 {
+        return Err(WorkerError::ArtifactUnavailable(
+            "model config declares conflicting context lengths".into(),
+        ));
+    }
+    Ok(values.into_iter().next())
+}
+
+fn json_contains_forbidden_code_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "auto_map" | "custom_pipelines" | "trust_remote_code"
+            ) || json_contains_forbidden_code_key(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(json_contains_forbidden_code_key),
+        _ => false,
+    }
+}
+
+/// Identity-only re-verification of an already content-hashed bundle: the
+/// same traversal, limits, and immutability checks as [`scan_bundle`], but no
+/// file contents are read. Fails unless the root and every entry match
+/// `expected` exactly.
+fn verify_bundle_identity(path: &Path, expected: &BundleSnapshot) -> Result<PathBuf, WorkerError> {
+    let changed = || {
+        WorkerError::ArtifactUnavailable(
+            "MLX model bundle changed after worker construction".into(),
+        )
+    };
+    let root = canonical_bundle_root(path)?;
+    let root_before = root
+        .symlink_metadata()
+        .map_err(|_| WorkerError::ArtifactUnavailable("model unavailable".into()))?;
+    let mut state = BundleScanState::default();
+    scan_bundle_directory(
+        &root,
+        &root,
+        "",
+        0,
+        &mut state,
+        BundleScanMode::IdentityOnly,
+    )?;
+    let root_after = root.symlink_metadata().map_err(|_| changed())?;
+    let root_identity = file_identity(&root_after);
+    if file_identity(&root_before) != root_identity || root_identity != expected.root_identity {
+        return Err(changed());
+    }
+    state.entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    if state.entries != expected.entries || state.total_bytes != expected.total_bytes {
+        return Err(changed());
+    }
+    Ok(root)
+}
+
+fn reverify_spawn_inputs(
+    config: &MlxConfig,
+    expected_bundle: &BundleSnapshot,
+    expected_runtime: &RuntimeSnapshot,
+    mode: BundleScanMode,
+) -> Result<(), WorkerError> {
+    // The pinned entry point is small; always re-hash it.
+    let (runtime_path, runtime) = inspect_runtime(&config.server_binary_path)?;
+    if runtime_path != config.server_binary_path || &runtime != expected_runtime {
+        return Err(WorkerError::Other(
+            "MLX runtime changed after worker construction".into(),
+        ));
+    }
+    match mode {
+        BundleScanMode::ContentHash => {
+            let (bundle_path, bundle) = scan_bundle(&config.verified_model_bundle_path)?;
+            if bundle_path != config.verified_model_bundle_path
+                || bundle.cid != config.model_cid
+                || &bundle != expected_bundle
+            {
+                return Err(WorkerError::ArtifactUnavailable(
+                    "MLX model bundle changed after worker construction".into(),
+                ));
+            }
+        }
+        BundleScanMode::IdentityOnly => {
+            let bundle_path =
+                verify_bundle_identity(&config.verified_model_bundle_path, expected_bundle)?;
+            if bundle_path != config.verified_model_bundle_path {
+                return Err(WorkerError::ArtifactUnavailable(
+                    "MLX model bundle changed after worker construction".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess lifecycle
+// ---------------------------------------------------------------------------
+
+struct MlxServer {
+    port: u16,
+    failed: Arc<AtomicBool>,
+    /// Set when the backend exited on its own or misbehaved (protocol error,
+    /// timeout). A Phase-initiated stop — request cancellation or a dropped
+    /// stream — leaves it clear. Decides whether the next spawn needs a full
+    /// content re-hash of the bundle.
+    abnormal: Arc<AtomicBool>,
+    shutdown_tx: mpsc::Sender<ShutdownRequest>,
+    supervisor: tokio::task::JoinHandle<()>,
+}
+
+struct ShutdownRequest {
+    acknowledgement: oneshot::Sender<()>,
+}
+
+impl MlxServer {
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn ended_abnormally(&self) -> bool {
+        self.abnormal.load(Ordering::Acquire)
+    }
+
+    /// Stop the backend because it misbehaved. Unlike a clean,
+    /// Phase-initiated [`shutdown`](Self::shutdown), this makes the next spawn
+    /// re-hash the bundle contents.
+    async fn shutdown_after_failure(&self, deadline: Duration) {
+        self.abnormal.store(true, Ordering::Release);
+        self.shutdown(deadline).await;
+    }
+
+    async fn shutdown(&self, deadline: Duration) {
+        self.failed.store(true, Ordering::Release);
+        let (acknowledgement, received) = oneshot::channel();
+        let request = ShutdownRequest { acknowledgement };
+        if matches!(
+            timeout(deadline, self.shutdown_tx.send(request)).await,
+            Ok(Ok(()))
+        ) {
+            let _ = timeout(deadline.saturating_mul(3), received).await;
+        }
+        self.supervisor.abort();
+    }
+}
+
+impl Drop for MlxServer {
+    fn drop(&mut self) {
+        self.failed.store(true, Ordering::Release);
+        self.supervisor.abort();
+    }
+}
+
+/// Last-resort cleanup for the `JobStream` drop contract.  Explicit handle
+/// cancellation takes the graceful bounded shutdown path; if the caller drops
+/// the stream future outright, `Drop` cannot await, so aborting the supervisor
+/// relies on the child's `kill_on_drop(true)` guarantee.
+struct StreamServerGuard {
+    server: Option<Arc<MlxServer>>,
+}
+
+impl StreamServerGuard {
+    fn new(server: Arc<MlxServer>) -> Self {
+        Self {
+            server: Some(server),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.server = None;
+    }
+}
+
+impl Drop for StreamServerGuard {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.failed.store(true, Ordering::Release);
+            server.supervisor.abort();
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.server.try_lock() {
+            if let Some(server) = slot.as_ref() {
+                server.failed.store(true, Ordering::Release);
+                server.supervisor.abort();
+            }
+        }
+    }
+}
+
+fn server_arguments(config: &MlxConfig, port: u16) -> Vec<OsString> {
+    [
+        "--model".into(),
+        config.verified_model_bundle_path.as_os_str().to_owned(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+        "--allowed-origins".into(),
+        "lucid.invalid".into(),
+        "--log-level".into(),
+        "INFO".into(),
+        "--max-tokens".into(),
+        config.max_output_tokens.to_string().into(),
+        "--decode-concurrency".into(),
+        "1".into(),
+        "--prompt-concurrency".into(),
+        "1".into(),
+        "--prefill-step-size".into(),
+        "512".into(),
+        "--prompt-cache-size".into(),
+        "0".into(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn spawn_mlx_server(config: &MlxConfig) -> std::io::Result<MlxServer> {
+    // Holding this listener until immediately before spawn rejects a stale or
+    // attacker-controlled service already on the configured port. MLX does
+    // not support inheriting a listening FD, so a narrow close-to-bind race
+    // remains and is disclosed through `MLX_PORT_BINDING_STATUS`.
+    let port_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, config.server_port))?;
+    let port = port_guard.local_addr()?.port();
+    let mut command = Command::new(&config.server_binary_path);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("HF_HUB_OFFLINE", "1");
+    command.env("TRANSFORMERS_OFFLINE", "1");
+    command.env("PYTHONNOUSERSITE", "1");
+    command.env("TOKENIZERS_PARALLELISM", "false");
+    command.args(server_arguments(config, port));
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    drop(port_guard);
+    let child = command.spawn()?;
+    Ok(supervise_child(child, port, config.shutdown_timeout))
+}
+
+fn supervise_child(mut child: Child, port: u16, shutdown_timeout: Duration) -> MlxServer {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_task = failed.clone();
+    let abnormal = Arc::new(AtomicBool::new(false));
+    let abnormal_task = abnormal.clone();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<ShutdownRequest>(1);
+    let supervisor = tokio::spawn(async move {
+        let stdout_task = stdout.map(|stream| tokio::spawn(discard_child_output(stream)));
+        let stderr_task = stderr.map(|stream| tokio::spawn(discard_child_output(stream)));
+
+        tokio::select! {
+            status = child.wait() => {
+                // Nobody asked it to stop: treat as a crash.
+                abnormal_task.store(true, Ordering::Release);
+                match status {
+                    Ok(status) => tracing::warn!(%status, "MLX backend exited"),
+                    Err(error) => tracing::warn!(%error, "failed waiting for MLX backend"),
+                }
+            }
+            request = shutdown_rx.recv() => {
+                if let Some(request) = request {
+                    terminate_child(&mut child, shutdown_timeout).await;
+                    let _ = request.acknowledgement.send(());
+                } else {
+                    terminate_child(&mut child, shutdown_timeout).await;
+                }
+            }
+        }
+        failed_task.store(true, Ordering::Release);
+        if let Some(task) = stdout_task {
+            task.abort();
+        }
+        if let Some(task) = stderr_task {
+            task.abort();
+        }
+    });
+    MlxServer {
+        port,
+        failed,
+        abnormal,
+        shutdown_tx,
+        supervisor,
+    }
+}
+
+async fn discard_child_output<R>(mut reader: R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; CHILD_IO_BUFFER_BYTES];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn terminate_child(child: &mut Child, deadline: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let mut signal = Command::new("/bin/kill");
+        signal.env_clear();
+        signal.arg("-INT").arg(pid.to_string());
+        signal.stdin(Stdio::null());
+        signal.stdout(Stdio::null());
+        signal.stderr(Stdio::null());
+        let _ = timeout(Duration::from_secs(1), signal.status()).await;
+    }
+
+    if matches!(timeout(deadline, child.wait()).await, Ok(Ok(_))) {
+        return;
+    }
+    let _ = child.start_kill();
+    let _ = timeout(deadline, child.wait()).await;
+}
+
+async fn wait_for_ready(
+    client: &reqwest::Client,
+    server: &MlxServer,
+    config: &MlxConfig,
+) -> Result<(), String> {
+    let health_url = format!("http://127.0.0.1:{}/health", server.port);
+    let started = Instant::now();
+    let mut last_error = "not reachable".to_string();
+    while started.elapsed() < config.model_load_timeout {
+        if server.is_failed() {
+            return Err("process exited during startup".into());
+        }
+        match client
+            .get(&health_url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                return warm_up_model(client, server, config).await;
+            }
+            Ok(response) => last_error = format!("health status {}", response.status()),
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!("health deadline exceeded ({last_error})"))
+}
+
+async fn warm_up_model(
+    client: &reqwest::Client,
+    server: &MlxServer,
+    config: &MlxConfig,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{}/v1/completions", server.port);
+    let response = client
+        .post(url)
+        .timeout(config.model_load_timeout)
+        .json(&serde_json::json!({
+            "model": "default_model",
+            "prompt": " ",
+            "stream": false,
+            "max_tokens": 1,
+            "temperature": 0.0
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("warm-up request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("warm-up status {}", response.status()));
+    }
+    if server.is_failed() {
+        return Err("process exited during warm-up".into());
+    }
+    let body = read_limited_response(response, MAX_WARMUP_RESPONSE_BYTES).await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| "warm-up returned invalid JSON".to_string())?;
+    if value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Err("warm-up response omitted choices".into());
+    }
+    Ok(())
+}
+
+async fn read_limited_response(response: reqwest::Response, limit: usize) -> Result<Bytes, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err("backend response exceeded its size limit".into());
+    }
+    let mut output = BytesMut::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(limit),
+    );
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| "backend response transport failed".to_string())?;
+        if chunk.len() > limit.saturating_sub(output.len()) {
+            return Err("backend response exceeded its size limit".into());
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output.freeze())
+}
+
+// ---------------------------------------------------------------------------
+// Request validation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    Chat,
+    Text,
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Chat => "/v1/chat/completions",
+            Self::Text => "/v1/completions",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletionRequest {
+    endpoint: Endpoint,
+    body: serde_json::Value,
+    prompt_chars: u64,
+    max_tokens: u32,
+}
+
+fn build_completion_request(
+    inference: &InferenceJobSpec,
+    configured_max_tokens: u32,
+) -> Result<CompletionRequest, String> {
+    if inference.messages.len() > MAX_MESSAGES {
+        return Err(format!("message count exceeds {MAX_MESSAGES}"));
+    }
+    if inference
+        .messages
+        .iter()
+        .any(|message| !message.images.is_empty())
+    {
+        return Err("multimodal messages are not supported by the MLX adapter".into());
+    }
+    if !inference.messages.is_empty() && inference.prompt.is_some() {
+        return Err("prompt and messages are mutually exclusive".into());
+    }
+    if inference.messages.is_empty()
+        && inference
+            .prompt
+            .as_deref()
+            .is_none_or(|prompt| prompt.is_empty())
+    {
+        return Err("an inference prompt or messages are required".into());
+    }
+
+    let prompt_chars = if inference.messages.is_empty() {
+        inference
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .count()
+    } else {
+        inference
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum()
+    };
+    if prompt_chars > MAX_PROMPT_CHARS {
+        return Err(format!("prompt exceeds {MAX_PROMPT_CHARS} characters"));
+    }
+
+    let max_tokens = inference
+        .max_tokens
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .clamp(1, configured_max_tokens.min(ABSOLUTE_MAX_TOKENS));
+    let mut body = validated_sampling_params(&inference.sampling)?;
+    let endpoint = if inference.messages.is_empty() {
+        body.insert(
+            "prompt".into(),
+            serde_json::Value::String(inference.prompt.clone().unwrap_or_default()),
+        );
+        Endpoint::Text
+    } else {
+        let messages = inference
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": match message.role {
+                        phase_protocol::ChatRole::System => "system",
+                        phase_protocol::ChatRole::User => "user",
+                        phase_protocol::ChatRole::Assistant => "assistant",
+                        phase_protocol::ChatRole::Tool => "tool",
+                    },
+                    "content": message.content,
+                })
+            })
+            .collect::<Vec<_>>();
+        body.insert("messages".into(), serde_json::Value::Array(messages));
+        Endpoint::Chat
+    };
+
+    // Insert server-owned controls last.  Untrusted sampling cannot replace
+    // the local bundle with a remote identifier or disable streaming/caps.
+    body.insert("model".into(), serde_json::json!("default_model"));
+    body.insert("stream".into(), serde_json::json!(true));
+    body.insert("max_tokens".into(), serde_json::json!(max_tokens));
+    Ok(CompletionRequest {
+        endpoint,
+        body: serde_json::Value::Object(body),
+        prompt_chars: prompt_chars as u64,
+        max_tokens,
+    })
+}
+
+fn validated_sampling_params(
+    sampling: &SamplingParams,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut output = serde_json::Map::new();
+    for (key, encoded) in &sampling.params {
+        if matches!(
+            key.as_str(),
+            "model" | "prompt" | "messages" | "stream" | "max_tokens" | "adapters"
+        ) {
+            return Err(format!("sampling parameter '{key}' is server-owned"));
+        }
+        if !matches!(
+            key.as_str(),
+            "temperature"
+                | "top_p"
+                | "top_k"
+                | "min_p"
+                | "repetition_penalty"
+                | "presence_penalty"
+                | "frequency_penalty"
+                | "seed"
+                | "stop"
+        ) {
+            return Err("unsupported sampling parameter".into());
+        }
+        let value: serde_json::Value = serde_json::from_str(encoded)
+            .map_err(|_| format!("sampling parameter '{key}' is not valid JSON"))?;
+        match key.as_str() {
+            "temperature" => validate_number(key, &value, 0.0, 2.0, true)?,
+            "top_p" | "min_p" => validate_number(key, &value, 0.0, 1.0, true)?,
+            "repetition_penalty" => validate_number(key, &value, 0.0, 2.0, false)?,
+            "presence_penalty" | "frequency_penalty" => {
+                validate_number(key, &value, -2.0, 2.0, true)?
+            }
+            "top_k" => validate_unsigned_integer(key, &value, MAX_TOP_K)?,
+            "seed" => validate_unsigned_integer(key, &value, MAX_SEED)?,
+            "stop" => validate_stop_sequences(&value)?,
+            _ => return Err("unsupported sampling parameter".into()),
+        }
+        output.insert(key.clone(), value);
+    }
+    Ok(output)
+}
+
+fn validate_number(
+    key: &str,
+    value: &serde_json::Value,
+    min: f64,
+    max: f64,
+    include_min: bool,
+) -> Result<(), String> {
+    let Some(number) = value.as_f64() else {
+        return Err(format!("sampling parameter '{key}' must be numeric"));
+    };
+    if !number.is_finite()
+        || if include_min {
+            number < min || number > max
+        } else {
+            number <= min || number > max
+        }
+    {
+        return Err(format!("sampling parameter '{key}' is out of range"));
+    }
+    Ok(())
+}
+
+fn validate_unsigned_integer(key: &str, value: &serde_json::Value, max: u64) -> Result<(), String> {
+    let Some(number) = value.as_u64() else {
+        return Err(format!(
+            "sampling parameter '{key}' must be an unsigned integer"
+        ));
+    };
+    if number > max {
+        return Err(format!("sampling parameter '{key}' is out of range"));
+    }
+    Ok(())
+}
+
+fn validate_stop_sequences(value: &serde_json::Value) -> Result<(), String> {
+    let Some(sequences) = value.as_array() else {
+        return Err("sampling parameter 'stop' must be an array".into());
+    };
+    if sequences.len() > MAX_STOP_SEQUENCES {
+        return Err(format!(
+            "sampling parameter 'stop' exceeds {MAX_STOP_SEQUENCES} sequences"
+        ));
+    }
+    if sequences.iter().any(|sequence| {
+        sequence
+            .as_str()
+            .is_none_or(|text| text.chars().count() > MAX_STOP_SEQUENCE_CHARS)
+    }) {
+        return Err(format!(
+            "sampling parameter 'stop' entries must be strings of at most {MAX_STOP_SEQUENCE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SSE inference
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReason {
+    Stop,
+    Length,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameAction {
+    Ignore,
+    Done,
+    Delta {
+        text: String,
+        terminal: Option<TerminalReason>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFrame {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    #[serde(default)]
+    delta: OpenAiDelta,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+fn parse_sse_frame(frame: &[u8], endpoint: Endpoint) -> Result<FrameAction, String> {
+    let mut data: Option<&[u8]> = None;
+    for raw_line in frame.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(b":") {
+            continue;
+        }
+        if let Some(payload) = line.strip_prefix(b"data:") {
+            if data.is_some() {
+                return Err("multiple data fields in one SSE event".into());
+            }
+            data = Some(payload.strip_prefix(b" ").unwrap_or(payload));
+        }
+    }
+    let Some(data) = data else {
+        return Ok(FrameAction::Ignore);
+    };
+    if data == b"[DONE]" {
+        return Ok(FrameAction::Done);
+    }
+
+    let parsed: OpenAiFrame =
+        serde_json::from_slice(data).map_err(|_| "invalid SSE JSON".to_string())?;
+    if parsed.error.is_some() {
+        return Err("MLX backend returned an SSE error object".into());
+    }
+    if parsed.choices.is_empty() {
+        return if parsed.usage.is_some() {
+            Ok(FrameAction::Ignore)
+        } else {
+            Err("SSE frame omitted choices".into())
+        };
+    }
+    if parsed.choices.len() != 1 {
+        return Err("SSE frame must contain exactly one choice".into());
+    }
+    let choice = parsed.choices.into_iter().next().expect("length checked");
+    let terminal = match choice.finish_reason.as_deref() {
+        None => None,
+        Some("stop") => Some(TerminalReason::Stop),
+        Some("length") => Some(TerminalReason::Length),
+        Some(_) => return Err("unsupported MLX finish reason".into()),
+    };
+    let text = match endpoint {
+        Endpoint::Chat => {
+            let mut text = choice.delta.reasoning_content.unwrap_or_default();
+            text.push_str(&choice.delta.reasoning.unwrap_or_default());
+            text.push_str(&choice.delta.content.unwrap_or_default());
+            text
+        }
+        Endpoint::Text => choice.text.unwrap_or_default(),
+    };
+    Ok(FrameAction::Delta { text, terminal })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inference(
+    client: reqwest::Client,
+    server: Arc<MlxServer>,
+    request: CompletionRequest,
+    manifest_hash: [u8; 32],
+    mut producer: JobHandleProducer,
+    identity: NodeIdentity,
+    config: MlxConfig,
+    permit: OwnedSemaphorePermit,
+) -> impl futures::Stream<Item = JobEvent> + Send + 'static {
+    let mut stream_server_guard = StreamServerGuard::new(server.clone());
+    stream! {
+        let _permit = permit;
+        let started_at = Instant::now();
+        let mut accumulator = CommitmentAccumulator::new();
+        let mut completion_chunks = 0u64;
+        let mut output_bytes = 0usize;
+        let mut sequence = 0u64;
+        let mut terminal_reason = None;
+        let mut saw_finish = false;
+        let url = format!("http://127.0.0.1:{}{}", server.port, request.endpoint.path());
+
+        if server.is_failed() {
+            yield finish_event(
+                &mut producer, &identity, manifest_hash, accumulator,
+                Completion::Error, Some("MLX backend is unavailable".into()),
+                request.prompt_chars, completion_chunks, started_at, &config,
+            );
+            return;
+        }
+
+        let response = tokio::select! {
+            _ = producer.cancelled() => {
+                server.shutdown(config.shutdown_timeout).await;
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Cancelled, None, request.prompt_chars,
+                    completion_chunks, started_at, &config,
+                );
+                return;
+            }
+            result = timeout(
+                config.request_start_timeout,
+                client
+                    .post(url)
+                    .header(reqwest::header::ACCEPT, "text/event-stream")
+                    .json(&request.body)
+                    .send(),
+            ) => result,
+        };
+
+        let response = match response {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            Ok(Ok(response)) => {
+                let status = response.status();
+                drop(response);
+                server.shutdown_after_failure(config.shutdown_timeout).await;
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Error, Some(format!("MLX backend returned {status}")),
+                    request.prompt_chars, completion_chunks, started_at, &config,
+                );
+                return;
+            }
+            Ok(Err(_)) => {
+                server.shutdown_after_failure(config.shutdown_timeout).await;
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Error, Some("MLX backend request failed".into()),
+                    request.prompt_chars, completion_chunks, started_at, &config,
+                );
+                return;
+            }
+            Err(_) => {
+                server.shutdown_after_failure(config.shutdown_timeout).await;
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Error, Some("MLX backend response deadline exceeded".into()),
+                    request.prompt_chars, completion_chunks, started_at, &config,
+                );
+                return;
+            }
+        };
+
+        let content_type_ok = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+        if !content_type_ok {
+            drop(response);
+            server.shutdown_after_failure(config.shutdown_timeout).await;
+            yield finish_event(
+                &mut producer, &identity, manifest_hash, accumulator,
+                Completion::Error, Some("MLX backend returned a non-SSE response".into()),
+                request.prompt_chars, completion_chunks, started_at, &config,
+            );
+            return;
+        }
+
+        let mut bytes = response.bytes_stream();
+        let mut buffer = BytesMut::with_capacity(4096);
+        let max_output_frames = u64::from(request.max_tokens).saturating_mul(8).saturating_add(32);
+
+        'streaming: loop {
+            if server.is_failed() {
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Error, Some("MLX backend exited during inference".into()),
+                    request.prompt_chars, completion_chunks, started_at, &config,
+                );
+                return;
+            }
+            let Some(remaining) = config.request_deadline.checked_sub(started_at.elapsed()) else {
+                server.shutdown_after_failure(config.shutdown_timeout).await;
+                yield finish_event(
+                    &mut producer, &identity, manifest_hash, accumulator,
+                    Completion::Error, Some("MLX inference deadline exceeded".into()),
+                    request.prompt_chars, completion_chunks, started_at, &config,
+                );
+                return;
+            };
+            let wait_for = config.per_request_idle_timeout.min(remaining);
+            let next = tokio::select! {
+                _ = producer.cancelled() => {
+                    server.shutdown(config.shutdown_timeout).await;
+                    yield finish_event(
+                        &mut producer, &identity, manifest_hash, accumulator,
+                        Completion::Cancelled, None, request.prompt_chars,
+                        completion_chunks, started_at, &config,
+                    );
+                    return;
+                }
+                result = timeout(wait_for, bytes.next()) => result,
+            };
+            let chunk = match next {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(_))) => {
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
+                    yield finish_event(
+                        &mut producer, &identity, manifest_hash, accumulator,
+                        Completion::Error, Some("MLX SSE transport failed".into()),
+                        request.prompt_chars, completion_chunks, started_at, &config,
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
+                    yield finish_event(
+                        &mut producer, &identity, manifest_hash, accumulator,
+                        Completion::Error, Some("MLX SSE ended before [DONE]".into()),
+                        request.prompt_chars, completion_chunks, started_at, &config,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
+                    yield finish_event(
+                        &mut producer, &identity, manifest_hash, accumulator,
+                        Completion::Error, Some("MLX SSE idle deadline exceeded".into()),
+                        request.prompt_chars, completion_chunks, started_at, &config,
+                    );
+                    return;
+                }
+            };
+
+            for segment in chunk.chunks(SSE_INGEST_SLICE_BYTES) {
+                if append_sse_chunk(&mut buffer, segment).is_err() {
+                    server.shutdown_after_failure(config.shutdown_timeout).await;
+                    yield finish_event(
+                        &mut producer, &identity, manifest_hash, accumulator,
+                        Completion::Error, Some("MLX SSE frame exceeded its size limit".into()),
+                        request.prompt_chars, completion_chunks, started_at, &config,
+                    );
+                    return;
+                }
+                loop {
+                    let frame = match take_next_sse_frame(&mut buffer) {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(_) => {
+                            server.shutdown_after_failure(config.shutdown_timeout).await;
+                            yield finish_event(
+                                &mut producer, &identity, manifest_hash, accumulator,
+                                Completion::Error, Some("MLX SSE frame exceeded its size limit".into()),
+                                request.prompt_chars, completion_chunks, started_at, &config,
+                            );
+                            return;
+                        }
+                    };
+                    let action = match parse_sse_frame(&frame, request.endpoint) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "rejected malformed MLX SSE frame");
+                            server.shutdown_after_failure(config.shutdown_timeout).await;
+                            yield finish_event(
+                                &mut producer, &identity, manifest_hash, accumulator,
+                                Completion::Error, Some("MLX backend returned an invalid SSE frame".into()),
+                                request.prompt_chars, completion_chunks, started_at, &config,
+                            );
+                            return;
+                        }
+                    };
+                    match action {
+                        FrameAction::Ignore => {}
+                        FrameAction::Done => {
+                            break 'streaming;
+                        }
+                        FrameAction::Delta { text, terminal } => {
+                            if saw_finish && (!text.is_empty() || terminal.is_some()) {
+                                server.shutdown_after_failure(config.shutdown_timeout).await;
+                                yield finish_event(
+                                    &mut producer, &identity, manifest_hash, accumulator,
+                                    Completion::Error, Some("MLX backend emitted data after finish".into()),
+                                    request.prompt_chars, completion_chunks, started_at, &config,
+                                );
+                                return;
+                            }
+                            if !text.is_empty() {
+                                output_bytes = match output_bytes.checked_add(text.len()) {
+                                    Some(total) if total <= MAX_STREAM_OUTPUT_BYTES => total,
+                                    _ => {
+                                        server.shutdown_after_failure(config.shutdown_timeout).await;
+                                        yield finish_event(
+                                            &mut producer, &identity, manifest_hash, accumulator,
+                                            Completion::Error, Some("MLX output exceeded its byte limit".into()),
+                                            request.prompt_chars, completion_chunks, started_at, &config,
+                                        );
+                                        return;
+                                    }
+                                };
+                                if completion_chunks >= max_output_frames {
+                                    server.shutdown_after_failure(config.shutdown_timeout).await;
+                                    yield finish_event(
+                                        &mut producer, &identity, manifest_hash, accumulator,
+                                        Completion::Error, Some("MLX output exceeded its frame limit".into()),
+                                        request.prompt_chars, completion_chunks, started_at, &config,
+                                    );
+                                    return;
+                                }
+                                let output = OutputChunk {
+                                    kind: "token".into(),
+                                    data: Bytes::from(text),
+                                    seq: sequence,
+                                };
+                                accumulator.update(&output);
+                                sequence += 1;
+                                completion_chunks += 1;
+                                yield JobEvent::Output(output);
+                            }
+                            if let Some(reason) = terminal {
+                                terminal_reason = Some(reason);
+                                saw_finish = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let completion = match terminal_reason.unwrap_or(TerminalReason::Stop) {
+            TerminalReason::Stop => Completion::Stop,
+            TerminalReason::Length => Completion::Length,
+        };
+        stream_server_guard.disarm();
+        yield finish_event(
+            &mut producer, &identity, manifest_hash, accumulator, completion, None,
+            request.prompt_chars, completion_chunks, started_at, &config,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_event(
+    producer: &mut JobHandleProducer,
+    identity: &NodeIdentity,
+    manifest_hash: [u8; 32],
+    accumulator: CommitmentAccumulator,
+    completion: Completion,
+    error: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    started_at: Instant,
+    config: &MlxConfig,
+) -> JobEvent {
+    let (output_commitment, output_chunk_count) = accumulator.finalize();
+    let mut extra = BTreeMap::new();
+    extra.insert("backend".into(), "mlx".into());
+    extra.insert(
+        "runtime_compatibility_target".into(),
+        format!(
+            "mlx-lm={};mlx={}",
+            TARGET_MLX_LM_VERSION, TARGET_MLX_VERSION
+        ),
+    );
+    extra.insert("runtime_attestation".into(), MLX_RUNTIME_ATTESTATION.into());
+    extra.insert(
+        "bundle_root_algorithm".into(),
+        MLX_BUNDLE_ROOT_ALGORITHM.into(),
+    );
+    extra.insert("bundle_cid".into(), config.model_cid.to_hex());
+    extra.insert(
+        "hardware_acceptance".into(),
+        MLX_HARDWARE_ACCEPTANCE_LABEL.into(),
+    );
+    extra.insert("compute_proof".into(), MLX_COMPUTE_PROOF.into());
+    let result = JobResult {
+        job_spec_hash: manifest_hash,
+        output_commitment,
+        output_chunk_count,
+        completion,
+        resumption: None,
+        metrics: JobMetrics {
+            total_duration_ms: started_at.elapsed().as_millis() as u64,
+            // `mlx_lm.server` does not expose prompt-token counts before the
+            // terminal usage frame.  Character count is a stable lower-trust
+            // workload measure, matching the existing llama worker's spike.
+            prompt_tokens,
+            completion_tokens,
+            extra,
+        },
+    };
+    let receipt = ReceiptBuilder::new(result.clone(), manifest_hash)
+        .sign_with(identity)
+        .expect("signing an in-memory JobResult is infallible");
+    producer.deliver_receipt(receipt);
+    JobEvent::Final { result, error }
+}
+
+#[cfg(test)]
+mod tests;

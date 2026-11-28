@@ -1,0 +1,85 @@
+{
+  "_about": "Single source of truth for Phase & LUCID documentation: sidebar order, titles, summaries, ⌘K search index, sitemap, and llms.txt. Each entry maps to site/help/<slug>.md.",
+  "groups": [
+    {
+      "name": "Getting Started",
+      "pages": [
+        {
+          "slug": "install",
+          "title": "Install LUCID",
+          "summary": "Download and verify LUCID on macOS Apple Silicon (.dmg or CLI), Linux (.deb or tarball), Windows (PowerShell installer), or build from source."
+        },
+        {
+          "slug": "first-chat",
+          "title": "Your first chat and joining a circle",
+          "summary": "Use the built-in streaming Desktop chat, read trust badges, create and accept one-time lucid://join/ invitations, and connect Ollama clients like Open WebUI."
+        },
+        {
+          "slug": "models-and-sharing",
+          "title": "Models, Ollama import and sharing your GPU",
+          "summary": "Read-only local GGUF discovery from Ollama and LM Studio, permission-gated GPU sharing, verified P2P model downloads with exact-offset resume, and pinning llama.cpp b12651."
+        }
+      ]
+    },
+    {
+      "name": "Operating & Pooling",
+      "pages": [
+        {
+          "slug": "operator-policy",
+          "title": "Operator policy and safety controls",
+          "summary": "Complete reference for policy.toml and node.toml: hot-reload, SIGHUP, battery and thermal auto-pause, time-of-day windows, concurrency caps, and default-deny allowlists."
+        },
+        {
+          "slug": "workers-and-backends",
+          "title": "Workers and GPU backends",
+          "summary": "How llama.cpp (Metal, CUDA, ROCm, Vulkan, CPU), Apple Silicon MLX, and the echo dev worker isolate keys, strip co-tenant KV caches, report /api/ps residency, and handle crashes."
+        },
+        {
+          "slug": "trusted-circle-sharding",
+          "title": "Pool GPUs across machines (Tier-1 Trusted-Circle)",
+          "summary": "Split large GGUF models across trusted machines over Noise-encrypted /phase/shard-rpc/1.0.0 with auto-managed SHA-256-pinned ggml-rpc-server, RPC-first tensor splits, and SSH-equivalent trust boundaries."
+        },
+        {
+          "slug": "cloud-relay-and-privacy",
+          "title": "Run a Cloud Relay and Tor/Tails guidance",
+          "summary": "Deploy an unprivileged Linux Circuit Relay v2 node on port 443 or 4001 with setup-cloud-relay.sh, configure PeerID-pinned DNS TXT bootstrap, and run consume-only nodes over TailsOS/Tor."
+        }
+      ]
+    },
+    {
+      "name": "APIs & CLI",
+      "pages": [
+        {
+          "slug": "http-api",
+          "title": "HTTP API reference",
+          "summary": "Every Ollama-compatible /api/* endpoint, every Bearer-authenticated /api/lucid/* control endpoint, request limits, options allowlists, custom headers, and all five X-Lucid-Trust-Label values."
+        },
+        {
+          "slug": "cli-and-env",
+          "title": "CLI, subcommands and environment variables",
+          "summary": "Every lucidd subcommand (probe, models, peers, invite, join, bench, cluster), all daemon flags grouped by role, and every runtime, desktop, and signing environment variable."
+        }
+      ]
+    },
+    {
+      "name": "Protocols & Architecture",
+      "pages": [
+        {
+          "slug": "protocols",
+          "title": "Phase network protocols and wire formats",
+          "summary": "Wire specifications for all seven /phase/* libp2p protocols, framing and size bounds, admission pools, Kademlia/Relay v2/DCUtR/AutoNAT behaviours, and all ten DHT key namespaces."
+        },
+        {
+          "slug": "cryptography-and-receipts",
+          "title": "Cryptography, receipts and verification",
+          "summary": "Ed25519 NodeIdentity and PeerId binding, SignedManifest, SignedReceipt, streaming CommitmentAccumulator replay, composite shard chains, DHT rollback and equivocation protection, and verification limits."
+        },
+        {
+          "slug": "architecture-and-crates",
+          "title": "Workspace architecture, crates and Plasm",
+          "summary": "All eight Rust crates, the Apache-2.0 substrate vs AGPL-3.0-or-later flagship license split, #![deny(unsafe_code)], the Plasm WASM node, phase-artifact-server, Desktop security boundaries, and release signing."
+        }
+      ]
+    }
+  ]
+}

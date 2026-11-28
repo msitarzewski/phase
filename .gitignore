@@ -14,9 +14,11 @@ composer.lock
 
 # Build artifacts
 /build/
+/_site/
 
 # Binaries
 *.wasm
+dist/lucidd-*/lucidd
 
 # IDE
 .vscode/
@@ -44,3 +46,28 @@ identity.key
 **/identity.key
 *.key
 !keys/*.pub.placeholder
+
+# Code signing certificates, Apple API keys, provisioning profiles, and temp signing metadata.
+*.p12
+*.pfx
+*.p8
+*.cer
+*.mobileprovision
+*.provisionprofile
+artifact-signing.json
+
+# Local daemon control credentials and one-use enrollment invitations.
+*.control-token
+control-*.token
+*.lucidinvite
+
+# Private local fleet topology / SSH / relay configuration (never commit hostnames or IPs).
+.phase-fleet.local.env
+*.local.env
+
+# Tauri v2 desktop app build artifacts & staged sidecar binaries
+apps/lucid-desktop/node_modules/
+apps/lucid-desktop/dist/
+apps/lucid-desktop/src-tauri/target/
+apps/lucid-desktop/src-tauri/gen/
+apps/lucid-desktop/src-tauri/binaries/lucidd*

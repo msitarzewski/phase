@@ -1,0 +1,44 @@
+<!--
+title: Why Phase & LUCID · Open Verifiable Compute Without Lock-In
+description: Why Phase separates a workload-neutral Apache-2.0 substrate from the copyleft LUCID inference flagship, why there are no accounts or billing, and how Plasm shares the same protocol.
+-->
+<main class="page" id="content">
+
+<header class="hero">
+  <h1>Why Phase &amp; LUCID</h1>
+  <p class="tagline">Public compute infrastructure that no single provider controls.</p>
+  <p class="lede">Most "decentralized AI" projects build a proprietary token network first and treat privacy, simplicity, and local ownership as an afterthought. Phase starts from the opposite direction.</p>
+</header>
+
+<section class="band">
+  <h2>One substrate, many workloads</h2>
+  <div class="two">
+    <div>
+      <h3>Phase (Apache-2.0)</h3>
+      <p>The substrate handles only what every distributed compute network needs: persistent Ed25519 identities, Noise/QUIC peer discovery and NAT traversal, signed job manifests, streaming execution receipts, and content-addressed blob transfer.</p>
+      <p>It deliberately knows nothing about LLMs, weights, or prompts. All six library crates are licensed <strong>Apache-2.0</strong> so anyone—even competing organizations—can adopt the protocol without legal friction.</p>
+    </div>
+    <div>
+      <h3>LUCID &amp; Plasm (Flagship Nodes)</h3>
+      <p><strong>LUCID</strong> (<code>lucidd</code> + Desktop app) is the GPU inference flagship built on Phase. It is licensed <strong>AGPL-3.0-or-later</strong> so improvements to the inference daemon stay open rather than disappearing into closed forks.</p>
+      <p><strong>Plasm</strong> (<code>plasmd</code>, Apache-2.0) runs sandboxed WebAssembly modules on the exact same substrate, proving the protocol is genuinely workload-neutral. Future flagships (image synthesis, rendering, science) plug in as separate nodes rather than bloating LUCID.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px"><a href="help/architecture-and-crates.html">Inspect all 8 crates and the dependency graph →</a></p>
+</section>
+
+<section class="band">
+  <h2>Why no accounts, no billing, and no tokens</h2>
+  <ul class="list">
+    <li><strong>Start with people you actually trust:</strong> Friends, families, labs, and small teams already own powerful Macs and desktop GPUs that sit idle 90% of the day. They do not need a cryptocurrency or KYC gateway to share a local model safely.</li>
+    <li><strong>Zero-friction local tooling:</strong> Because LUCID speaks the standard Ollama HTTP API on <code>127.0.0.1</code>, your existing chat UIs, IDE assistants, and scripts work unchanged—and you can switch away anytime with zero lock-in.</li>
+    <li><strong>Honest trust boundaries first:</strong> Cryptographic receipts today prove <em>who</em> ran a job and that the streamed bytes were not altered in transit. We label that honestly (<code>remote-receipt-verified</code>, <code>remote-spot-checked</code>, <code>trusted-circle-sharded</code>) instead of pretending a signature proves hidden GPU math.</li>
+  </ul>
+</section>
+
+<section class="band narrow">
+  <h2>Where to go next</h2>
+  <p>Want to try it in a minute? <a href="help/install.html">Install LUCID</a>. Want the wire-level truth? Read the <a href="help/http-api.html">HTTP API reference</a>, <a href="help/protocols.html">Phase network protocols</a>, or <a href="security.html">Security &amp; Trust Model</a>.</p>
+</section>
+
+</main>

@@ -1035,7 +1035,7 @@ LUCID v0.1 derived a placeholder `ModelCid` from a human model name and `/api/pu
 - Negative: whole-file GGUF hashing is O(file size), and the first schema supports one-file GGUF plus a separate canonical MLX bundle-root contract rather than a general Merkle/chunk CID.
 - Completion is not implied: real multi-gigabyte pull/resume and cold third-node alias resolution remain release gates.
 
-**References**: `crates/lucidd/src/{registry,content}.rs`, `crates/phase-artifact-server/src/artifacts.rs`, `crates/phase-net/src/{protocol,discovery}.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/lucidd/src/{registry,content}.rs`, `crates/phase-artifact-server/src/artifacts.rs`, `crates/phase-net/src/{protocol,discovery}.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 
@@ -1059,7 +1059,7 @@ The v1 request/response relay batches a completed `Vec<JobEvent>`, so it cannot 
 - Positive: remote output is genuinely incremental, cancellation and receipt state stay attributable, and the minimum legal idle timeout works under constrained Linux scheduling.
 - Negative: v1 compatibility adds a guarded pre-output branch, and live streams cannot migrate after client-visible output without a separately designed resumable-output protocol.
 
-**References**: `crates/phase-net/src/{protocol,discovery}.rs`, `crates/lucidd/src/router.rs`, `crates/lucidd/tests/http_api.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/phase-net/src/{protocol,discovery}.rs`, `crates/lucidd/src/router.rs`, `crates/lucidd/tests/http_api.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 
@@ -1082,7 +1082,7 @@ Ordinary peers need relay reservations, rendezvous discovery, AutoNAT, and DCUtR
 - Positive: no duplicate swarm/identity exists, infrastructure cannot be enabled by an ordinary-node typo, and tests can assert an exact relayed path independently from DCUtR.
 - Negative: loopback coverage does not establish real NAT success; physical topology and capacity evidence remain required; public rendezvous cannot deploy from `lucidd` until its admission layer is complete.
 
-**References**: `crates/phase-net/src/discovery.rs`, `crates/lucidd/src/main.rs`, `crates/lucidd/systemd/lucidd-relay.service`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/phase-net/src/discovery.rs`, `crates/lucidd/src/main.rs`, `crates/lucidd/systemd/lucidd-relay.service`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 
@@ -1106,7 +1106,7 @@ Routing needs attributable history without turning reputation into a centralized
 - Positive: operators can inspect attributable evidence without creating a global authority or privacy archive; redundant checks cannot silently multiply unbounded work.
 - Negative: confidence is observer-local and Sybil/collusion limits remain; a larger physical adversarial campaign is still required.
 
-**References**: `crates/lucidd/src/reputation.rs`, `crates/lucidd/src/router.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/lucidd/src/reputation.rs`, `crates/lucidd/src/router.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 
@@ -1129,7 +1129,7 @@ Routing needs attributable history without turning reputation into a centralized
 - Positive: backend-specific risk stays inside one adapter while LUCID semantics remain shared and testable on non-Apple CI.
 - Negative: the adapter has a documented loopback port bind race because upstream cannot inherit a reserved listener; real model, thermal, power, cancellation, crash, and remote-relay acceptance remain mandatory.
 
-**References**: `crates/lucidd/src/worker_mlx.rs`, `crates/lucidd/src/main.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/lucidd/src/worker_mlx.rs`, `crates/lucidd/src/main.rs`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 
@@ -1138,22 +1138,22 @@ Routing needs attributable history without turning reputation into a centralized
 **Status**: Accepted for deployment and physical-test staging; provisioning and acceptance evidence remain open.
 
 **Context**:
-UMBP’s Sonic public IPv4 is DHCP-assigned and the existing public host also serves unrelated HTTP applications through Caddy. A small public cloud host can supply a stable IP and independent network context, but blindly forwarding TCP `80/443` or Phase traffic to the mutable Sonic address would preserve the home-link dependency and would not create the required public circuit-relay actor.
+Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)’s Sonic public IPv4 is DHCP-assigned and the existing public host also serves unrelated HTTP applications through Caddy. A small public cloud host can supply a stable IP and independent network context, but blindly forwarding TCP `80/443` or Phase traffic to the mutable Sonic address would preserve the home-link dependency and would not create the required public circuit-relay actor.
 
 **Decision**:
 
 1. Provision the first independent foundation site on a small DigitalOcean Ubuntu x86_64 host with a Reserved IPv4. Start with 1 vCPU, 2 GB RAM, and 50 GB disk; deploy a prebuilt qualified binary rather than compiling or storing models there.
-2. Run the existing bounded `lucidd --mode infrastructure` service locally. Public native Phase/libp2p TCP `4001` terminates at that process and is never redirected to UMBP or the Sonic address.
-3. Terminate public web TCP `80/443` in Caddy on the cloud host. Caddy may reverse-proxy the existing web origins to UMBP through Tailscale, which provides a stable encrypted upstream independent of Sonic DHCP churn. The LUCID HTTP API stays loopback-only and Ollama remains private.
-4. Treat Tailscale as the administration/recovery plane, not the Phase acceptance data path. The external requester must reach Pip through Phase’s configured public relay so the test cannot pass merely because both machines share a tailnet.
-5. Use Pip, the M1 iMac with 16 GB RAM, as the Apple Silicon inference contributor and MLX acceptance candidate. UMBP remains a transitional origin/relay until its backup, Ubuntu 26.04 LTS upgrade, and post-upgrade audit pass.
+2. Run the existing bounded `lucidd --mode infrastructure` service locally. Public native Phase/libp2p TCP `4001` terminates at that process and is never redirected to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) or the Sonic address.
+3. Terminate public web TCP `80/443` in Caddy on the cloud host. Caddy may reverse-proxy the existing web origins to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) through Tailscale, which provides a stable encrypted upstream independent of Sonic DHCP churn. The LUCID HTTP API stays loopback-only and Ollama remains private.
+4. Treat Tailscale as the administration/recovery plane, not the Phase acceptance data path. The external requester must reach Mac M1 Max (32GB RAM) through Phase’s configured public relay so the test cannot pass merely because both machines share a tailnet.
+5. Use Mac M1 Max (32GB RAM), the M1 iMac with 16 GB RAM, as the Apple Silicon inference contributor and MLX acceptance candidate. Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) remains a transitional origin/relay until its backup, Ubuntu 26.04 LTS upgrade, and post-upgrade audit pass.
 6. Do not claim public rendezvous from this deployment. `lucidd` keeps `rendezvous_server: None` until hard global/per-peer/per-namespace registration quotas exist; bootstrap, DHT, circuit relay, AutoNAT, and configured-peer paths are the first-site scope.
 
 **Consequences**:
 - Positive: Phase gains a stable public failure domain and real relay actor; home DHCP churn no longer controls Phase ingress; web migration can happen independently over the tailnet.
-- Negative: the proxied web origins still depend on UMBP and the home connection; one cloud site is not geographic fleet resilience; public rendezvous and the physical intended-stream evidence remain incomplete.
+- Negative: the proxied web origins still depend on Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) and the home connection; one cloud site is not geographic fleet resilience; public rendezvous and the physical intended-stream evidence remain incomplete.
 
-**References**: `crates/lucidd/src/main.rs:756-803`, `crates/lucidd/systemd/lucidd-relay.service:17-40`, `releases/lucid-v0.2/reachability-plane.md`, `releases/lucid-v0.2/network-operations.md`, `tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md`.
+**References**: `crates/lucidd/src/main.rs:756-803`, `crates/lucidd/systemd/lucidd-relay.service:17-40`, `releases/lucid-v0.2/reachability-plane.md`, `releases/lucid-v0.2/network-operations.md`, `tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md`.
 
 ---
 

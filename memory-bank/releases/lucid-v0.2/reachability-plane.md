@@ -158,16 +158,16 @@ Approve a decision specifying:
 - Deterministic integration coverage proves direct state, relay reservation, exact `Relayed` connection state, rendezvous registration/discovery, and workload traffic over the same swarm. The circuit test explicitly disables DCUtR so a direct upgrade cannot hide the relay path (`crates/phase-net/src/discovery.rs:3879-3969`).
 - macOS ARM64 and native Ubuntu x86_64 network suites passed after synchronization was changed from wall-clock races to observed swarm state.
 - Remaining before completion: physical coffee-shop/consumer-NAT topology, real DCUtR upgrade, forced hole-punch failure with relay retention, VPN/corporate-network observations, and relay load/resource measurements.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).
 
 ## 2026-08-10 approved physical topology
 
 The first real-NAT acceptance run will use three independent roles:
 
 1. A DigitalOcean Ubuntu x86_64 foundation node with Reserved IPv4 runs `lucidd --mode infrastructure` locally and exposes native Phase/libp2p TCP `4001`.
-2. Pip, an M1 iMac with 16 GB RAM behind consumer NAT, acts as the inference contributor and establishes outbound relay connectivity. No Sonic router forwarding is assumed.
+2. Mac M1 Max (32GB RAM), an M1 iMac with 16 GB RAM behind consumer NAT, acts as the inference contributor and establishes outbound relay connectivity. No Sonic router forwarding is assumed.
 3. The requester runs from a physically different network. Tailscale may administer the machines but must not carry the acceptance data path.
 
-Web ingress is deliberately separate: DigitalOcean Caddy terminates TCP `80/443` and proxies existing web origins to UMBP over Tailscale. Phase TCP `4001` is not forwarded to UMBP or the Sonic DHCP address. This topology supplies a stable public failure domain without pretending a reverse proxy is a circuit relay.
+Web ingress is deliberately separate: DigitalOcean Caddy terminates TCP `80/443` and proxies existing web origins to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) over Tailscale. Phase TCP `4001` is not forwarded to Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM) or the Sonic DHCP address. This topology supplies a stable public failure domain without pretending a reverse proxy is a circuit relay.
 
 The topology is approved but not yet evidence. Completion still requires relay-only real inference and receipt verification, a successful DCUtR-capable run, forced hole-punch failure with relay retention, and bounded load/resource observations. Rendezvous acceptance remains separately blocked on admission quotas and a public server deployment.

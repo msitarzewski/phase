@@ -300,11 +300,11 @@ After the live LAN demo earlier in the day, the same session brought the substra
 - Added user-level systemd unit at `crates/lucidd/systemd/lucidd-relay.service`
 - New `x86_64-unknown-linux-gnu` dist target (previously only had `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu`)
 
-**First foundation relay live on umbp** (Ubuntu 24.04 x86_64, 10Gb sync Sonic fiber):
+**First foundation relay live on Ubuntu Laptop (2012 Retina MacBook Pro, 16GB RAM)** (Ubuntu 24.04 x86_64, 10Gb sync Sonic fiber):
 - peer_id `12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB`
-- multiaddr `/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`
+- multiaddr `/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...`
 - managed by `lucidd-relay.service` (user systemd, `Linger=yes` for boot survival)
-- DNS record added (subdomain → `76.191.195.7`)
+- DNS record added (subdomain → `203.0.113.10`)
 - Verified reachable from a fresh lucidd instance via `--bootstrap-peer` in tens of ms
 
 **What's NOT in this session**: libp2p circuit-relay server protocol (`relay::server::Behaviour`), DCUtR hole-punching, libp2p rendezvous. Those are the real v0.2 substantive substrate work, scoped for the next dedicated session.
@@ -316,12 +316,12 @@ Same session continued. Added `--bootstrap-dns <DOMAIN>` (repeatable) to lucidd.
 Validated end-to-end with the foundation TXT record:
 ```
 $ dig +short TXT bootstrap.phasebased.net
-"/ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB"
+"/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc9YbFWp8hd3JYfpaE2CxhYKvWcPozaNJB"
 
 $ lucidd --no-local-worker --bootstrap-dns bootstrap.phasebased.net
   INFO lucidd: DNS bootstrap resolved domain=bootstrap.phasebased.net count=1
   INFO lucidd: merged DNS-resolved bootstrap peers total=1 domains=1
-  INFO phase_net::discovery: Dialing bootstrap peer: /ip4/76.191.195.7/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...
+  INFO phase_net::discovery: Dialing bootstrap peer: /ip4/203.0.113.10/tcp/4001/p2p/12D3KooWJ6vTjo6yFgEc...
   INFO phase_net::discovery: Connected to peer
 ```
 

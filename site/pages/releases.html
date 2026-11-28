@@ -1,0 +1,103 @@
+<!--
+title: Download & Release Notes · Phase & LUCID
+description: Install LUCID on macOS Apple Silicon, Linux x86_64/ARM64, and Windows x86_64 with SHA-256 verification, code signing status, and full release notes.
+-->
+<main class="page" id="content">
+
+<header class="hero">
+  <h1>Download &amp; Releases</h1>
+  <p class="tagline">Verified bundles for macOS, Linux, and Windows.</p>
+  <p class="lede">Every release publishes a unified <code>SHA256SUMS.txt</code> across all platforms. Installers verify exact SHA-256 digests before unpacking anything.</p>
+  <div class="cta">
+    <a class="button primary" href="https://github.com/msitarzewski/phase/releases">Browse GitHub Releases</a>
+    <a class="button" href="help/install.html">Full install guide</a>
+    <a class="button" href="help/first-chat.html">First chat tutorial</a>
+  </div>
+  <p class="facts">Latest beta series: v0.2.0 prereleases · Checksums enforced fail-closed · macOS Developer ID + Apple Notarization · Windows Azure Artifact Signing</p>
+</header>
+
+<section class="band" id="downloads">
+  <h2>Choose your platform</h2>
+  <p class="intro">Pick the Desktop app for a guided setup and built-in streaming chat, or the CLI installer for servers, relays, and headless GPU boxes.</p>
+
+  <div class="grid">
+    <div class="card">
+      <span class="glyph" aria-hidden="true"></span>
+      <h3>macOS Apple Silicon <span class="pill ok">Desktop + CLI</span></h3>
+      <p>Requires macOS 14+ on Apple Silicon (M1–M5). Download <code>LUCID_0.2.0_aarch64.dmg</code> from GitHub Releases and drag <strong>LUCID</strong> to Applications, or install both CLI and app via Terminal.</p>
+      <div class="cmd-box"><code>curl -fsSL https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.sh | bash -s -- --app</code></div>
+    </div>
+
+    <div class="card">
+      <span class="glyph" aria-hidden="true">🐧</span>
+      <h3>Linux x86_64 &amp; ARM64 <span class="pill ok">Desktop + CLI</span></h3>
+      <p>Ubuntu/Debian Desktop <code>.deb</code> (needs <code>libwebkit2gtk-4.1-0</code> and <code>libgtk-3-0</code>) or baseline <code>x86-64</code> / <code>aarch64</code> CLI tarball (zero AVX2/BMI2 requirements; runs on 2012+ CPUs).</p>
+      <div class="cmd-box"><code>curl -fsSL https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.sh | bash</code></div>
+    </div>
+
+    <div class="card">
+      <span class="glyph" aria-hidden="true">⊞</span>
+      <h3>Windows x86_64 <span class="pill">CLI</span></h3>
+      <p>Native <code>x86_64-pc-windows-msvc</code> binary (<code>lucidd.exe</code>) installed to <code>%LOCALAPPDATA%\LUCID\bin</code> with zip traversal protection and fail-closed SHA-256 verification.</p>
+      <div class="cmd-box"><code>irm https://raw.githubusercontent.com/msitarzewski/phase/main/scripts/install-lucid.ps1 | iex</code></div>
+    </div>
+  </div>
+
+  <p style="margin-top:20px">Prefer to pin a specific tag or verify checksums manually before running anything? See <a href="help/install.html#verify-checksums-manually">Verify checksums manually</a> and <a href="help/install.html#build-from-source">Build from source</a>.</p>
+</section>
+
+<section class="band" id="signing">
+  <h2>Code signing &amp; integrity</h2>
+  <div class="two">
+    <div>
+      <h3>macOS (Developer ID + Notarization)</h3>
+      <p>Release builds for friends and public milestones are signed inside-out with a Developer ID Application certificate (hardened runtime + secure timestamp), notarized with Apple, stapled (both <code>LUCID.app</code> and <code>.dmg</code>), and verified with <code>spctl --assess</code>. Maintainer signing runs strictly from a local macOS Keychain via <code>scripts/sign-macos-release.sh</code>—zero Apple credentials are ever stored in GitHub.</p>
+    </div>
+    <div>
+      <h3>Windows (Azure Artifact Signing)</h3>
+      <p>Windows release builds sign <code>lucidd.exe</code> via <strong>Azure Artifact Signing</strong> (Public Trust, SHA-256 Authenticode + RFC 3161 timestamp via <code>http://timestamp.acs.microsoft.com</code>) using SHA-256-pinned NuGet SDK tools and GitHub OIDC inside a reviewer-gated <code>release</code> environment, then verify with <code>signtool verify /pa</code> before zipping.</p>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="release-notes">
+  <h2>Release notes</h2>
+  <p class="intro">Chronological summary of shipped milestones and the active v0.2 beta series, grounded directly in repository commits and physical fleet evidence.</p>
+
+  <article class="release-entry" id="v020-beta">
+    <h3>LUCID v0.2.0 beta series <span class="pill warn">Active beta · Friends &amp; Family</span></h3>
+    <p class="release-meta">Pre-releases v0.2.0-rc8 through v0.2.0-rc12 · November 2026</p>
+    <p>Turns LUCID from a developer daemon into a hardened, consumer-usable peer-to-peer AI app and desktop suite:</p>
+    <ul class="list">
+      <li><strong>Built-in Streaming Desktop Chat:</strong> Token-by-token NDJSON streaming in LUCID Desktop (Tauri v2 + Svelte 5), Stop button cancelling the upstream HTTP stream, one-click Copy, Local Only privacy toggle, memory-only history, and live trust badges upgraded only after terminal receipt verification.</li>
+      <li><strong>Real <code>/api/ps</code> Model Residency:</strong> Reports only live, health-verified models across both <code>llama.cpp</code> and <code>MLX</code> workers (omitting loading, crashed, degraded, or unmeasured VRAM fields honestly).</li>
+      <li><strong>Zero-CLI Tier-1 Trusted-Circle GPU Pooling:</strong> Native Noise-encrypted <code>/phase/shard-rpc/1.0.0</code> tunneling with auto-managed SHA-256-pinned loopback <code>ggml-rpc-server</code> (pipe-guarded teardown on exit/SIGKILL), strict enrollment-only admission re-checked every 250 ms, and explicit refusal of silent local fallback when an RPC peer fails to attach. Physically verified on 2-Mac sliced <code>gemma-4-12B</code> (22.0 tok/s c=1, 57.5 tok/s c=4).</li>
+      <li><strong>Co-Tenant KV-Cache &amp; Browser Lockdown:</strong> Enforces <code>--no-cache-prompt --cache-ram 0 --cache-reuse 0</code> plus server-owned <code>cache_prompt: false</code> on <code>llama-server</code>; adds per-spawn 256-bit <code>LLAMA_API_KEY</code>, <code>--cors-origins localhost --no-cors-credentials --no-webui --no-slots</code>, loopback <code>Host</code> 403 DNS-rebinding guard, and constant-time Bearer control tokens.</li>
+      <li><strong>Verified P2P Model Pull &amp; Resume:</strong> Resumable <code>/phase/blob/1.0.0</code> streaming with signed alias/provider records, rollback and equivocation detection, multi-provider failover, and whole-file SHA-256 verification (physically verified on a 10.18 GB transfer interrupted and resumed at exact offset).</li>
+      <li><strong>Zero-Config Discovery &amp; Cloud Relay:</strong> PeerID-pinned DNS TXT bootstrap (<code>bootstrap.phasebased.net</code>), Circuit Relay v2 + AutoNAT v2 + DCUtR hole punching, one-command unprivileged Linux relay setup (<code>scripts/setup-cloud-relay.sh --port 443|4001</code>), and one-time <code>lucid://join/…</code> circle invitations.</li>
+      <li><strong>Apple Silicon MLX Backend &amp; Windows CLI:</strong> Strict read-only canonical-hash MLX worker (physically verified at 71.3 tok/s over Cellular + VPN + Relay), first native Windows x86_64 CLI builds + PowerShell installer, and zero-secret macOS notarization + Windows Azure Artifact Signing scripts.</li>
+    </ul>
+    <p><strong>Still open before v0.2.0 final:</strong> NVIDIA CUDA live host qualification, fail-closed native <code>--tor-socks5</code> transport, public rendezvous registration quotas, Linux ARM64 VM qualification, and multi-site relay redundancy.</p>
+  </article>
+
+  <article class="release-entry" id="v011">
+    <h3>LUCID v0.1.1 &amp; Security Hardening <span class="pill ok">Shipped</span></h3>
+    <p class="release-meta">May 2026 (dependency refresh November 2026)</p>
+    <ul class="list">
+      <li>Default-deny submitter authorization (<code>authorized_submitters</code>), strict Ed25519 <code>signer_pubkey → PeerId</code> binding, remote replay cache, and DoS caps across all HTTP and libp2p surfaces.</li>
+      <li>Four-way receipt verify+bind (Ed25519 signature, manifest <code>job_id</code> match, delivering <code>PeerId</code> binding, and chunk commitment replay).</li>
+      <li>Upgraded substrate dependencies (<code>libp2p 0.57</code>, <code>wasmtime 36 LTS</code>, <code>hickory 0.26</code>) with <code>cargo audit</code> and <code>cargo deny</code> CI gates.</li>
+    </ul>
+  </article>
+
+  <article class="release-entry" id="v010">
+    <h3>LUCID v0.1.0 &amp; Phase Core <span class="pill ok">Shipped</span></h3>
+    <p class="release-meta">November 2025 → May 2026</p>
+    <ul class="list">
+      <li>Extracted six Apache-2.0 substrate crates (<code>phase-identity</code>, <code>phase-net</code>, <code>phase-manifest</code>, <code>phase-receipt</code>, <code>phase-protocol</code>, <code>phase-artifact-server</code>) plus the repositioned <code>plasm</code> WASM reference node, all with <code>#![deny(unsafe_code)]</code>.</li>
+      <li>Initial AGPL-3.0-or-later <code>lucidd</code> daemon with Ollama-compatible HTTP API, <code>llama.cpp</code> and <code>echo</code> workers, hot-reloadable <code>policy.toml</code>, and Kademlia DHT local-or-peer routing.</li>
+    </ul>
+  </article>
+</section>
+
+</main>

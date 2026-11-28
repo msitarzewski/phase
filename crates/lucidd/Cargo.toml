@@ -1,12 +1,12 @@
 [package]
 name = "lucidd"
 version = "0.2.0"
-edition = "2021"
-rust-version = "1.88"
+edition.workspace = true
+rust-version.workspace = true
 license = "AGPL-3.0-or-later"
 description = "LUCID inference daemon — open GPU inference flagship built on the Phase substrate."
-authors = ["Michael Sitarzewski"]
-repository = "https://github.com/msitarzewski/phase"
+authors.workspace = true
+repository.workspace = true
 readme = "README.md"
 include = [
     "src/**",
@@ -28,106 +28,52 @@ phase-protocol = { path = "../phase-protocol" }
 phase-identity = { path = "../phase-identity" }
 phase-manifest = { path = "../phase-manifest" }
 phase-receipt = { path = "../phase-receipt" }
-# LUCID M6 model registry. We pull phase-net for the libp2p `PeerId` type
-# so the registry's public API speaks in canonical Phase peer identifiers,
-# but we deliberately keep the DHT-IO surface behind a small in-crate
-# `DhtTransport` trait. That trait abstracts what `phase_net::Discovery`
-# already exposes (`publish_kad_record`) and what M5 will need to add
-# (a record-lookup primitive). Real wiring is M5's job.
 phase-net = { path = "../phase-net" }
-# Reuse Phase's existing content-addressed blob store and range-serving
-# primitives for verified model imports and `/api/pull`.
 phase-artifact-server = { path = "../phase-artifact-server" }
-ed25519-dalek = "2.1"
-# Wire format for signed DHT advertisements. Migrated off the unmaintained
-# `bincode 1.x` (RUSTSEC-2025-0141, SEC-12) to postcard — maintained, stable
-# wire format, deterministic (critical: the SigningPayload bytes are
-# Ed25519-signed, so encode/sign and verify/decode must agree byte-for-byte).
-postcard = { version = "1", features = ["use-std"] }
-sha2 = "0.10"
-# DNS resolver for --bootstrap-dns. system-config picks up /etc/resolv.conf
-# on Linux + macOS automatically; tokio-runtime keeps us on the same
-# async executor as the rest of lucidd.
+ed25519-dalek.workspace = true
+postcard.workspace = true
+sha2.workspace = true
+ring = "0.17"
+hex.workspace = true
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
-async-trait = "0.1"
-anyhow = "1"
-thiserror = "2"
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
 
-# HTTP server. axum 0.7 sits cleanly on top of tokio + hyper 1, has a
-# first-class Body::from_stream for NDJSON, and is the de-facto choice in
-# the modern Rust stack. Matches the research brief's recommendation.
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1.40", features = ["full"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-hyper = "1"
+axum = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "fs", "io-util", "sync", "time", "macros", "process", "signal"] }
+tower.workspace = true
+tower-http = { workspace = true, features = ["cors", "trace"] }
+hyper.workspace = true
 
-# Stream plumbing for the NDJSON response body.
-futures = "0.3"
-futures-util = "0.3"
-async-stream = "0.3"
-bytes = "1"
+futures.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
 
-# Wire format for /api/chat.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 
-# Receipt commitment encoding.
-base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
+base64.workspace = true
+uuid.workspace = true
 
-# Tracing.
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
-# CLI argument parsing for `--worker llama-cpp --model-dir ...`. `clap` is
-# already pulled in by transitive deps; using it directly keeps the bin
-# surface obvious and self-documenting.
-clap = { version = "4", features = ["derive"] }
-
-# HTTP client for talking to llama-server. `rustls-tls` keeps the dependency
-# graph free of native OpenSSL; `stream` exposes `bytes_stream()` for SSE.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-
-# Concurrent map of (model_id → LoadedModel). DashMap is the obvious choice;
-# we want lock-free reads from many request handlers with rare writes (load
-# / unload). `Mutex<HashMap>` would serialise every inference call.
+clap.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 dashmap = "6"
 
-# llama-server's native `/completion` endpoint streams Server-Sent Events
-# with `data: {json}\n\n` framing. We parse it inline (one frame fits in
-# memory comfortably) — no separate SSE crate needed; `bytes_stream()` plus
-# a small buffered split on `\n\n` is enough.
-
-# --- LUCID M7 policy surface ---
-# Operator-facing config (TOML), file-watch reload, system state probing.
-# `notify` v6 ships a tokio-friendly `RecommendedWatcher` and bridges via a
-# crossbeam channel — we re-pipe events onto a tokio mpsc in `policy.rs`.
 notify = "6"
-# Cross-platform battery state. `battery` 0.7 abstracts IOKit on macOS and
-# `/sys/class/power_supply` on Linux. Windows reports Unknown — handled.
 battery = "0.7"
-# Thermal sensors via the Components surface. sysinfo is the path of least
-# resistance for cross-platform temp readout; we'll re-use it in later
-# milestones for VRAM/CPU probing too.
 sysinfo = "0.32"
-# Operator-facing model_id allowlist patterns (`qwen3-*`, `*-q4`, …).
 glob = "0.3"
-# `~/.config/lucidd/` — standard XDG / macOS Application Support resolution.
-dirs = "5"
-# TOML parse + emit for the operator policy file.
+dirs.workspace = true
 toml = "0.8"
-# Local-time evaluation for `time_of_day_window`. We need a tz-aware "now"
-# in the local zone; `chrono`'s `Local` is the standard answer.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono.workspace = true
 
 [dev-dependencies]
-# Subprocess integration tests need a temp dir and a way to wait for child
-# output. Their llama-server protocol fixture is compiled only into the
-# integration-test harness; it is not an installable Cargo binary target.
-tempfile = "3"
-tokio = { version = "1.40", features = ["full", "test-util"] }
-# The test-only llama-server protocol fixture is a tiny axum app. See
-# `tests/fixtures/fake_llama_server.rs`.
-axum = { version = "0.7", features = ["macros"] }
-hyper = { version = "1", features = ["server"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "fs", "io-util", "sync", "time", "macros", "process", "signal", "test-util"] }
+axum = { workspace = true, features = ["macros"] }
+hyper = { workspace = true, features = ["server"] }

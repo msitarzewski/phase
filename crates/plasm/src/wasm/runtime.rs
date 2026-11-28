@@ -1,7 +1,15 @@
 use anyhow::Result;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+/// Bounded number of compiled Wasmtime modules retained in memory to avoid
+/// repeating Cranelift JIT compilation on hot WASM workloads while keeping
+/// cache memory bounded.
+const MAX_CACHED_WASM_MODULES: usize = 64;
 
 #[derive(Error, Debug)]
 pub enum WasmError {
@@ -40,6 +48,92 @@ pub struct ExecutionResult {
     pub module_hash: String,
 }
 
+struct WasmStoreState {
+    wasi: wasmtime_wasi::preview1::WasiP1Ctx,
+    limits: wasmtime::StoreLimits,
+}
+
+struct CompiledModuleCache {
+    entries: HashMap<[u8; 32], wasmtime::Module>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl CompiledModuleCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, digest: &[u8; 32]) -> Option<wasmtime::Module> {
+        self.entries.get(digest).cloned()
+    }
+
+    fn insert(&mut self, digest: [u8; 32], module: wasmtime::Module) {
+        if self.entries.contains_key(&digest) {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHED_WASM_MODULES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(digest);
+        self.entries.insert(digest, module);
+    }
+}
+
+struct SharedWasmEngine {
+    engine: wasmtime::Engine,
+    linker: wasmtime::Linker<WasmStoreState>,
+    modules: Mutex<CompiledModuleCache>,
+}
+
+impl SharedWasmEngine {
+    fn global() -> Result<&'static Self, WasmError> {
+        static ENGINE: OnceLock<std::result::Result<SharedWasmEngine, String>> = OnceLock::new();
+        let init = ENGINE.get_or_init(|| {
+            let mut config = wasmtime::Config::new();
+            config.consume_fuel(true);
+            let engine = wasmtime::Engine::new(&config).map_err(|e| e.to_string())?;
+            let mut linker = wasmtime::Linker::new(&engine);
+            wasmtime_wasi::preview1::add_to_linker_sync(
+                &mut linker,
+                |state: &mut WasmStoreState| &mut state.wasi,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(SharedWasmEngine {
+                engine,
+                linker,
+                modules: Mutex::new(CompiledModuleCache::new()),
+            })
+        });
+        init.as_ref()
+            .map_err(|msg| WasmError::RuntimeCreationError(msg.clone()))
+    }
+
+    fn get_or_compile(
+        &self,
+        digest: [u8; 32],
+        wasm_bytes: &[u8],
+    ) -> Result<wasmtime::Module, WasmError> {
+        if let Ok(cache) = self.modules.lock() {
+            if let Some(module) = cache.get(&digest) {
+                return Ok(module);
+            }
+        }
+        let module = wasmtime::Module::from_binary(&self.engine, wasm_bytes)
+            .map_err(|e| WasmError::ModuleLoadError(e.to_string()))?;
+        if let Ok(mut cache) = self.modules.lock() {
+            cache.insert(digest, module.clone());
+        }
+        Ok(module)
+    }
+}
+
 /// Trait for WASM runtime implementations
 #[allow(
     clippy::double_must_use,
@@ -59,7 +153,12 @@ pub trait WasmRuntime {
     ) -> Result<ExecutionResult>;
 }
 
-/// Wasmtime-based WASM runtime implementation (with full WASI support)
+/// Wasmtime-based WASM runtime implementation (with full WASI support).
+///
+/// Reuses a process-wide compiled [`wasmtime::Engine`], WASI [`wasmtime::Linker`],
+/// and bounded SHA-256 compiled-module cache across executions while isolating
+/// every run in its own `Store` with per-job fuel and memory limits.
+#[derive(Clone)]
 pub struct Wasm3Runtime {
     max_memory_bytes: u64,
     _stack_size_bytes: u64,
@@ -86,12 +185,19 @@ impl Wasm3Runtime {
         self
     }
 
-    /// Compute SHA-256 hash of WASM module
-    fn compute_module_hash(wasm_bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
+    fn compute_module_digest(wasm_bytes: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(wasm_bytes);
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+        hasher.finalize().into()
+    }
+
+    /// Compute SHA-256 hash of WASM module
+    #[cfg(test)]
+    fn compute_module_hash(wasm_bytes: &[u8]) -> String {
+        format!(
+            "sha256:{}",
+            hex::encode(Self::compute_module_digest(wasm_bytes))
+        )
     }
 }
 
@@ -106,48 +212,40 @@ impl Wasm3Runtime {
     fn execute_sync(
         wasm_bytes: &[u8],
         timeout: Duration,
-        _max_memory_bytes: u64,
+        max_memory_bytes: u64,
     ) -> Result<ExecutionResult> {
         use wasmtime::*;
 
         info!("Executing WASM module ({} bytes)", wasm_bytes.len());
         let start = Instant::now();
 
-        // Compute module hash
-        let module_hash = Self::compute_module_hash(wasm_bytes);
+        let digest = Self::compute_module_digest(wasm_bytes);
+        let module_hash = format!("sha256:{}", hex::encode(digest));
         debug!("Module hash: {}", module_hash);
 
-        // Create engine with resource limits
-        let mut config = Config::new();
-        config.consume_fuel(true); // Enable fuel for timeout control
+        let shared = SharedWasmEngine::global()?;
+        let module = shared.get_or_compile(digest, wasm_bytes)?;
 
-        let engine =
-            Engine::new(&config).map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
-
-        // Create WASI preview1 context with stdio
+        // Create isolated WASI preview1 context with per-job memory ceiling.
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
             .inherit_stdio()
             .build_p1();
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(usize::try_from(max_memory_bytes).unwrap_or(usize::MAX))
+            .build();
 
-        let mut store = Store::new(&engine, wasi);
+        let mut store = Store::new(&shared.engine, WasmStoreState { wasi, limits });
+        store.limiter(|state| &mut state.limits);
 
         // Set fuel limit based on timeout (rough heuristic: 1M instructions per second)
-        let fuel_limit = timeout.as_secs() * 1_000_000;
+        let fuel_limit = timeout.as_secs().max(1).saturating_mul(1_000_000);
         store
             .set_fuel(fuel_limit)
             .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
 
-        // Load module
-        let module = Module::from_binary(&engine, wasm_bytes)
-            .map_err(|e| WasmError::ModuleLoadError(e.to_string()))?;
-
-        // Create linker and add WASI (preview 1)
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
-            .map_err(|e| WasmError::RuntimeCreationError(e.to_string()))?;
-
-        // Instantiate module
-        let instance = linker
+        // Instantiate module against the shared pre-populated WASI linker
+        let instance = shared
+            .linker
             .instantiate(&mut store, &module)
             .map_err(|e| WasmError::ModuleLoadError(e.to_string()))?;
 
@@ -156,7 +254,7 @@ impl Wasm3Runtime {
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| WasmError::ExecutionError(format!("No _start function: {}", e)))?;
 
-        // Execute (fuel exhaustion will cause error if timeout)
+        // Execute (fuel exhaustion or memory cap causes error)
         let result = func.call(&mut store, ());
 
         let exit_code = match result {
@@ -174,8 +272,6 @@ impl Wasm3Runtime {
             exit_code, wall_time_ms
         );
 
-        // Note: For MVP, stdout is inherited (prints to terminal)
-        // Full capture will be implemented in later tasks
         let stdout = String::from("(stdout inherited - see terminal output)");
 
         Ok(ExecutionResult {
@@ -244,6 +340,28 @@ mod tests {
         assert_eq!(hash.len(), 71); // "sha256:" + 64 hex chars
     }
 
-    // Note: Full execution tests require a valid WASM module
-    // These will be added in Task 4 when we create hello.wasm
+    #[test]
+    fn test_shared_engine_caches_compiled_module() {
+        // Minimal valid WASI-compatible module exporting empty `_start`.
+        let minimal_wasm: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
+            0x03, 0x02, 0x01, 0x00, // func section
+            0x07, 0x0a, 0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00,
+            0x00, // export _start
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code: nop/end
+        ];
+        let digest = Wasm3Runtime::compute_module_digest(minimal_wasm);
+        let shared = SharedWasmEngine::global().expect("shared engine");
+        let _ = shared
+            .get_or_compile(digest, minimal_wasm)
+            .expect("first compile");
+        let cached = shared
+            .modules
+            .lock()
+            .expect("cache lock")
+            .get(&digest)
+            .is_some();
+        assert!(cached, "compiled module should be cached by SHA-256 digest");
+    }
 }

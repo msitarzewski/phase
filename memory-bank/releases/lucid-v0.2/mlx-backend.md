@@ -127,4 +127,12 @@ Approve a decision covering:
 - Tests cover canonical bundle identity, mutation after construction, runtime mutation, malicious/oversized/CRLF SSE, cancellation, hung streams, occupied ports, wrong model/kind, bounded recursive scan, signed output, and Linux fail-closed platform behavior.
 - macOS ARM64 workspace QA and native Linux x86_64 unsupported-platform QA pass. Test fixtures validate the adapter contract but do not satisfy hardware acceptance.
 - Remaining before completion: pin the chosen real MLX/`mlx-lm` version and license set, run a real open-weight model on Apple Silicon, validate local and peer routing/cancellation/crash/resource behavior, and record performance/power measurements.
-- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-umbp-qualification.md).
+- Evidence and exact fingerprint: [2026-08-09 checkpoint task](../../tasks/2026-08/260809_lucid-v0.2-implementation-linux-qualification.md).
+
+## 2026-11-22 hardware assignment & SSE refactor
+
+- Refactored `MlxWorker` (`crates/lucidd/src/worker_mlx/mod.rs`) to reuse shared zero-extra-allocation SSE framing from `crates/lucidd/src/backend_io.rs`, removing the per-chunk `BytesMut` copy-allocate overhead while preserving strict frame-size, CRLF/LF, and fail-closed invariants; inline tests moved to `crates/lucidd/src/worker_mlx/tests.rs`.
+- **Designated Apple Silicon test rigs:**
+  - **Primary:** Mac M1 Max (32GB RAM, macOS 27.x, behind home NAT) — runs pinned `mlx_lm.server` + read-only canonical model bundle via `lucidd --worker mlx --mlx-server-binary <ABS_PATH> --mlx-model-bundle <RO_BUNDLE_DIR> --mlx-model-alias <ALIAS>`, tested both locally and remotely from Mac M5 Max (128GB RAM, on cellular) across the Cloud Relay (see [Stage 4 of the soup-to-nuts plan](./intended-stream-vertical-slice.md#stage-4--contributor-2--real-mlx-hardware-acceptance-mac-m1-max-32gb-ram-behind-home-nat)).
+  - **Secondary (optional):** Mac M5 Max (128GB RAM, macOS 27.3 b2) — local large-model throughput/power comparison.
+- Hardware acceptance remains open until the pinned `mlx`/`mlx-lm` versions, licenses, local/remote stream recordings, cancellation cleanup, and performance/power numbers are recorded.

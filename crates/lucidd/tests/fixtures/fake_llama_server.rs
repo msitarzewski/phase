@@ -26,6 +26,12 @@
 //! | `FAKE_LLAMA_HANG_AFTER=N` | Stop emitting after N tokens, hold socket. |
 //! | `FAKE_LLAMA_CRASH_AFTER_MS=N` | `std::process::exit(2)` after N ms. |
 //! | `FAKE_LLAMA_FAIL_HEALTH=1` | Always return 500 from `/health`. |
+//! | `FAKE_LLAMA_FAIL_HEALTH_FOR_MODEL=stem` | Return 500 from `/health` only when `--model` has this file stem. |
+//!
+//! Like the real `llama-server` started with `LLAMA_API_KEY`, the fixture
+//! refuses to start without a key in its environment and answers every
+//! endpoint except `GET /health` with `401` unless the request carries
+//! `Authorization: Bearer <key>`.
 //!
 //! The worker only ever cares about the SSE chunk shape and the `/health`
 //! semantics, so the fixture stays small.
@@ -36,8 +42,9 @@ use std::time::Duration;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -53,6 +60,9 @@ struct Config {
     hang_after: Option<usize>,
     fail_health: bool,
     boot_at: std::time::Instant,
+    template_mode: String,
+    required_prompt: Option<String>,
+    api_key: String,
 }
 
 pub(crate) fn run() -> ! {
@@ -69,6 +79,23 @@ async fn run_server() -> ! {
         .parse()
         .expect("fixture port must be a u16");
     let host = std::env::var("PHASE_FAKE_LLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Mirror llama-server's `LLAMA_API_KEY` contract. A worker that forgets
+    // to pass the key must fail loudly rather than serve unauthenticated.
+    let api_key = match std::env::var("LLAMA_API_KEY") {
+        Ok(key) if !key.is_empty() => key,
+        _ => {
+            eprintln!("fake-llama-server: LLAMA_API_KEY missing from environment");
+            std::process::exit(64);
+        }
+    };
+    let model_stem = std::env::var("PHASE_FAKE_LLAMA_MODEL")
+        .ok()
+        .and_then(|model| {
+            std::path::Path::new(&model)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
 
     let cfg = Config {
         tokens: std::env::var("FAKE_LLAMA_TOKENS")
@@ -98,8 +125,13 @@ async fn run_server() -> ! {
         hang_after: std::env::var("FAKE_LLAMA_HANG_AFTER")
             .ok()
             .and_then(|s| s.parse().ok()),
-        fail_health: std::env::var("FAKE_LLAMA_FAIL_HEALTH").is_ok(),
+        fail_health: std::env::var("FAKE_LLAMA_FAIL_HEALTH").is_ok()
+            || std::env::var("FAKE_LLAMA_FAIL_HEALTH_FOR_MODEL")
+                .is_ok_and(|stem| !stem.is_empty() && stem == model_stem),
         boot_at: std::time::Instant::now(),
+        template_mode: std::env::var("FAKE_LLAMA_TEMPLATE_MODE").unwrap_or_default(),
+        required_prompt: std::env::var("FAKE_LLAMA_REQUIRED_PROMPT").ok(),
+        api_key,
     };
 
     // Optional self-destruct used to simulate a crash mid-stream.
@@ -115,20 +147,49 @@ async fn run_server() -> ! {
         });
     }
 
+    let cfg = Arc::new(cfg);
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/completion", post(handle_completion))
+        .route("/apply-template", post(handle_apply_template))
         .route("/v1/chat/completions", post(handle_completion))
         .route("/embedding", post(handle_embedding))
-        .with_state(Arc::new(cfg));
+        .route("/slots", get(handle_health))
+        .layer(middleware::from_fn_with_state(cfg.clone(), require_api_key))
+        .with_state(cfg);
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("valid host:port from args");
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("fake-llama-server bind {addr} failed: {e}");
+    // When a worker evicts a previous fixture on the same port and immediately
+    // spawns a replacement, the OS may need a few milliseconds to finish
+    // reaping the killed child's listening FD. Retry AddrInUse briefly so
+    // parallel/repeated test runs do not flake on transient teardown races.
+    let mut listener = None;
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 9 => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    let listener = match listener {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "fake-llama-server bind {addr} failed: {}",
+                last_err.unwrap_or_else(|| std::io::Error::other("unknown bind failure"))
+            );
             std::process::exit(1);
         }
     };
@@ -140,6 +201,30 @@ async fn run_server() -> ! {
     std::process::exit(0)
 }
 
+/// `llama-server` exempts only its health endpoints from API-key checks.
+async fn require_api_key(State(cfg): State<Arc<Config>>, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| presented == cfg.api_key);
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"code": 401, "message": "Invalid API Key", "type": "authentication_error"}
+            })),
+        )
+            .into_response()
+    }
+}
+
 async fn handle_health(State(cfg): State<Arc<Config>>) -> Response {
     if cfg.fail_health {
         return (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response();
@@ -148,6 +233,31 @@ async fn handle_health(State(cfg): State<Arc<Config>>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "loading model").into_response();
     }
     Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+async fn handle_apply_template(
+    State(cfg): State<Arc<Config>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    if request["add_generation_prompt"] != true
+        || request["chat_template_kwargs"]["enable_thinking"] != false
+        || !request["messages"].is_array()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match cfg.template_mode.as_str() {
+        "invalid" => return Json(serde_json::json!({"prompt": 17})).into_response(),
+        "oversize" => {
+            return Json(serde_json::json!({"prompt": "x".repeat(4 * 1024 * 1024 + 1)}))
+                .into_response()
+        }
+        "hang" => tokio::time::sleep(Duration::from_secs(600)).await,
+        _ => {}
+    }
+    Json(serde_json::json!({"prompt": format!(
+        "<fixture-template>{}</fixture-template>", request["messages"]
+    )}))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -202,9 +312,16 @@ async fn handle_embedding(
 
 async fn handle_completion(
     State(cfg): State<Arc<Config>>,
-    Json(_req): Json<CompletionRequest>,
+    Json(req): Json<CompletionRequest>,
 ) -> Response {
     let cfg = cfg.clone();
+    if cfg
+        .required_prompt
+        .as_ref()
+        .is_some_and(|expected| req.prompt.as_ref() != Some(expected))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let stream = async_stream::stream! {
         for (idx, tok) in cfg.tokens.iter().enumerate() {
             // Hang test: stop emitting but keep socket open. The worker's

@@ -1,8 +1,64 @@
 # Quick Start: Phase Development Guide
 
-**Last Updated**: 2025-11-09
-**Version**: 0.1
-**Audience**: Developers working on Phase Open MVP
+**Last Updated**: 2026-11-22
+**Version**: 0.2
+**Audience**: Developers and operators working on Phase Core, Plasm, LUCID, and `apps/lucid-macos`
+
+---
+
+## Current Workspace Quick Reference (2026-11-22)
+
+> **Note:** Historical November 2025 MVP notes further down (`daemon/`, `wasm3`) are kept for archival context. Use the current workspace layout and validation commands below.
+
+### Repository Layout
+
+```text
+phase/
+├── Cargo.toml                     # 8-crate workspace + centralized [workspace.dependencies] (MSRV 1.88)
+├── crates/
+│   ├── phase-identity/            # Persistent Ed25519 identity (Apache-2.0)
+│   ├── phase-net/                 # libp2p 0.56 DHT/relay/DCUtR/substreams (discovery/{mod,tests}.rs)
+│   ├── phase-manifest/            # Generic SignedManifest<T> + canonical JSON
+│   ├── phase-receipt/             # Generic SignedReceipt<T> + canonical JSON
+│   ├── phase-protocol/            # Worker trait, JobSpec, CommitmentAccumulator
+│   ├── phase-artifact-server/     # Standalone content-addressed HTTP range server
+│   ├── plasm/                     # Wasmtime 36 WASM node (shared Engine + module cache + StoreLimits)
+│   └── lucidd/                    # LUCID inference daemon (AGPL-3.0; llama.cpp, echo, experimental MLX)
+├── apps/lucid-macos/              # Native SwiftUI macOS 14+ consumer app (LUCID.app)
+├── scripts/phase-validate.sh      # Fingerprinted local/Linux/release/security/qualification runner
+├── boot/                          # Phase Boot USB/netboot/kexec pipeline
+├── php-sdk/                       # PHP 8.1+ client SDK
+└── memory-bank/                   # Architecture, ADRs, release trackers, tasks/YYYY-MM/
+```
+
+### Everyday Commands
+
+```bash
+# Fast workspace checks (offline-safe once crates are cached)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo test --workspace --locked --offline
+
+# Fingerprinted validation profiles (logs stored under target/phase-validation/)
+scripts/phase-validate.sh workspace
+scripts/phase-validate.sh release
+scripts/phase-validate.sh security
+scripts/phase-validate.sh linux          # Run on Ubuntu x86_64 & Ubuntu ARM64 VM
+
+# Install verified GitHub Release artifacts (zero manual copy/paste)
+scripts/install-lucid.sh --tag v0.2.0-rc1                    # CLI -> ~/.local/bin/lucidd
+scripts/install-lucid.sh --tag v0.2.0-rc1 --install-systemd  # Linux relay user unit
+scripts/install-lucid.sh --tag v0.2.0-rc1 --app              # macOS Apple Silicon -> ~/Applications/LUCID.app
+scripts/fleet-install.sh --tag v0.2.0-rc1                    # Reads gitignored .phase-fleet.local.env
+
+# Native macOS consumer app (local build on macOS 14+ with Xcode CLT)
+swift test --package-path apps/lucid-macos --scratch-path target/lucid-macos/swift-build -Xswiftc -warnings-as-errors
+bash apps/lucid-macos/build-app.sh --daemon target/release/lucidd
+open target/lucid-macos/LUCID.app
+
+# Full physical fleet test runbook (Cloud Relay + Ubuntu Desktop + Ubuntu Laptop + Mac M1 Max + cellular Mac M5 Max):
+# See memory-bank/releases/lucid-v0.2/intended-stream-vertical-slice.md#soup-to-nuts-physical-fleet-test-plan--2026-11-22
+```
 
 ---
 

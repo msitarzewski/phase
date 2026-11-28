@@ -93,12 +93,20 @@ sha256_file() {
 source_fingerprint() {
     (
         cd "$REPO_ROOT" || exit 1
-        find Cargo.toml Cargo.lock deny.toml crates scripts -type f -print \
-            | LC_ALL=C sort \
-            | while IFS= read -r path; do
-                printf '%s\t' "$path"
-                sha256_file "$path" || exit 1
-            done
+        local source_roots=(Cargo.toml Cargo.lock deny.toml crates scripts)
+        if [[ -d apps/lucid-macos ]]; then
+            source_roots+=(apps/lucid-macos)
+        fi
+        local hash_cmd=(shasum -a 256)
+        if command -v sha256sum >/dev/null 2>&1; then
+            hash_cmd=(sha256sum)
+        fi
+        find "${source_roots[@]}" \
+            -type d \( -name .build -o -name .swiftpm \) -prune \
+            -o -type f -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 "${hash_cmd[@]}" \
+            | awk '{ hash=$1; sub(/^[^ ]+  /, ""); printf "%s\t%s\n", $0, hash }'
     ) | if command -v sha256sum >/dev/null 2>&1; then
         sha256sum | awk '{ print $1 }'
     else
@@ -385,7 +393,8 @@ run_security() {
 
     if cargo deny --version >/dev/null 2>&1; then
         # Both Cargo dependency resolution and advisory lookup stay offline.
-        run_step "security-deny" cargo deny --locked --offline check --disable-fetch
+        # Match CI by keeping unmaintained-crate advisories as warnings.
+        run_step "security-deny" cargo deny --locked --offline check --disable-fetch --warn unmaintained
     else
         skip_step "security-deny" "cargo-deny is not installed"
     fi
@@ -469,12 +478,14 @@ case "$PROFILE" in
         run_workspace
         ;;
     qualification|all)
-        # Workspace tests/clippy cover every component. Adversarial repeats the
-        # security-critical targets intentionally so its evidence logs remain
-        # self-contained and reviewable beside optimized/package evidence.
+        # Workspace tests/clippy already execute every package and integration
+        # target (including phase-net, lucidd, and phase-artifact-server). Run
+        # the optimized release package check and security gates without
+        # duplicating the identical cargo test runs. The standalone
+        # `adversarial` profile remains self-contained when invoked directly.
         run_workspace
         run_release
-        run_adversarial
+        run_security
         require_native_macos_arm64
         # Qualification is intentionally incomplete without evidence from
         # both supported Linux architecture profiles. A macOS-only run must

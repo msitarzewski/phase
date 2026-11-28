@@ -15,14 +15,21 @@
 // lucidd's source against an `unsafe` regression.
 #![deny(unsafe_code)]
 
+pub(crate) mod backend_io;
+pub mod bench;
+pub mod consumer;
 pub mod content;
 pub mod dht_transport;
 pub mod echo;
+pub mod node_config;
 pub mod ollama;
 pub mod policy;
 pub mod registry;
 pub mod reputation;
 pub mod router;
+pub mod runtime_manager;
+pub mod shard_plan;
+pub mod shard_worker;
 pub mod worker_llama;
 pub mod worker_mlx;
 
