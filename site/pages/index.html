@@ -80,20 +80,20 @@ description: Run open-weight AI models on your own machines and share spare GPU 
   <p class="intro">Numbers below come from physical 5-node fleet tests (macOS Apple Silicon, Linux x86_64 including 2012 Ivy Bridge, and an unprivileged Cloud Relay) rather than synthetic mocks.</p>
   <div class="metrics">
     <div class="metric">
-      <span class="val">122 / 122</span>
+      <span class="val">126 / 126</span>
       <span class="lbl">Remote peer-verified Ed25519 receipts (100%)</span>
+    </div>
+    <div class="metric">
+      <span class="val">50.9 tok/s</span>
+      <span class="lbl">NVIDIA RTX 5060 Ti CUDA 12.8 (10.18 GB, c=2)</span>
+    </div>
+    <div class="metric">
+      <span class="val">37.5 tok/s</span>
+      <span class="lbl">3-GPU Metal 4 + NVIDIA CUDA 12.8 sliced (zero SSH)</span>
     </div>
     <div class="metric">
       <span class="val">71.3 tok/s</span>
       <span class="lbl">Apple Silicon MLX over Cellular + VPN + Relay</span>
-    </div>
-    <div class="metric">
-      <span class="val">57.5 tok/s</span>
-      <span class="lbl">2-Mac sliced gemma-4-12B over /phase/shard-rpc (c=4)</span>
-    </div>
-    <div class="metric">
-      <span class="val">10.18 GB</span>
-      <span class="lbl">P2P model pull with interrupt &amp; exact-offset resume</span>
     </div>
   </div>
   <p style="margin-top:16px"><a href="releases.html#v020-beta">Read the full v0.2 release notes and verification status →</a></p>
