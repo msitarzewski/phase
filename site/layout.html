@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="{{description}}">
+<link rel="canonical" href="{{canonical}}">
+<meta property="og:type" content="{{og_type}}">
+<meta property="og:site_name" content="Phase &amp; LUCID">
+<meta property="og:title" content="{{og_title}}">
+<meta property="og:description" content="{{description}}">
+<meta property="og:url" content="{{canonical}}">
+<meta property="og:image" content="{{base_url}}static/icon-512.png">
+<meta name="twitter:card" content="summary">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#111215" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<link rel="icon" type="image/png" href="{{root}}static/icon-32.png">
+<link rel="apple-touch-icon" href="{{root}}static/icon-256.png">
+<link rel="alternate" type="text/plain" href="{{base_url}}llms.txt" title="llms.txt">
+<link rel="stylesheet" href="{{root}}static/site.css">
+<script type="application/ld+json">{{jsonld}}</script>
+</head>
+<body data-root="{{root}}">
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="{{root}}index.html"><img class="only-dark" src="{{root}}static/icon-dark.png" alt="" width="28" height="28"><img class="only-light" src="{{root}}static/icon-light.png" alt="" width="28" height="28"><span>Phase &amp; LUCID</span></a>
+    <nav class="nav" aria-label="Site">
+{{nav}}
+    </nav>
+    <div class="top-actions">
+      <button class="search-button" type="button" data-search aria-label="Search docs and APIs">⌕ <span class="search-label">Search docs</span> <kbd>⌘K</kbd></button>
+      <button class="theme-button" type="button" data-theme-toggle aria-label="Change appearance">◐</button>
+    </div>
+  </div>
+</header>
+{{body}}
+<footer class="footer">
+  <div class="footer-inner">
+{{footer}}
+    <p class="fine">Phase substrate: Apache-2.0 · LUCID daemon &amp; desktop app: AGPL-3.0-or-later · This site sets no cookies, runs no analytics, and loads nothing from third-party hosts. Theme preference stays in this browser only.</p>
+  </div>
+</footer>
+<div class="palette" role="dialog" aria-modal="true" aria-label="Search documentation">
+  <div class="scrim"></div>
+  <div class="panel">
+    <div class="field"><span aria-hidden="true">⌕</span><input type="search" placeholder="Search setup, APIs, CLI flags, protocols…" autocomplete="off" spellcheck="false" aria-label="Search documentation"><kbd>esc</kbd></div>
+    <ul></ul>
+    <div class="hint status"></div>
+  </div>
+</div>
+<script src="{{root}}static/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!--
+title: Security & Trust Model · Phase & LUCID
+description: How LUCID protects your machine, local APIs, GPUs, and circle peers—and an honest list of what is not protected yet.
+-->
+<main class="page" id="content">
+
+<header class="hero">
+  <h1>Security &amp; Trust Model</h1>
+  <p class="tagline">Default-deny networking, loopback lockdown, and honest limits.</p>
+  <p class="lede">Every claim on this page is traced directly to enforcement in the Rust and Tauri source code. Where a guarantee does not exist yet, it is stated plainly below.</p>
+</header>
+
+<section class="band">
+  <h2>Local machine &amp; browser protection</h2>
+  <ul class="list">
+    <li><strong>Loopback-only HTTP bind:</strong> <code>lucidd</code> refuses any non-loopback <code>LUCIDD_HOST</code> (only <code>127.0.0.1</code> and <code>::1</code> are permitted).</li>
+    <li><strong>DNS-rebinding <code>Host</code> guard:</strong> Every HTTP request is checked by middleware that returns <code>403 Forbidden</code> on missing, duplicated, or non-loopback <code>Host</code> headers or URI authorities.</li>
+    <li><strong>Private control API bearer token:</strong> All <code>/api/lucid/*</code> endpoints require <code>Authorization: Bearer &lt;64-hex&gt;</code> verified in constant time and return <code>Cache-Control: no-store</code>. In LUCID Desktop, the per-session token (<code>0600</code>) never enters the Svelte WebView—only Rust Tauri commands hold it.</li>
+    <li><strong>Explicit permission gates:</strong> Turning on GPU sharing (<code>/api/lucid/provide</code>) or downloading/pinning the runtime (<code>/api/lucid/runtime/setup</code>) requires <code>confirm_permission: true</code> (else <code>428 Precondition Required</code>). LUCID Desktop refuses to run as <code>root</code> (<code>uid == 0</code>).</li>
+    <li><strong>Folder &amp; runtime confinement:</strong> Model folder validation blocks symlinks, relative paths, system roots, <code>$HOME</code> root, and sensitive folders (<code>.ssh</code>, <code>.gnupg</code>, <code>.aws</code>, <code>.kube</code>, <code>.docker</code>, Keychains, <code>.config/phase</code>). Downloaded <code>llama.cpp b12651</code> archives and auto-managed <code>ggml-rpc-server</code> binaries are verified against pinned SHA-256 digests before extraction and before every spawn.</li>
+    <li><strong>Worker subprocess isolation:</strong> Each <code>llama-server</code> spawn gets a cleared environment, a fresh 256-bit OS CSPRNG <code>LLAMA_API_KEY</code> (never in argv), <code>--cors-origins localhost --no-cors-credentials --no-webui --no-slots</code>, and strict no-proxy / no-redirect loopback HTTP clients.</li>
+    <li><strong>Cross-tenant KV-cache isolation:</strong> <code>llama-server</code> runs with <code>--no-cache-prompt --cache-ram 0 --cache-reuse 0</code> and server-owned <code>cache_prompt: false</code> on every request so one caller cannot probe another caller's prompt prefix via timing.</li>
+  </ul>
+</section>
+
+<section class="band">
+  <h2>Network, identity &amp; peer authorization</h2>
+  <ul class="list">
+    <li><strong>Ed25519 root identity:</strong> Persistent 32-byte key stored atomically at mode <code>0600</code> inside a <code>0700</code> directory (<code>phase-identity</code>). The same key derives your libp2p <code>PeerId</code>.</li>
+    <li><strong>Encrypted transport:</strong> All libp2p traffic runs over Noise XX (TCP &amp; Circuit Relay v2) or TLS 1.3 (QUIC v1).</li>
+    <li><strong>Default-deny job execution:</strong> <code>policy.toml</code> starts with <code>authorized_submitters = []</code> and <code>allow_unauthenticated_jobs = false</code>. Inbound jobs must pass <code>SignedManifest::verify_for_remote_execution()</code> (15-minute max TTL, 5-minute max clock skew), bind <code>signer_pubkey</code> to the delivering libp2p <code>PeerId</code>, and match an allowlisted key or active circle enrollment grant.</li>
+    <li><strong>Strictest gate for GPU pooling (<code>/phase/shard-rpc/1.0.0</code>):</strong> A synchronous peer filter drops non-enrolled peers before reading a single byte, <em>never</em> honors <code>allow_unauthenticated_jobs</code>, requires live <code>cluster_enabled = true</code> and <code>!manual_pause</code>, and re-checks authorization every 250 ms—tearing down live tunnels immediately on opt-out or revocation.</li>
+    <li><strong>Memory safety:</strong> All library crates and LUCID Desktop's Rust backend enforce <code>#![deny(unsafe_code)]</code> (zero <code>unsafe</code> blocks in workspace crates; third-party crypto/network crates are audited via <code>cargo audit</code> and <code>cargo deny</code> in CI).</li>
+  </ul>
+  <p><a href="help/cryptography-and-receipts.html">Read exact signature domains, commitment replay, and rollback protection →</a></p>
+</section>
+
+<section class="band">
+  <h2>What is NOT protected yet (honest limits)</h2>
+  <p class="intro">Do not rely on LUCID for guarantees it has not built yet:</p>
+  <ul class="list">
+    <li><strong>Prompt visibility on the serving peer:</strong> Noise and QUIC protect prompts from relays and network observers, <em>not</em> from the peer executing your inference. Use <code>X-Lucid-Local-Only: true</code> (or the Desktop <strong>Local Only</strong> toggle) for prompts that must stay on your own device.</li>
+    <li><strong>Receipts prove attribution, not hidden compute:</strong> A verified <code>SignedReceipt</code> proves which peer signed the exact tokens you received. Redundant spot-checking (<code>remote-spot-checked</code>) adds local deterministic consistency evidence, not a cryptographic proof that the peer used a specific model weight or quantization.</li>
+    <li><strong>Tier-1 GPU pooling carries SSH-equivalent peer trust:</strong> Enabling <code>cluster_enabled</code> exposes a loopback <code>ggml-rpc-server</code> to your explicitly enrolled circle over <code>/phase/shard-rpc/1.0.0</code>. Use Tier-1 sharding only among machines you personally own or trust at the OS level. Tier-2 <code>UntrustedSpotChecked</code> sharding is fail-closed and not implemented.</li>
+    <li><strong>No built-in Tor / SOCKS5 transport yet:</strong> Peers and relays see direct IP addresses unless you route through an OS-level Tor gateway (see <a href="help/cloud-relay-and-privacy.html#running-over-tor-and-tailsos">TailsOS &amp; Tor guide</a>, including same-LAN RFC 1918 caveats).</li>
+    <li><strong>DNS bootstrap without DNSSEC:</strong> TXT lookups on <code>bootstrap.phasebased.net</code> pin each relay's <code>PeerId</code> (preventing key impersonation), but do not enforce DNSSEC; pass explicit <code>--no-default-bootstrap --relay-peer &lt;multiaddr&gt;</code> for maximum bootstrap certainty.</li>
+    <li><strong>Whole-file blob verification:</strong> <code>/phase/blob/1.0.0</code> enforces sequential offsets and commits only after full-file SHA-256 verification, but does not yet verify per-chunk Merkle proofs (a corrupt chunk from a bad provider triggers a clean restart from offset 0 on failover).</li>
+    <li><strong>In-memory job replay cache:</strong> Inbound job replay protection is process-local (bounded by the 15-minute manifest TTL), and <code>ContentProviderRecord</code> rollback tracking is in-memory (whereas <code>AliasRecord</code> replay protection persists atomically at mode <code>0600</code>).</li>
+  </ul>
+</section>
+
+<section class="band narrow">
+  <h2>Reporting a vulnerability</h2>
+  <p>Please report security issues privately through GitHub's <a href="https://github.com/msitarzewski/phase/security/advisories">Security Advisories</a> page on <code>msitarzewski/phase</code> rather than opening a public issue. Include reproduction steps, affected crate or binary version, and impact.</p>
+</section>
+
+</main>

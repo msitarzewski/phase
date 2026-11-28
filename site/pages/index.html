@@ -1,0 +1,162 @@
+<!--
+title: Phase & LUCID — private, peer-to-peer AI on hardware you trust
+description: Run open-weight AI models on your own machines and share spare GPU power with friends you invite. Ollama-compatible API, signed receipts, no accounts, no billing, no lock-in.
+-->
+<main class="page" id="content">
+
+<header class="hero">
+  <img class="mark only-dark" src="static/icon-dark.png" alt="The LUCID icon: six silver peer nodes linked in a ring around a red four-point sparkle on a dark graphite plate." width="120" height="120">
+  <img class="mark only-light" src="static/icon-light.png" alt="The LUCID icon: six dark peer nodes linked in a ring around a red four-point sparkle on a brushed aluminum plate." width="120" height="120">
+  <h1>Phase &amp; LUCID</h1>
+  <p class="tagline">Private AI across the machines you trust.</p>
+  <p class="lede"><strong>LUCID</strong> is a desktop app and background daemon that runs open-weight AI models on your own GPU—or securely borrows spare GPU capacity from friends you explicitly invite. It speaks the standard Ollama API on <code>127.0.0.1</code> and runs on the open <strong>Phase</strong> peer-to-peer substrate.</p>
+  <div class="cta">
+    <a class="button primary" href="releases.html">Download LUCID</a>
+    <a class="button" href="help/install.html">60-second setup</a>
+    <a class="button" href="help/http-api.html">APIs &amp; Protocols</a>
+    <a class="button" href="security.html">Security &amp; Trust</a>
+  </div>
+  <p class="facts">LUCID v0.2 beta · macOS Apple Silicon (.dmg &amp; CLI) · Linux x86_64 &amp; ARM64 (.deb &amp; CLI) · Windows x86_64 (CLI) · Apache-2.0 substrate / AGPL-3.0-or-later app · no accounts, no telemetry</p>
+</header>
+
+<section class="band">
+  <h2>Up and running in three steps</h2>
+  <p class="intro">Nothing is shared until you turn it on. Install the app, chat locally or paste a one-time invitation from a friend, and point any Ollama-compatible tool at localhost.</p>
+  <ol class="steps">
+    <li>
+      <h3>Install</h3>
+      <p>Download the macOS <code>.dmg</code>, Ubuntu <code>.deb</code>, Linux tarball, or Windows CLI installer. Every download is verified against <code>SHA256SUMS.txt</code> before unpacking. <a href="help/install.html">Install guide →</a></p>
+    </li>
+    <li>
+      <h3>Join a circle—or stay local</h3>
+      <p>Use your own local models immediately, or click a one-time <code>lucid://join/…</code> link from someone you trust. Uninvited strangers are refused by default. <a href="help/first-chat.html">First chat &amp; invites →</a></p>
+    </li>
+    <li>
+      <h3>Chat or plug in your tools</h3>
+      <p>Use the built-in streaming Desktop Chat, or point Open WebUI, Continue, Zed, or <code>curl</code> at <code>http://127.0.0.1:11434</code> (Desktop sidecar: <code>:11435</code>). <a href="help/http-api.html">HTTP API →</a></p>
+    </li>
+  </ol>
+</section>
+
+<section class="band">
+  <h2>What LUCID does</h2>
+  <p class="intro">Simple on the surface; every card below links straight into the setup guide or technical specification written from the source code.</p>
+  <div class="grid">
+    <a class="card" href="help/first-chat.html">
+      <span class="glyph" aria-hidden="true">💬</span>
+      <h3>Built-in Chat &amp; Ollama API</h3>
+      <p>Token-by-token streaming chat with Stop, Copy, and a <strong>Local Only</strong> toggle. History stays in memory only. Works with existing Ollama clients on <code>/api/chat</code>, <code>/api/generate</code>, <code>/api/embed</code>, <code>/api/tags</code>, <code>/api/ps</code>, and <code>/api/pull</code>.</p>
+    </a>
+    <a class="card" href="help/first-chat.html#joining-a-trusted-circle">
+      <span class="glyph" aria-hidden="true">🔑</span>
+      <h3>Default-Deny Private Circles</h3>
+      <p>Create single-use <code>lucid://join/…</code> links or <code>.lucidinvite</code> files with configurable expiry (up to 1 hour). Enrolling devices exchange doubly signed DHT approvals; uninvited peers are rejected automatically.</p>
+    </a>
+    <a class="card" href="help/operator-policy.html">
+      <span class="glyph" aria-hidden="true">🛡</span>
+      <h3>Share Your GPU Safely</h3>
+      <p>Sharing is strictly opt-in. A hot-reloadable <code>policy.toml</code> automatically pauses remote jobs on battery power, over your temperature ceiling, outside your hours, or above your concurrency cap—while your own prompts always run.</p>
+    </a>
+    <a class="card" href="help/models-and-sharing.html">
+      <span class="glyph" aria-hidden="true">📦</span>
+      <h3>Zero-Copy Discovery &amp; P2P Pull</h3>
+      <p>Finds existing GGUF models from Ollama and LM Studio read-only. Download missing models peer-to-peer over <code>/phase/blob/1.0.0</code> with exact-offset resume, automatic provider failover, and whole-file SHA-256 verification.</p>
+    </a>
+    <a class="card" href="help/trusted-circle-sharding.html">
+      <span class="glyph" aria-hidden="true">⚡</span>
+      <h3>Pool GPUs Across Machines</h3>
+      <p>Split large models across your own trusted machines over Noise-encrypted <code>/phase/shard-rpc/1.0.0</code>. LUCID auto-manages a SHA-256-pinned loopback <code>ggml-rpc-server</code> and refuses silent local fallback if a peer drops.</p>
+    </a>
+    <a class="card" href="help/protocols.html">
+      <span class="glyph" aria-hidden="true">🌐</span>
+      <h3>Open Verifiable Substrate</h3>
+      <p>Built on six Apache-2.0 Rust crates (<code>libp2p 0.57</code>, QUIC/Noise, Kademlia DHT, Circuit Relay v2, DCUtR hole punching, Ed25519 receipts) with <code>#![deny(unsafe_code)]</code>. The same substrate runs WASM via <code>plasmd</code>.</p>
+    </a>
+  </div>
+</section>
+
+<section class="band">
+  <h2>Measured on real hardware</h2>
+  <p class="intro">Numbers below come from physical 5-node fleet tests (macOS Apple Silicon, Linux x86_64 including 2012 Ivy Bridge, and an unprivileged Cloud Relay) rather than synthetic mocks.</p>
+  <div class="metrics">
+    <div class="metric">
+      <span class="val">122 / 122</span>
+      <span class="lbl">Remote peer-verified Ed25519 receipts (100%)</span>
+    </div>
+    <div class="metric">
+      <span class="val">71.3 tok/s</span>
+      <span class="lbl">Apple Silicon MLX over Cellular + VPN + Relay</span>
+    </div>
+    <div class="metric">
+      <span class="val">57.5 tok/s</span>
+      <span class="lbl">2-Mac sliced gemma-4-12B over /phase/shard-rpc (c=4)</span>
+    </div>
+    <div class="metric">
+      <span class="val">10.18 GB</span>
+      <span class="lbl">P2P model pull with interrupt &amp; exact-offset resume</span>
+    </div>
+  </div>
+  <p style="margin-top:16px"><a href="releases.html#v020-beta">Read the full v0.2 release notes and verification status →</a></p>
+</section>
+
+<section class="band">
+  <h2>What leaves your machine</h2>
+  <p class="intro">LUCID talks only to the places listed below—there are no user accounts, no cloud dashboards, no analytics, and no crash telemetry.</p>
+  <ul class="list">
+    <li><strong>Bootstrap DNS (optional):</strong> On startup, <code>lucidd</code> queries TXT records on <code>bootstrap.phasebased.net</code> via your system resolver for PeerID-pinned relay addresses. Pass <code>--no-default-bootstrap</code> to disable it completely.</li>
+    <li><strong>Encrypted libp2p peers &amp; relays:</strong> Traffic uses Noise XX (over TCP or Circuit Relay v2) or TLS 1.3 (over QUIC). Pass <code>--outbound-only</code> to disable direct listeners, mDNS, and hole punching.</li>
+    <li><strong>Prompts—only when routed remotely:</strong> Requests marked <code>X-Lucid-Local-Only</code> (or the Desktop <strong>Local Only</strong> toggle) never leave your machine and refuse remote or RPC-offloaded execution. When routed to an invited peer, that serving peer sees the plaintext prompt in order to run inference.</li>
+    <li><strong>Model downloads:</strong> Only when you explicitly run <code>/api/pull</code> or click <strong>Download Locally</strong>, or when you explicitly approve downloading the SHA-256-pinned <code>llama.cpp b12651</code> runtime.</li>
+  </ul>
+  <p><a href="security.html">Read the full Security &amp; Trust Model →</a></p>
+</section>
+
+<section class="band">
+  <h2>What is verified—and what is not</h2>
+  <div class="two">
+    <div>
+      <h3>Proven by the code today</h3>
+      <ul class="list">
+        <li><strong>Attributable output integrity:</strong> Every remote reply carries an Ed25519 <code>SignedReceipt</code> binding the manifest hash, delivering <code>PeerId</code>, and streaming SHA-256 chunk commitment.</li>
+        <li><strong>Honest trust labels:</strong> Streaming responses start at <code>remote-pending</code> and upgrade to <code>remote-receipt-verified</code> or <code>remote-spot-checked</code> only after terminal verification passes.</li>
+        <li><strong>Strict localhost lockdown:</strong> Loopback-only bind, <code>Host</code> header <code>403</code> DNS-rebinding guard, constant-time Bearer control tokens, per-spawn 256-bit <code>LLAMA_API_KEY</code>, and co-tenant KV-cache stripping (<code>--no-cache-prompt --cache-ram 0 --cache-reuse 0</code>).</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Honest current limits</h3>
+      <ul class="list">
+        <li><strong>Receipts do not prove hidden weights:</strong> A signed receipt proves which peer produced the exact tokens delivered, not that the peer ran a specific unquantized model or precision.</li>
+        <li><strong>Serving peers see plaintext prompts:</strong> Encrypted transport hides prompts from relays and ISPs, not from the machine executing inference.</li>
+        <li><strong>Not yet built in:</strong> Native <code>--tor-socks5</code> transport (use <a href="help/cloud-relay-and-privacy.html#running-over-tor-and-tailsos">TailsOS/Tor</a> for now), Tier-2 untrusted sharding (strictly fail-closed), per-chunk Merkle blob hashes (whole-file SHA-256 at commit), and public rendezvous serving (disabled pending quotas).</li>
+      </ul>
+    </div>
+  </div>
+  <p><a href="help/cryptography-and-receipts.html">Inspect the exact cryptography &amp; verification formulas →</a></p>
+</section>
+
+<section class="band">
+  <h2>Leaving (no lock-in)</h2>
+  <p class="intro">You can stop using LUCID at any time without migrating your models, prompts, or clients.</p>
+  <ul class="list">
+    <li><strong>Standard Ollama API:</strong> Every client pointed at <code>127.0.0.1:11434</code> can point back to Ollama, llama.cpp, or LM Studio with a one-line URL change.</li>
+    <li><strong>Read-only model discovery:</strong> LUCID never modifies or moves your existing Ollama or LM Studio folders; removing a folder from settings leaves your files untouched.</li>
+    <li><strong>Open licenses:</strong> All six Phase substrate crates and <code>plasmd</code> are <strong>Apache-2.0</strong>; <code>lucidd</code> and LUCID Desktop are <strong>AGPL-3.0-or-later</strong>. You can audit, fork, or self-host your own relay in one command.</li>
+  </ul>
+</section>
+
+<section class="band">
+  <h2>Check it yourself</h2>
+  <p class="intro">Everything on this site is verified directly against the repository source.</p>
+  <ul class="list">
+    <li><strong>Source code:</strong> <a href="https://github.com/msitarzewski/phase">github.com/msitarzewski/phase</a></li>
+    <li><strong>APIs &amp; CLI:</strong> <a href="help/http-api.html">HTTP API reference</a> · <a href="help/cli-and-env.html">CLI &amp; environment variables</a></li>
+    <li><strong>Wire specs:</strong> <a href="help/protocols.html">Phase libp2p protocols &amp; DHT keys</a> · <a href="help/cryptography-and-receipts.html">Cryptography &amp; receipts</a></li>
+    <li><strong>Release artifacts &amp; checksums:</strong> <a href="releases.html">Downloads &amp; release notes</a></li>
+  </ul>
+</section>
+
+<section class="band narrow">
+  <p class="handback">That is what Phase and LUCID do today, what is verified, and what is still ahead. Press <kbd>⌘K</kbd> or <kbd>/</kbd> anywhere on this site to search every guide, endpoint, CLI flag, and protocol.</p>
+</section>
+
+</main>

@@ -63,41 +63,9 @@ cp "$APP_SOURCE/Info.plist" "$APP/Contents/Info.plist"
 cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/Phase-LICENSE"
 chmod 755 "$APP/Contents/MacOS/Lucid" "$APP/Contents/Helpers/lucidd"
 
-# Render a simple native vector mark into the standard macOS icon sizes.
-ICONSET="$STAGE/AppIcon.iconset"
-mkdir -p "$ICONSET"
-cat > "$STAGE/render-icon.swift" <<'SWIFT'
-import AppKit
-import Foundation
-let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
-for size in [16, 32, 128, 256, 512] {
-    for scale in [1, 2] {
-        let pixels = size * scale
-        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0), let context = NSGraphicsContext(bitmapImageRep: bitmap) else { fatalError("Cannot create app icon context") }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = context
-        let side = CGFloat(pixels)
-        let inset = side * 0.05
-        let background = NSBezierPath(roundedRect: NSRect(x: inset, y: inset, width: side - inset * 2, height: side - inset * 2), xRadius: side * 0.22, yRadius: side * 0.22)
-        NSGradient(starting: NSColor(red: 0.20, green: 0.23, blue: 0.66, alpha: 1), ending: NSColor(red: 0.13, green: 0.57, blue: 0.88, alpha: 1))?.draw(in: background, angle: 45)
-        NSColor.white.setStroke()
-        for ratio in [0.24, 0.42, 0.60] {
-            let width = side * ratio
-            let circle = NSBezierPath(ovalIn: NSRect(x: (side - width) / 2, y: (side - width) / 2, width: width, height: width))
-            circle.lineWidth = max(1, side * 0.022)
-            circle.stroke()
-        }
-        NSColor.white.setFill()
-        NSBezierPath(ovalIn: NSRect(x: side * 0.465, y: side * 0.465, width: side * 0.07, height: side * 0.07)).fill()
-        NSGraphicsContext.restoreGraphicsState()
-        guard let png = bitmap.representation(using: .png, properties: [:]) else { fatalError("Cannot render app icon") }
-        let suffix = scale == 2 ? "@2x" : ""
-        try png.write(to: directory.appendingPathComponent("icon_\(size)x\(size)\(suffix).png"))
-    }
-}
-SWIFT
-xcrun swift -module-cache-path "$OUTPUT/module-cache" "$STAGE/render-icon.swift" "$ICONSET"
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+# Install the official macOS AppIcon.icns and Liquid Glass Assets.car bundle resources.
+cp "$APP_SOURCE/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$APP_SOURCE/Resources/Assets.car" "$APP/Contents/Resources/Assets.car"
 
 if [[ "$SIGN" == true ]]; then
     codesign --force --sign - --timestamp=none --identifier net.phasebased.lucid.daemon "$APP/Contents/Helpers/lucidd"

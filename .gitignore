@@ -14,6 +14,7 @@ composer.lock
 
 # Build artifacts
 /build/
+/_site/
 
 # Binaries
 *.wasm
